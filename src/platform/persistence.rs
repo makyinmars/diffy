@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::compare::{CompareMode, LayoutMode, RendererKind};
 use crate::core::error::Result;
-use crate::core::forge::github::GitHubUser;
+use crate::core::forge::model::ForgeUser;
 use crate::core::keymap::KeymapOverride;
+use crate::core::review::ReviewForge;
 use crate::core::theme_types::ThemeMode;
 use crate::fonts::FontSettings;
 use crate::platform::database::{
@@ -86,7 +87,8 @@ pub struct Settings {
     pub sidebar_width_px: Option<u32>,
     pub last_compare: Option<PersistedCompare>,
     pub viewport: PersistedViewport,
-    pub github_user: Option<GitHubUser>,
+    pub github_user: Option<ForgeUser>,
+    pub bitbucket_user: Option<ForgeUser>,
     pub wheel_scroll_lines: u8,
     pub auto_update: bool,
     pub continuous_scroll: bool,
@@ -110,6 +112,7 @@ impl Default for Settings {
             last_compare: None,
             viewport: PersistedViewport::default(),
             github_user: None,
+            bitbucket_user: None,
             wheel_scroll_lines: 3,
             auto_update: true,
             continuous_scroll: false,
@@ -120,6 +123,23 @@ impl Default for Settings {
             repo_discovery: RepoDiscovery::default(),
             github_clones: BTreeMap::new(),
             tips: crate::core::tips::TipsMemory::default(),
+        }
+    }
+}
+
+impl Settings {
+    /// The last signed-in user for `forge`, shown until a fresh fetch lands.
+    pub fn forge_user(&self, forge: ReviewForge) -> Option<&ForgeUser> {
+        match forge {
+            ReviewForge::GitHub => self.github_user.as_ref(),
+            ReviewForge::Bitbucket => self.bitbucket_user.as_ref(),
+        }
+    }
+
+    pub fn set_forge_user(&mut self, forge: ReviewForge, user: Option<ForgeUser>) {
+        match forge {
+            ReviewForge::GitHub => self.github_user = user,
+            ReviewForge::Bitbucket => self.bitbucket_user = user,
         }
     }
 }
@@ -212,6 +232,21 @@ mod tests {
 
     use super::{PersistedCompare, Settings, SettingsStore};
     use crate::core::compare::{CompareMode, LayoutMode, RendererKind};
+    use crate::core::review::ReviewForge;
+
+    #[test]
+    fn saved_github_user_still_loads() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"github_user": {"login": "octo", "name": "Octo Cat", "avatar_url": "a"}}"#,
+        )
+        .unwrap();
+        let user = settings.forge_user(ReviewForge::GitHub).unwrap();
+        assert_eq!(
+            (user.login.as_str(), user.name.as_str()),
+            ("octo", "Octo Cat")
+        );
+        assert_eq!(settings.forge_user(ReviewForge::Bitbucket), None);
+    }
 
     #[test]
     fn imports_settings_json_once() {

@@ -17,17 +17,18 @@ use crate::contracts::commands::{
 };
 use crate::contracts::navigation::SelectionOrigin;
 use crate::contracts::review::{
-    CardKey, ComposerFormat, GitHubRequest, GitHubResponse, PullRequestComparison, PullRequestRef,
-    PullsAction, ReviewAction, ReviewContext, ReviewEffect, ReviewEvent, ReviewScope, Secret,
+    CardKey, ComposerFormat, ForgeRequest, ForgeResponse, PullRequestComparison, PullsAction,
+    ReviewAction, ReviewContext, ReviewEffect, ReviewEvent, ReviewScope, Secret,
 };
 use crate::contracts::shared::{AccountEpoch, JobId, SharedContext, SourceTarget};
 use crate::contracts::shell::{Controller, Intent, LogicalFocus, Reduction, ShellEffect};
 use crate::contracts::viewport::CompareIntent;
 use crate::core::compare::RendererKind;
-use crate::core::forge::github::{DeviceFlowState, GitHubUser, parse_pr_url};
-use crate::core::forge::github::{PullRequestInfo, PullRequestOverview};
+use crate::core::forge::github::DeviceFlowState;
+use crate::core::forge::model::{ForgeUser, PullRequestInfo, PullRequestOverview};
+use crate::core::forge::parse_pull_request_url;
 use crate::core::review::{
-    ReviewAnchor, ReviewDecision, ReviewDraftId, ReviewDraftKind, ReviewDraftState,
+    ReviewAnchor, ReviewDecision, ReviewDraftId, ReviewDraftKind, ReviewDraftState, ReviewForge,
     ReviewResolution, ReviewSession, ReviewSessionStatus, ReviewTarget, ReviewThread,
     ReviewThreadId,
 };
@@ -113,7 +114,7 @@ pub enum AuthStatus {
 #[derive(Debug, Default)]
 pub struct Account {
     pub token: Option<Secret>,
-    pub user: Option<GitHubUser>,
+    pub user: Option<ForgeUser>,
     pub avatar: Option<AvatarImage>,
     pub avatar_url: Option<String>,
     pub auth: AuthStatus,
@@ -121,10 +122,36 @@ pub struct Account {
     pub token_loaded: bool,
 }
 
+#[derive(Debug, Default)]
+struct Accounts {
+    github: Account,
+    bitbucket: Account,
+}
+
+impl Accounts {
+    fn get(&self, forge: ReviewForge) -> &Account {
+        match forge {
+            ReviewForge::GitHub => &self.github,
+            ReviewForge::Bitbucket => &self.bitbucket,
+        }
+    }
+
+    fn get_mut(&mut self, forge: ReviewForge) -> &mut Account {
+        match forge {
+            ReviewForge::GitHub => &mut self.github,
+            ReviewForge::Bitbucket => &mut self.bitbucket,
+        }
+    }
+
+    fn all_mut(&mut self) -> [&mut Account; 2] {
+        [&mut self.github, &mut self.bitbucket]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Pending {
     LoadPullRequest,
-    User,
+    User(ReviewForge),
     ReviewData,
     ReviewComments,
     Reply(ReviewDraftId),
@@ -139,13 +166,13 @@ pub(super) enum Pending {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InFlight {
-    pr: Option<PullRequestRef>,
+    pr: Option<ReviewTarget>,
     kind: Pending,
 }
 
 #[derive(Debug)]
 pub struct ActivePullRequest {
-    pub pr: PullRequestRef,
+    pub pr: ReviewTarget,
     pub url: String,
     pub comparison: Option<PullRequestComparison>,
     pub session: Option<ReviewSession>,
@@ -156,16 +183,9 @@ pub struct ActivePullRequest {
 }
 
 impl ActivePullRequest {
-    fn target(&self) -> ReviewTarget {
-        ReviewTarget::github(self.pr.owner.clone(), self.pr.repo.clone(), self.pr.number)
-    }
-
     pub fn web_url(&self) -> String {
         if self.url.is_empty() {
-            format!(
-                "https://github.com/{}/{}/pull/{}",
-                self.pr.owner, self.pr.repo, self.pr.number
-            )
+            self.pr.web_url()
         } else {
             self.url.clone()
         }
@@ -200,7 +220,7 @@ pub struct ReviewController {
     pub(super) comment_menu: Option<String>,
     epoch: AccountEpoch,
     client_id: String,
-    pub(super) account: Account,
+    accounts: Accounts,
     pub(super) overlay: Option<ReviewOverlay>,
     pending_url: Option<String>,
     pub(super) repo_path: Option<PathBuf>,
@@ -212,7 +232,7 @@ pub struct ReviewController {
     pub(super) focus_request: Option<LogicalFocus>,
     pub(super) focused_card: Option<CardKey>,
     avatars: AvatarCache,
-    peeks: HashMap<PullRequestRef, PeekState>,
+    peeks: HashMap<ReviewTarget, PeekState>,
     pub(super) file_comments: Option<String>,
     pub(super) overview: OverviewState,
     pub(super) pulls: PullsPage,
@@ -228,7 +248,7 @@ impl Default for ReviewController {
             comment_menu: None,
             epoch: AccountEpoch::default(),
             client_id: String::new(),
-            account: Account::default(),
+            accounts: Accounts::default(),
             overlay: None,
             pending_url: None,
             repo_path: None,
@@ -253,7 +273,7 @@ impl Default for ReviewController {
 impl std::fmt::Debug for ReviewController {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReviewController")
-            .field("account", &self.account)
+            .field("accounts", &self.accounts)
             .field("overlay", &self.overlay)
             .field("pr", &self.pr)
             .field("composer", &self.composer)
@@ -356,8 +376,15 @@ impl ReviewController {
         }
     }
 
-    pub fn account(&self) -> &Account {
-        &self.account
+    pub fn account(&self, forge: ReviewForge) -> &Account {
+        self.accounts.get(forge)
+    }
+
+    /// The forge of the open pull request; GitHub when none is open.
+    pub(super) fn active_forge(&self) -> ReviewForge {
+        self.pr
+            .as_ref()
+            .map_or(ReviewForge::GitHub, |active| active.pr.forge)
     }
 
     pub fn active_pull_request(&self) -> Option<&ActivePullRequest> {
@@ -397,7 +424,7 @@ impl ReviewController {
     }
 
     pub fn viewer_is_author(&self) -> bool {
-        let user = self.account.user.as_ref();
+        let user = self.account(self.active_forge()).user.as_ref();
         let author = self
             .pr
             .as_ref()
@@ -407,7 +434,7 @@ impl ReviewController {
             .is_some_and(|(user, author)| user.login.eq_ignore_ascii_case(author))
     }
 
-    pub fn peek(&self, pr: &PullRequestRef) -> Option<&PeekState> {
+    pub fn peek(&self, pr: &ReviewTarget) -> Option<&PeekState> {
         self.peeks.get(pr)
     }
 
@@ -416,7 +443,8 @@ impl ReviewController {
     }
 
     fn request_author_avatars(&mut self, emails: &[String]) -> Reduction {
-        if !self.signed_in() {
+        // Commit author faces come from GitHub's avatar service.
+        if !self.signed_in(ReviewForge::GitHub) {
             return Reduction::default();
         }
         let mut reduction = Reduction::default();
@@ -475,14 +503,14 @@ impl ReviewController {
 
     fn fetch_overview(&mut self) -> Option<ReviewEffect> {
         let pr = self.pr.as_ref()?.pr.clone();
-        let token = self.token();
+        let token = self.token(pr.forge);
         let scope = self.job(Some(pr.clone()), Pending::Overview);
         self.overview.loading = true;
         self.overview.error = None;
         self.overview.request = Some(scope.request);
-        Some(ReviewEffect::GitHub {
+        Some(ReviewEffect::Forge {
             scope,
-            request: Box::new(GitHubRequest::FetchPullRequestOverview { pr, token }),
+            request: Box::new(ForgeRequest::FetchPullRequestOverview { pr, token }),
         })
     }
 
@@ -544,15 +572,18 @@ impl ReviewController {
         self.open_composer(ComposerTarget::Conversation, "")
     }
 
-    pub fn signed_in(&self) -> bool {
-        self.account
+    pub fn signed_in(&self, forge: ReviewForge) -> bool {
+        self.account(forge)
             .token
             .as_ref()
             .is_some_and(|token| !token.is_empty())
     }
 
-    pub(super) fn token(&self) -> Option<Secret> {
-        self.account.token.clone().filter(|token| !token.is_empty())
+    pub(super) fn token(&self, forge: ReviewForge) -> Option<Secret> {
+        self.account(forge)
+            .token
+            .clone()
+            .filter(|token| !token.is_empty())
     }
 
     pub(super) fn next_job_id(&mut self) -> JobId {
@@ -560,7 +591,7 @@ impl ReviewController {
         JobId(self.next_job)
     }
 
-    pub(super) fn job(&mut self, pr: Option<PullRequestRef>, kind: Pending) -> ReviewScope {
+    pub(super) fn job(&mut self, pr: Option<ReviewTarget>, kind: Pending) -> ReviewScope {
         let request = self.next_job_id();
         self.in_flight.insert(request, InFlight { pr, kind });
         ReviewScope {
@@ -569,10 +600,10 @@ impl ReviewController {
         }
     }
 
-    fn github(&mut self, kind: Pending, request: GitHubRequest) -> ReviewEffect {
+    fn forge_request(&mut self, kind: Pending, request: ForgeRequest) -> ReviewEffect {
         let pr = self.pr.as_ref().map(|pr| pr.pr.clone());
         let scope = self.job(pr, kind);
-        ReviewEffect::GitHub {
+        ReviewEffect::Forge {
             scope,
             request: Box::new(request),
         }
@@ -595,7 +626,7 @@ impl ReviewController {
     }
 
     fn require_token(&mut self, why: &str) -> Result<Secret, Reduction> {
-        match self.token() {
+        match self.token(self.active_forge()) {
             Some(token) => Ok(token),
             None => {
                 self.open_overlay(ReviewOverlay::Auth);
@@ -645,18 +676,18 @@ impl ReviewController {
         if in_flight {
             return None;
         }
-        let token = self.token();
+        let token = self.token(pr.forge);
         Some(match token {
-            Some(token) => self.github(
+            Some(token) => self.forge_request(
                 Pending::ReviewData,
-                GitHubRequest::FetchReviewData {
+                ForgeRequest::FetchReviewData {
                     pr,
                     token: Some(token),
                 },
             ),
-            None => self.github(
+            None => self.forge_request(
                 Pending::ReviewComments,
-                GitHubRequest::FetchReviewComments { pr, token: None },
+                ForgeRequest::FetchReviewComments { pr, token: None },
             ),
         })
     }
@@ -671,7 +702,8 @@ impl ReviewController {
 
     fn startup(&mut self, startup: &crate::contracts::shell::AppStartup) -> Reduction {
         self.client_id = startup.options.github_client_id.clone();
-        self.account.user = startup.settings.github_user.clone();
+        let forge = ReviewForge::GitHub;
+        self.accounts.get_mut(forge).user = startup.settings.forge_user(forge).cloned();
         self.pending_url = startup.options.args.open_pr.clone();
         if self.repo_path.is_none() {
             self.repo_path = startup.options.args.repo.clone();
@@ -679,45 +711,43 @@ impl ReviewController {
         let mut reduction = Reduction::changed();
         match startup.options.github_token.clone() {
             Some(token) => {
-                self.account.token = Some(Secret::new(token));
-                self.account.token_loaded = true;
-                reduction.merge(self.fetch_user());
+                let account = self.accounts.get_mut(forge);
+                account.token = Some(Secret::new(token));
+                account.token_loaded = true;
+                reduction.merge(self.fetch_user(forge));
                 reduction.merge(self.load_pending());
             }
-            None => reduction = reduction.effect(ReviewEffect::LoadToken),
+            None => reduction = reduction.effect(ReviewEffect::LoadToken(forge)),
         }
         reduction
     }
 
-    fn fetch_user(&mut self) -> Reduction {
-        let Some(token) = self.token() else {
+    fn fetch_user(&mut self, forge: ReviewForge) -> Reduction {
+        let Some(token) = self.token(forge) else {
             return Reduction::default();
         };
-        let scope = self.job(None, Pending::User);
-        Reduction::default().effect(ReviewEffect::GitHub {
+        let scope = self.job(None, Pending::User(forge));
+        Reduction::default().effect(ReviewEffect::Forge {
             scope,
-            request: Box::new(GitHubRequest::FetchUser { token }),
+            request: Box::new(ForgeRequest::FetchUser { forge, token }),
         })
     }
 
     fn load_pending(&mut self) -> Reduction {
-        if !self.account.token_loaded {
+        let target = self.pending_url.as_deref().and_then(parse_pull_request_url);
+        let forge = target.as_ref().map_or(ReviewForge::GitHub, |pr| pr.forge);
+        if !self.account(forge).token_loaded {
             return Reduction::default();
         }
         let (Some(url), Some(repo_path)) = (self.pending_url.clone(), self.repo_path.clone())
         else {
             return Reduction::default();
         };
-        let Some(parsed) = parse_pr_url(&url) else {
+        let Some(pr) = target else {
             self.pending_url = None;
             return Reduction::changed().intent(error("Not a valid GitHub pull request URL."));
         };
         self.pending_url = None;
-        let pr = PullRequestRef {
-            owner: parsed.owner,
-            repo: parsed.repo,
-            number: parsed.number,
-        };
         let mut reduction = Reduction::changed();
         if self.pr.as_ref().is_some_and(|active| active.pr != pr) {
             reduction.merge(self.close_pull_request());
@@ -738,10 +768,10 @@ impl ReviewController {
             active.error = None;
             active.url = url.clone();
         }
-        let token = self.token();
-        reduction.effect(self.github(
+        let token = self.token(forge);
+        reduction.effect(self.forge_request(
             Pending::LoadPullRequest,
-            GitHubRequest::LoadPullRequest {
+            ForgeRequest::LoadPullRequest {
                 url,
                 repo_path,
                 token,
@@ -772,7 +802,7 @@ impl ReviewController {
         let mut reduction =
             Reduction::changed().intent(Intent::SetReviewTarget(Some(Rc::new(ReviewContext {
                 account: self.epoch,
-                target: active.target(),
+                target: active.pr.clone(),
                 pull_request: Arc::new(comparison.info.clone()),
                 left_ref: comparison.left_ref.clone(),
                 right_ref: comparison.right_ref.clone(),
@@ -824,7 +854,7 @@ impl ReviewController {
         };
         active.loading = false;
         active.error = None;
-        let target = active.target();
+        let target = active.pr.clone();
         match active.session.as_mut() {
             Some(session) => {
                 session.pull_request = info.clone();
@@ -859,25 +889,31 @@ impl ReviewController {
         if self.pr.is_some() {
             reduction.merge(self.close_pull_request());
         }
-        self.account = Account {
+        let forge = ReviewForge::GitHub;
+        *self.accounts.get_mut(forge) = Account {
             token_loaded: true,
             ..Account::default()
         };
         self.close_overlay();
         reduction = reduction
-            .effect(ReviewEffect::ClearToken)
+            .effect(ReviewEffect::ClearToken(forge))
             .intent(self.bump_account())
             .intent(info("Signed out of GitHub."));
-        reduction.merge(self.publish_user(cx, None));
+        reduction.merge(self.publish_user(cx, forge, None));
         reduction
     }
 
-    fn publish_user(&self, cx: &SharedContext, user: Option<GitHubUser>) -> Reduction {
-        if cx.settings.settings.github_user == user {
+    fn publish_user(
+        &self,
+        cx: &SharedContext,
+        forge: ReviewForge,
+        user: Option<ForgeUser>,
+    ) -> Reduction {
+        if cx.settings.settings.forge_user(forge) == user.as_ref() {
             return Reduction::default();
         }
         let mut settings = cx.settings.settings.clone();
-        settings.github_user = user;
+        settings.set_forge_user(forge, user);
         Reduction::default().intent(Intent::SettingsChanged(Rc::new(SettingsSnapshot {
             revision: cx.settings.revision + 1,
             settings,
@@ -955,7 +991,7 @@ impl ReviewController {
         self.open_composer(ComposerTarget::Reply { thread, draft }, &body)
     }
 
-    fn edit_comment(&mut self, comment_node_id: String) -> Reduction {
+    fn edit_comment(&mut self, comment_id: String) -> Reduction {
         if let Err(reduction) = self.require_token("Sign in to edit review comments.") {
             return reduction;
         }
@@ -966,20 +1002,14 @@ impl ReviewController {
             let comment = thread
                 .comments
                 .iter()
-                .find(|c| c.backend_node_id.as_deref() == Some(comment_node_id.as_str()))?;
+                .find(|c| c.remote_id.as_deref() == Some(comment_id.as_str()))?;
             Some((thread.id.clone(), comment.body.clone()))
         });
         let Some((thread, body)) = found else {
             return Reduction::changed().intent(error("This comment can no longer be edited."));
         };
         self.expanded.insert(thread.clone(), true);
-        self.open_composer(
-            ComposerTarget::Edit {
-                thread,
-                comment_node_id,
-            },
-            &body,
-        )
+        self.open_composer(ComposerTarget::Edit { thread, comment_id }, &body)
     }
 
     fn edit_draft(&mut self, id: ReviewDraftId) -> Reduction {
@@ -1100,40 +1130,39 @@ impl ReviewController {
                 }
             }
             ComposerTarget::Reply { thread, draft } => {
-                let Some(node) = self.session().and_then(|s| s.thread_node_id(&thread)) else {
+                let Some(thread_id) = self.session().and_then(|s| s.thread_remote_id(&thread))
+                else {
                     return reduction.intent(error("This review thread cannot be replied to."));
                 };
                 if let Some(session) = self.session_mut() {
                     session.update_draft_body(draft, body.clone());
                     session.mark_draft_submitting(draft);
                 }
-                reduction = reduction.effect(self.github(
+                reduction = reduction.effect(self.forge_request(
                     Pending::Reply(draft),
-                    GitHubRequest::AddThreadReply {
+                    ForgeRequest::AddThreadReply {
                         pr,
-                        thread_node_id: node,
+                        thread_id,
                         token: Some(token),
                         body,
                     },
                 ));
             }
-            ComposerTarget::Edit {
-                comment_node_id, ..
-            } => {
-                reduction = reduction.effect(self.github(
+            ComposerTarget::Edit { comment_id, .. } => {
+                reduction = reduction.effect(self.forge_request(
                     Pending::Mutation,
-                    GitHubRequest::UpdateCommentGraphql {
+                    ForgeRequest::UpdateComment {
                         pr,
-                        comment_node_id,
+                        comment_id,
                         token: Some(token),
                         body,
                     },
                 ));
             }
             ComposerTarget::Conversation => {
-                reduction = reduction.effect(self.github(
+                reduction = reduction.effect(self.forge_request(
                     Pending::Comment,
-                    GitHubRequest::AddPullRequestComment {
+                    ForgeRequest::AddPullRequestComment {
                         pr,
                         token: Some(token),
                         body,
@@ -1211,15 +1240,15 @@ impl ReviewController {
         }
         session.status = ReviewSessionStatus::Loading;
         session.status_message = None;
-        let nodes: Vec<Option<String>> = replies
+        let thread_ids: Vec<Option<String>> = replies
             .iter()
-            .map(|(_, thread, _)| session.thread_node_id(thread))
+            .map(|(_, thread, _)| session.thread_remote_id(thread))
             .collect();
         let mut reduction = Reduction::changed();
         if !batch.is_empty() || replies.is_empty() {
-            reduction = reduction.effect(self.github(
+            reduction = reduction.effect(self.forge_request(
                 Pending::SubmitDrafts,
-                GitHubRequest::SubmitSessionDrafts {
+                ForgeRequest::SubmitSessionDrafts {
                     session: Box::new(submission),
                     decision,
                     body: None,
@@ -1227,14 +1256,14 @@ impl ReviewController {
                 },
             ));
         }
-        for ((draft, _, body), node) in replies.into_iter().zip(nodes) {
-            match node {
-                Some(thread_node_id) => {
-                    reduction = reduction.effect(self.github(
+        for ((draft, _, body), thread_id) in replies.into_iter().zip(thread_ids) {
+            match thread_id {
+                Some(thread_id) => {
+                    reduction = reduction.effect(self.forge_request(
                         Pending::Reply(draft),
-                        GitHubRequest::AddThreadReply {
+                        ForgeRequest::AddThreadReply {
                             pr: pr.clone(),
-                            thread_node_id,
+                            thread_id,
                             token: Some(token.clone()),
                             body,
                         },
@@ -1262,21 +1291,21 @@ impl ReviewController {
         let Some(pr) = self.pr.as_ref().map(|active| active.pr.clone()) else {
             return Reduction::default();
         };
-        let Some(node) = self.session().and_then(|s| s.thread_node_id(&id)) else {
+        let Some(thread_id) = self.session().and_then(|s| s.thread_remote_id(&id)) else {
             return Reduction::changed().intent(error("This review thread cannot be updated."));
         };
-        Reduction::default().effect(self.github(
+        Reduction::default().effect(self.forge_request(
             Pending::Mutation,
-            GitHubRequest::SetThreadResolution {
+            ForgeRequest::SetThreadResolution {
                 pr,
-                thread_node_id: node,
+                thread_id,
                 token: Some(token),
                 resolved,
             },
         ))
     }
 
-    fn delete_comment(&mut self, comment_node_id: String) -> Reduction {
+    fn delete_comment(&mut self, comment_id: String) -> Reduction {
         let token = match self.require_token("Sign in to delete review comments.") {
             Ok(token) => token,
             Err(reduction) => return reduction,
@@ -1284,11 +1313,11 @@ impl ReviewController {
         let Some(pr) = self.pr.as_ref().map(|active| active.pr.clone()) else {
             return Reduction::default();
         };
-        Reduction::default().effect(self.github(
+        Reduction::default().effect(self.forge_request(
             Pending::Mutation,
-            GitHubRequest::DeleteCommentGraphql {
+            ForgeRequest::DeleteComment {
                 pr,
-                comment_node_id,
+                comment_id,
                 token: Some(token),
             },
         ))
@@ -1395,8 +1424,9 @@ impl ReviewController {
 
     fn device_flow(&mut self) -> Reduction {
         let flow = self.next_job_id();
-        self.account.flow = Some(flow);
-        self.account.auth = AuthStatus::Starting;
+        let account = self.accounts.get_mut(ReviewForge::GitHub);
+        account.flow = Some(flow);
+        account.auth = AuthStatus::Starting;
         self.open_overlay(ReviewOverlay::Auth);
         Reduction::changed().effect(ReviewEffect::StartDeviceFlow {
             flow,
@@ -1404,59 +1434,63 @@ impl ReviewController {
         })
     }
 
-    fn reduce_github(
+    fn reduce_forge(
         &mut self,
         scope: ReviewScope,
-        response: GitHubResponse,
+        response: ForgeResponse,
         cx: &SharedContext,
     ) -> Reduction {
-        let keep = matches!(response, GitHubResponse::PullRequestCached { .. });
+        let keep = matches!(response, ForgeResponse::PullRequestCached { .. });
         let Some(kind) = self.accept(scope, keep) else {
             return Reduction::default();
         };
         match response {
-            GitHubResponse::PullRequestCached { comparison, .. } => {
+            ForgeResponse::PullRequestCached { comparison, .. } => {
                 if self.pr.as_ref().is_some_and(|pr| pr.comparison.is_none()) {
                     self.set_comparison(comparison, cx)
                 } else {
                     Reduction::default()
                 }
             }
-            GitHubResponse::PullRequestLoaded { comparison, .. } => {
+            ForgeResponse::PullRequestLoaded { comparison, .. } => {
                 self.pull_request_loaded(comparison, cx)
             }
-            GitHubResponse::PullRequestLoadFailed { message, .. } => {
+            ForgeResponse::PullRequestLoadFailed { message, .. } => {
                 if let Some(active) = self.pr.as_mut() {
                     active.loading = false;
                     active.error = Some(message.clone());
                 }
                 Reduction::changed().intent(error(message))
             }
-            GitHubResponse::UserFetched(user) => {
-                let previous = self.account.user.as_ref().map(|u| u.login.clone());
+            ForgeResponse::UserFetched(user) => {
+                let Pending::User(forge) = kind else {
+                    return Reduction::default();
+                };
+                let previous = self.account(forge).user.as_ref().map(|u| u.login.clone());
                 let mut reduction = Reduction::changed();
                 if previous.is_some_and(|login| login != user.login) && self.pr.is_some() {
                     reduction.merge(self.close_pull_request());
                     reduction = reduction.intent(self.bump_account());
                 }
+                let account = self.accounts.get_mut(forge);
                 if let Some(url) = avatar_url_sized(&user.avatar_url, ACCOUNT_AVATAR_PX)
-                    && self.account.avatar_url.as_deref() != Some(url.as_str())
+                    && account.avatar_url.as_deref() != Some(url.as_str())
                 {
-                    self.account.avatar_url = Some(url.clone());
-                    self.account.avatar = None;
+                    account.avatar_url = Some(url.clone());
+                    account.avatar = None;
                     reduction = reduction.effect(ReviewEffect::FetchAvatar { url });
                 }
-                reduction.merge(self.publish_user(cx, Some(user.clone())));
-                self.account.user = Some(user);
+                reduction.merge(self.publish_user(cx, forge, Some(user.clone())));
+                self.accounts.get_mut(forge).user = Some(user);
                 reduction
             }
-            GitHubResponse::UserFetchFailed { message } => {
+            ForgeResponse::UserFetchFailed { message } => {
                 tracing::warn!("failed to fetch GitHub user: {message}");
                 Reduction::default()
             }
-            GitHubResponse::ReviewDataLoaded { data, .. } => {
+            ForgeResponse::ReviewDataLoaded { data, .. } => {
                 if let Some(session) = self.session_mut() {
-                    session.apply_github_review_data(*data);
+                    session.apply_review_data(*data);
                 }
                 let mut reduction = Reduction::changed();
                 if let Some(effect) = self.save_session() {
@@ -1467,25 +1501,23 @@ impl ReviewController {
                 }
                 reduction
             }
-            GitHubResponse::ReviewDataLoadFailed { pr, message } => {
+            ForgeResponse::ReviewDataLoadFailed { pr, message } => {
                 tracing::warn!("failed to fetch pull request review data: {message}");
                 if let Some(session) = self.session_mut() {
                     session.status_message = Some(message);
                 }
-                Reduction::changed().effect(self.github(
+                let token = self.token(pr.forge);
+                Reduction::changed().effect(self.forge_request(
                     Pending::ReviewComments,
-                    GitHubRequest::FetchReviewComments {
-                        pr,
-                        token: self.token(),
-                    },
+                    ForgeRequest::FetchReviewComments { pr, token },
                 ))
             }
-            GitHubResponse::ReviewCommentsLoaded { comments, .. } => {
+            ForgeResponse::ReviewCommentsLoaded { comments, .. } => {
                 let mut reduction = Reduction::changed();
                 if let Some(session) = self.session_mut()
-                    && session.threads.iter().all(|t| t.backend_node_id.is_none())
+                    && session.threads.iter().all(|t| t.remote_id.is_none())
                 {
-                    session.replace_github_comments(comments);
+                    session.replace_comments(comments);
                     if let Some(effect) = self.save_session() {
                         reduction = reduction.effect(effect);
                     }
@@ -1495,7 +1527,7 @@ impl ReviewController {
                 }
                 reduction
             }
-            GitHubResponse::ReviewCommentsLoadFailed { message, .. } => {
+            ForgeResponse::ReviewCommentsLoadFailed { message, .. } => {
                 if let Some(session) = self.session_mut() {
                     session.status = ReviewSessionStatus::Failed;
                     session.status_message = Some(message);
@@ -1506,7 +1538,7 @@ impl ReviewController {
                 }
                 reduction
             }
-            GitHubResponse::ThreadReplyAdded { .. } => {
+            ForgeResponse::ThreadReplyAdded { .. } => {
                 if let Pending::Reply(draft) = kind
                     && let Some(session) = self.session_mut()
                 {
@@ -1521,7 +1553,7 @@ impl ReviewController {
                 }
                 self.after_mutation(true)
             }
-            GitHubResponse::ThreadReplyAddFailed { message, .. } => {
+            ForgeResponse::ThreadReplyAddFailed { message, .. } => {
                 if let Pending::Reply(draft) = kind
                     && let Some(session) = self.session_mut()
                 {
@@ -1533,7 +1565,7 @@ impl ReviewController {
                 reduction = reduction.intent(error(message));
                 reduction
             }
-            GitHubResponse::DraftsSubmitted { draft_ids, .. } => {
+            ForgeResponse::DraftsSubmitted { draft_ids, .. } => {
                 if let Some(session) = self.session_mut() {
                     for id in &draft_ids {
                         session.remove_draft(*id);
@@ -1549,7 +1581,7 @@ impl ReviewController {
                 }
                 self.after_mutation(true).intent(info("Review submitted."))
             }
-            GitHubResponse::DraftsSubmitFailed {
+            ForgeResponse::DraftsSubmitFailed {
                 draft_ids, message, ..
             } => {
                 if let Some(session) = self.session_mut() {
@@ -1561,8 +1593,8 @@ impl ReviewController {
                 }
                 self.after_mutation(false).intent(error(message))
             }
-            GitHubResponse::ThreadResolutionChanged { resolution, .. } => {
-                let id = ReviewThreadId::github_node(resolution.thread_node_id);
+            ForgeResponse::ThreadResolutionChanged { pr, resolution } => {
+                let id = ReviewThreadId::remote(pr.forge, resolution.thread_id);
                 if let Some(session) = self.session_mut() {
                     session.mark_thread_resolution(
                         &id,
@@ -1576,22 +1608,23 @@ impl ReviewController {
                 self.expanded.remove(&id);
                 self.after_mutation(false)
             }
-            GitHubResponse::CommentGraphqlUpdated { .. }
-            | GitHubResponse::CommentGraphqlDeleted { .. } => self.after_mutation(true),
-            GitHubResponse::CommentGraphqlUpdateFailed { message, .. }
-            | GitHubResponse::CommentGraphqlDeleteFailed { message, .. }
-            | GitHubResponse::ThreadResolutionChangeFailed { message, .. } => {
+            ForgeResponse::CommentUpdated { .. } | ForgeResponse::CommentDeleted { .. } => {
+                self.after_mutation(true)
+            }
+            ForgeResponse::CommentUpdateFailed { message, .. }
+            | ForgeResponse::CommentDeleteFailed { message, .. }
+            | ForgeResponse::ThreadResolutionChangeFailed { message, .. } => {
                 Reduction::changed().intent(error(message))
             }
-            GitHubResponse::PullRequestPeeked { pr, info } => {
+            ForgeResponse::PullRequestPeeked { pr, info } => {
                 self.peeks.insert(pr, PeekState::Ready(Box::new(info)));
                 Reduction::changed()
             }
-            GitHubResponse::PullRequestPeekFailed { pr, message } => {
+            ForgeResponse::PullRequestPeekFailed { pr, message } => {
                 self.peeks.insert(pr, PeekState::Failed(message));
                 Reduction::changed()
             }
-            GitHubResponse::PullRequestOverviewLoaded { overview, .. } => {
+            ForgeResponse::PullRequestOverviewLoaded { overview, .. } => {
                 if self.overview.request != Some(scope.request) {
                     return Reduction::default();
                 }
@@ -1601,7 +1634,7 @@ impl ReviewController {
                 self.overview.data = Some(Rc::new(*overview));
                 Reduction::changed()
             }
-            GitHubResponse::PullRequestOverviewLoadFailed { message, .. } => {
+            ForgeResponse::PullRequestOverviewLoadFailed { message, .. } => {
                 if self.overview.request != Some(scope.request) {
                     return Reduction::default();
                 }
@@ -1611,18 +1644,18 @@ impl ReviewController {
                 self.overview.error = Some(message);
                 Reduction::changed()
             }
-            GitHubResponse::MyPullRequestsLoaded(pulls) => self.pulls_loaded(scope.request, pulls),
-            GitHubResponse::MyPullRequestsLoadFailed { message } => {
+            ForgeResponse::MyPullRequestsLoaded(pulls) => self.pulls_loaded(scope.request, pulls),
+            ForgeResponse::MyPullRequestsLoadFailed { message } => {
                 self.pulls_failed(scope.request, message)
             }
-            GitHubResponse::PullRequestCommentAdded { .. } => {
+            ForgeResponse::PullRequestCommentAdded { .. } => {
                 let mut reduction = Reduction::changed().intent(info("Comment posted."));
                 if let Some(effect) = self.fetch_overview() {
                     reduction = reduction.effect(effect);
                 }
                 reduction
             }
-            GitHubResponse::PullRequestCommentAddFailed { body, message, .. } => {
+            ForgeResponse::PullRequestCommentAddFailed { body, message, .. } => {
                 let mut reduction = Reduction::changed().intent(error(message));
                 if self.overview_open() && self.composer.is_none() {
                     reduction.merge(self.open_composer(ComposerTarget::Conversation, &body));
@@ -1666,22 +1699,20 @@ impl ReviewController {
         );
         let cleared = confirming.is_some() || (!keeps_menu && self.comment_menu.take().is_some());
         let mut reduction = match action {
-            ReviewAction::ToggleCommentMenu { comment_node_id } => {
-                self.comment_menu =
-                    if self.comment_menu.as_deref() == Some(comment_node_id.as_str()) {
-                        None
-                    } else {
-                        Some(comment_node_id)
-                    };
+            ReviewAction::ToggleCommentMenu { comment_id } => {
+                self.comment_menu = if self.comment_menu.as_deref() == Some(comment_id.as_str()) {
+                    None
+                } else {
+                    Some(comment_id)
+                };
                 Reduction::changed()
             }
-            ReviewAction::DeleteComment { comment_node_id } => {
-                if matches!(&confirming, Some(DeleteTarget::Comment(node)) if *node == comment_node_id)
-                {
+            ReviewAction::DeleteComment { comment_id } => {
+                if matches!(&confirming, Some(DeleteTarget::Comment(id)) if *id == comment_id) {
                     self.comment_menu = None;
-                    self.delete_comment(comment_node_id)
+                    self.delete_comment(comment_id)
                 } else {
-                    self.confirm_delete = Some(DeleteTarget::Comment(comment_node_id));
+                    self.confirm_delete = Some(DeleteTarget::Comment(comment_id));
                     Reduction::changed()
                 }
             }
@@ -1703,8 +1734,9 @@ impl ReviewController {
         match action {
             ReviewAction::OpenAuthModal => {
                 self.open_overlay(ReviewOverlay::Auth);
-                if self.account.auth == AuthStatus::Done && !self.signed_in() {
-                    self.account.auth = AuthStatus::Idle;
+                let forge = ReviewForge::GitHub;
+                if self.account(forge).auth == AuthStatus::Done && !self.signed_in(forge) {
+                    self.accounts.get_mut(forge).auth = AuthStatus::Idle;
                 }
                 Reduction::changed()
             }
@@ -1713,7 +1745,7 @@ impl ReviewController {
                 Reduction::changed()
             }
             ReviewAction::StartDeviceFlow => self.device_flow(),
-            ReviewAction::OpenDeviceFlowBrowser => match &self.account.auth {
+            ReviewAction::OpenDeviceFlowBrowser => match &self.account(ReviewForge::GitHub).auth {
                 AuthStatus::Awaiting(flow) => {
                     Reduction::default().effect(ShellEffect::OpenBrowser {
                         url: flow.verification_uri.clone(),
@@ -1775,7 +1807,7 @@ impl ReviewController {
                 _ => Reduction::default(),
             },
             ReviewAction::ReplyToThread(thread) => self.reply_to(thread),
-            ReviewAction::EditComment { comment_node_id } => self.edit_comment(comment_node_id),
+            ReviewAction::EditComment { comment_id } => self.edit_comment(comment_id),
             ReviewAction::SubmitReview { decision } => self.submit_review(decision),
             ReviewAction::DiscardDrafts => self.discard_drafts(),
             ReviewAction::DeleteComment { .. }
@@ -1854,9 +1886,9 @@ impl ReviewController {
 
     fn event(&mut self, event: ReviewEvent, cx: &SharedContext) -> Reduction {
         match event {
-            ReviewEvent::GitHub { scope, response } => self.reduce_github(scope, *response, cx),
+            ReviewEvent::Forge { scope, response } => self.reduce_forge(scope, *response, cx),
             ReviewEvent::DeviceFlowStarted { flow, state } => {
-                if self.account.flow != Some(flow) {
+                if self.account(ReviewForge::GitHub).flow != Some(flow) {
                     return Reduction::default();
                 }
                 let url = state.verification_uri.clone();
@@ -1866,36 +1898,39 @@ impl ReviewController {
                     device_code: state.device_code.clone(),
                     interval_seconds: state.interval,
                 };
-                self.account.auth = AuthStatus::Awaiting(state);
+                self.accounts.get_mut(ReviewForge::GitHub).auth = AuthStatus::Awaiting(state);
                 Reduction::changed()
                     .effect(ShellEffect::OpenBrowser { url })
                     .effect(effect)
             }
             ReviewEvent::DeviceFlowStartFailed { flow, message }
             | ReviewEvent::DeviceFlowFailed { flow, message } => {
-                if self.account.flow != Some(flow) {
+                let account = self.accounts.get_mut(ReviewForge::GitHub);
+                if account.flow != Some(flow) {
                     return Reduction::default();
                 }
-                self.account.flow = None;
-                self.account.auth = AuthStatus::Failed(message.clone());
+                account.flow = None;
+                account.auth = AuthStatus::Failed(message.clone());
                 Reduction::changed().intent(error(message))
             }
             ReviewEvent::DeviceFlowCompleted { flow, token } => {
-                if self.account.flow != Some(flow) {
+                let forge = ReviewForge::GitHub;
+                let account = self.accounts.get_mut(forge);
+                if account.flow != Some(flow) {
                     return Reduction::default();
                 }
-                self.account.flow = None;
-                self.account.auth = AuthStatus::Done;
-                self.account.token = Some(token.clone());
-                self.account.token_loaded = true;
+                account.flow = None;
+                account.auth = AuthStatus::Done;
+                account.token = Some(token.clone());
+                account.token_loaded = true;
                 if self.overlay == Some(ReviewOverlay::Auth) {
                     self.close_overlay();
                 }
                 let mut reduction = Reduction::changed()
-                    .effect(ReviewEffect::SaveToken(token))
+                    .effect(ReviewEffect::SaveToken { forge, token })
                     .intent(self.bump_account())
                     .intent(info("GitHub authentication completed."));
-                reduction.merge(self.fetch_user());
+                reduction.merge(self.fetch_user(forge));
                 reduction.merge(self.load_pending());
                 if self.pr.as_ref().is_some_and(|pr| pr.comparison.is_some())
                     && let Some(effect) = self.fetch_review()
@@ -1912,27 +1947,29 @@ impl ReviewController {
                 }
                 reduction
             }
-            ReviewEvent::TokenLoaded { token } => {
-                self.account.token_loaded = true;
-                self.account.token = token.filter(|token| !token.is_empty());
+            ReviewEvent::TokenLoaded { forge, token } => {
+                let account = self.accounts.get_mut(forge);
+                account.token_loaded = true;
+                account.token = token.filter(|token| !token.is_empty());
                 let mut reduction = Reduction::changed();
-                reduction.merge(self.fetch_user());
+                reduction.merge(self.fetch_user(forge));
                 reduction.merge(self.load_pending());
                 if self.pulls.open && self.pulls.data.is_none() && !self.pulls.loading {
                     reduction.merge(self.fetch_pulls());
                 }
                 reduction
             }
-            ReviewEvent::TokenLoadFailed { message } => {
-                self.account.token_loaded = true;
-                self.account.token = None;
+            ReviewEvent::TokenLoadFailed { forge, message } => {
+                let account = self.accounts.get_mut(forge);
+                account.token_loaded = true;
+                account.token = None;
                 let mut reduction =
                     Reduction::changed().intent(error(format!("Keyring unavailable: {message}")));
                 reduction.merge(self.load_pending());
                 reduction
             }
-            ReviewEvent::TokenSaveFailed { message } => Reduction::changed().intent(error(
-                format!("Couldn't save GitHub token to keyring: {message}"),
+            ReviewEvent::TokenSaveFailed { forge, message } => Reduction::changed().intent(error(
+                format!("Couldn't save {} token to keyring: {message}", forge.name()),
             )),
             ReviewEvent::SessionLoaded {
                 scope,
@@ -1945,7 +1982,7 @@ impl ReviewController {
                 let Some(active) = self.pr.as_mut() else {
                     return Reduction::default();
                 };
-                if active.target() != target {
+                if active.pr != target {
                     return Reduction::default();
                 }
                 match active.session.as_mut() {
@@ -1977,9 +2014,11 @@ impl ReviewController {
                     cache_key: avatar_cache_key(&url),
                 };
                 let mut changed = false;
-                if self.account.avatar_url.as_deref() == Some(url.as_str()) {
-                    self.account.avatar = Some(picture.clone());
-                    changed = true;
+                for account in self.accounts.all_mut() {
+                    if account.avatar_url.as_deref() == Some(url.as_str()) {
+                        account.avatar = Some(picture.clone());
+                        changed = true;
+                    }
                 }
                 if let Some(login) = self.avatars.settle(&url, true) {
                     self.host.set_face(login, picture);
@@ -2151,13 +2190,8 @@ impl ReviewController {
     }
 
     fn peek_pull_request(&mut self, url: &str) -> Reduction {
-        let Some(parsed) = parse_pr_url(url) else {
+        let Some(pr) = parse_pull_request_url(url) else {
             return Reduction::default();
-        };
-        let pr = PullRequestRef {
-            owner: parsed.owner,
-            repo: parsed.repo,
-            number: parsed.number,
         };
         if matches!(
             self.peeks.get(&pr),
@@ -2167,10 +2201,10 @@ impl ReviewController {
         }
         self.peeks.insert(pr.clone(), PeekState::Loading);
         let scope = self.job(None, Pending::Peek);
-        let token = self.token();
-        Reduction::changed().effect(ReviewEffect::GitHub {
+        let token = self.token(pr.forge);
+        Reduction::changed().effect(ReviewEffect::Forge {
             scope,
-            request: Box::new(GitHubRequest::PeekPullRequest { pr, token }),
+            request: Box::new(ForgeRequest::PeekPullRequest { pr, token }),
         })
     }
 
@@ -2401,7 +2435,7 @@ impl TextHost for ReviewController {
 
 impl CommandSource for ReviewController {
     fn commands(&self, cx: &SharedContext, out: &mut Vec<CommandDescriptor>) {
-        let signed_in = self.signed_in();
+        let signed_in = self.signed_in(self.active_forge());
         let reviewing = self.session().is_some();
         let vcs_git = cx
             .repository
@@ -2485,7 +2519,7 @@ impl CommandSource for ReviewController {
             )
             .enabled(self.pr.is_some()),
         );
-        out.push(if signed_in {
+        out.push(if self.signed_in(ReviewForge::GitHub) {
             CommandDescriptor::new(
                 "review.sign_out",
                 "Sign out of GitHub",

@@ -14,6 +14,7 @@ use crate::contracts::shared::SharedContext;
 use crate::contracts::shell::{
     Action, AppEvent, Controller, Intent, Reduction, ShellAction, ShellEvent,
 };
+use crate::core::review::ReviewForge;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stream {
@@ -92,7 +93,8 @@ impl Controllers {
         if action.blocked_by_modal() && self.review.is_modal_open() {
             return Reduction::default();
         }
-        self.commands.observe_account(self.review.signed_in());
+        self.commands
+            .observe_account(self.review.signed_in(ReviewForge::GitHub));
         let mut reduction = Reduction::default();
         if action.wants_external_commands() {
             let commands = self.external_commands(cx);

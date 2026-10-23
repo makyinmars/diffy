@@ -26,7 +26,7 @@ use crate::contracts::commands::{
     LauncherFolder, RefPickerRequest, SettingsSnapshot, ToastUpdate,
 };
 use crate::contracts::navigation::{CompareField, NavigationAction, RepositorySyncReason};
-use crate::contracts::review::{GitHubRequest, ReviewAction, ReviewEffect, ReviewEvent};
+use crate::contracts::review::{ForgeRequest, ReviewAction, ReviewEffect, ReviewEvent};
 use crate::contracts::shared::{JobId, SharedContext};
 use crate::contracts::shell::{
     Action, Controller, Effect, Intent, LogicalFocus, Reduction, ShellAction, ShellEffect,
@@ -35,6 +35,7 @@ use crate::contracts::shell::{
 use crate::core::frecency::FrecencyStore;
 use crate::core::keymap::{KeymapOverride, ShortcutCommand};
 use crate::core::repo_discovery::{DiscoveredRepo, RepoScan};
+use crate::core::review::ReviewForge;
 use crate::core::theme_types::ThemeMode;
 use crate::platform::persistence::{Settings, SettingsStore};
 
@@ -1249,7 +1250,13 @@ fn enter_and_arrows_in_the_launcher_open_a_repository() {
 #[test]
 fn a_pull_request_link_opens_the_matching_local_clone_then_the_pull_request() {
     let mut ui = harness::harness();
-    harness::deliver(&mut ui, ReviewEvent::TokenLoaded { token: None });
+    harness::deliver(
+        &mut ui,
+        ReviewEvent::TokenLoaded {
+            forge: ReviewForge::GitHub,
+            token: None,
+        },
+    );
     scanned(
         &mut ui,
         &[
@@ -1264,8 +1271,8 @@ fn a_pull_request_link_opens_the_matching_local_clone_then_the_pull_request() {
     assert_eq!(opened_repo(&ui), Some(PathBuf::from("/w/alpha")));
     assert!(effects(&ui).iter().any(|effect| matches!(
         effect,
-        Effect::Review(ReviewEffect::GitHub { request, .. })
-            if **request == GitHubRequest::LoadPullRequest {
+        Effect::Review(ReviewEffect::Forge { request, .. })
+            if **request == ForgeRequest::LoadPullRequest {
                 url: "https://github.com/owner/alpha/pull/7".to_owned(),
                 repo_path: PathBuf::from("/w/alpha"),
                 token: None,

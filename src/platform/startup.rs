@@ -49,18 +49,18 @@ pub struct StartupOptions {
     pub github_client_id: String,
     pub log_debug: bool,
     pub keyring_enabled: bool,
-    pub github_token_store: GitHubTokenStore,
+    pub token_store: TokenStore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GitHubTokenStore {
+pub enum TokenStore {
     #[default]
     Disabled,
     Keyring,
     DevFile,
 }
 
-impl GitHubTokenStore {
+impl TokenStore {
     pub fn is_enabled(self) -> bool {
         !matches!(self, Self::Disabled)
     }
@@ -141,7 +141,7 @@ impl StartupOptions {
                 .unwrap_or_else(|| DEFAULT_GITHUB_CLIENT_ID.to_owned()),
             env_flag("DIFFY_LOG_DEBUG"),
             keyring_enabled,
-            github_token_store_from_env(env_flag, keyring_enabled),
+            token_store_from_env(env_flag, keyring_enabled),
         )
     }
 
@@ -161,10 +161,10 @@ impl StartupOptions {
         log_debug: bool,
         keyring_enabled: bool,
     ) -> Self {
-        let github_token_store = if keyring_enabled {
-            GitHubTokenStore::Keyring
+        let token_store = if keyring_enabled {
+            TokenStore::Keyring
         } else {
-            GitHubTokenStore::Disabled
+            TokenStore::Disabled
         };
         Self::from_parts_with_token_store(
             args,
@@ -172,7 +172,7 @@ impl StartupOptions {
             github_client_id,
             log_debug,
             keyring_enabled,
-            github_token_store,
+            token_store,
         )
     }
 
@@ -182,7 +182,7 @@ impl StartupOptions {
         github_client_id: String,
         log_debug: bool,
         keyring_enabled: bool,
-        github_token_store: GitHubTokenStore,
+        token_store: TokenStore,
     ) -> Self {
         Self {
             args,
@@ -190,7 +190,7 @@ impl StartupOptions {
             github_client_id,
             log_debug,
             keyring_enabled,
-            github_token_store,
+            token_store,
         }
     }
 
@@ -316,20 +316,20 @@ where
     !cfg!(debug_assertions)
 }
 
-fn github_token_store_from_env<FFlag>(env_flag: FFlag, keyring_enabled: bool) -> GitHubTokenStore
+fn token_store_from_env<FFlag>(env_flag: FFlag, keyring_enabled: bool) -> TokenStore
 where
     FFlag: Fn(&str) -> bool,
 {
     if env_flag("DIFFY_DISABLE_GITHUB_TOKEN_STORE") {
-        return GitHubTokenStore::Disabled;
+        return TokenStore::Disabled;
     }
     if env_flag("DIFFY_DEV_GITHUB_TOKEN_FILE") {
-        return GitHubTokenStore::DevFile;
+        return TokenStore::DevFile;
     }
     if keyring_enabled {
-        GitHubTokenStore::Keyring
+        TokenStore::Keyring
     } else {
-        GitHubTokenStore::Disabled
+        TokenStore::Disabled
     }
 }
 
@@ -341,9 +341,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Args, GitHubTokenStore, StartupEnvDefaults, StartupOptions, app_config_dir, app_log_dir,
-        config_dir_from, config_dir_override, github_token_store_from_env,
-        keyring_enabled_from_env,
+        Args, StartupEnvDefaults, StartupOptions, TokenStore, app_config_dir, app_log_dir,
+        config_dir_from, config_dir_override, keyring_enabled_from_env, token_store_from_env,
     };
     use crate::core::compare::{CompareMode, LayoutMode, RendererKind};
 
@@ -416,7 +415,7 @@ mod tests {
         assert_eq!(options.github_client_id, "client");
         assert!(options.log_debug);
         assert!(options.keyring_enabled);
-        assert_eq!(options.github_token_store, GitHubTokenStore::Keyring);
+        assert_eq!(options.token_store, TokenStore::Keyring);
     }
 
     #[test]
@@ -446,33 +445,33 @@ mod tests {
     }
 
     #[test]
-    fn github_token_store_follows_keyring_by_default() {
+    fn token_store_follows_keyring_by_default() {
         let env = HashMap::<&str, &str>::new();
         assert_eq!(
-            github_token_store_from_env(
+            token_store_from_env(
                 |name| env.get(name).is_some_and(|value| *value == "1"),
                 true
             ),
-            GitHubTokenStore::Keyring
+            TokenStore::Keyring
         );
         assert_eq!(
-            github_token_store_from_env(
+            token_store_from_env(
                 |name| env.get(name).is_some_and(|value| *value == "1"),
                 false
             ),
-            GitHubTokenStore::Disabled
+            TokenStore::Disabled
         );
     }
 
     #[test]
-    fn github_token_store_can_use_dev_file_without_keyring() {
+    fn token_store_can_use_dev_file_without_keyring() {
         let env = HashMap::from([("DIFFY_DEV_GITHUB_TOKEN_FILE", "1")]);
         assert_eq!(
-            github_token_store_from_env(
+            token_store_from_env(
                 |name| env.get(name).is_some_and(|value| *value == "1"),
                 false
             ),
-            GitHubTokenStore::DevFile
+            TokenStore::DevFile
         );
 
         let disabled = HashMap::from([
@@ -480,11 +479,11 @@ mod tests {
             ("DIFFY_DISABLE_GITHUB_TOKEN_STORE", "1"),
         ]);
         assert_eq!(
-            github_token_store_from_env(
+            token_store_from_env(
                 |name| disabled.get(name).is_some_and(|value| *value == "1"),
                 false
             ),
-            GitHubTokenStore::Disabled
+            TokenStore::Disabled
         );
     }
 

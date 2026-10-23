@@ -60,7 +60,7 @@ pub struct RepoCapabilities {
     pub partial_file_restore: bool,
     pub partial_hunk_mutation: bool,
     pub operation_log: bool,
-    pub github_pull_requests: bool,
+    pub forge_pull_requests: bool,
 }
 
 impl RepoCapabilities {
@@ -76,7 +76,7 @@ impl RepoCapabilities {
             partial_file_restore: true,
             partial_hunk_mutation: true,
             operation_log: false,
-            github_pull_requests: true,
+            forge_pull_requests: true,
         }
     }
 }

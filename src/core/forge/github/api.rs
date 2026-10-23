@@ -4,42 +4,39 @@ use serde_json::{Value, json};
 
 use super::transport::{self, Media};
 use crate::core::error::{DiffyError, Result};
+use crate::core::forge::model::{
+    ForgeUser, PullRequestActor, PullRequestCheckContext, PullRequestCheckSummary, PullRequestInfo,
+    PullRequestLabel, PullRequestReviewComment, PullRequestReviewData, PullRequestReviewMetadata,
+    PullRequestReviewRequest, PullRequestReviewSummary, PullRequestReviewThread,
+    PullRequestReviewThreadComment, ReactionGroup, ReviewThreadResolution,
+};
+use crate::core::review::{ReviewDecision, ReviewDraftKind, ReviewSession, ReviewSide};
 
 const API_ROOT: &str = "https://api.github.com";
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct GitHubUser {
-    pub login: String,
-    pub name: String,
-    pub avatar_url: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PullRequestInfo {
-    pub title: String,
-    pub state: String,
-    #[serde(default)]
-    pub draft: bool,
-    #[serde(default)]
-    pub merged: bool,
-    pub author_login: String,
-    pub number: i32,
-    pub additions: i32,
-    pub deletions: i32,
-    pub changed_files: i32,
-    pub base_branch: String,
-    pub head_branch: String,
-    pub base_sha: String,
-    pub head_sha: String,
-    pub base_repo_url: String,
-    pub head_repo_url: String,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum GitHubReviewSide {
     Left,
     Right,
+}
+
+impl From<GitHubReviewSide> for ReviewSide {
+    fn from(side: GitHubReviewSide) -> Self {
+        match side {
+            GitHubReviewSide::Left => Self::Old,
+            GitHubReviewSide::Right => Self::New,
+        }
+    }
+}
+
+impl From<ReviewSide> for GitHubReviewSide {
+    fn from(side: ReviewSide) -> Self {
+        match side {
+            ReviewSide::Old => Self::Left,
+            ReviewSide::New => Self::Right,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -49,176 +46,68 @@ pub struct GitHubReviewCommentUser {
     pub avatar_url: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct GitHubReactionGroup {
-    pub content: String,
-    pub count: u32,
-    pub viewer_has_reacted: bool,
+#[derive(Deserialize)]
+struct RestReviewComment {
+    id: i64,
+    #[serde(default)]
+    in_reply_to_id: Option<i64>,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    commit_id: String,
+    #[serde(default)]
+    original_commit_id: String,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    original_line: Option<u32>,
+    #[serde(default)]
+    side: Option<GitHubReviewSide>,
+    #[serde(default)]
+    start_line: Option<u32>,
+    #[serde(default)]
+    original_start_line: Option<u32>,
+    #[serde(default)]
+    start_side: Option<GitHubReviewSide>,
+    #[serde(default)]
+    subject_type: Option<String>,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    user: Option<GitHubReviewCommentUser>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PullRequestReviewComment {
-    pub id: i64,
-    #[serde(default)]
-    pub in_reply_to_id: Option<i64>,
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
-    pub body: String,
-    #[serde(default)]
-    pub commit_id: String,
-    #[serde(default)]
-    pub original_commit_id: String,
-    #[serde(default)]
-    pub line: Option<u32>,
-    #[serde(default)]
-    pub original_line: Option<u32>,
-    #[serde(default)]
-    pub side: Option<GitHubReviewSide>,
-    #[serde(default)]
-    pub start_line: Option<u32>,
-    #[serde(default)]
-    pub original_start_line: Option<u32>,
-    #[serde(default)]
-    pub start_side: Option<GitHubReviewSide>,
-    #[serde(default)]
-    pub subject_type: Option<String>,
-    #[serde(default)]
-    pub html_url: String,
-    #[serde(default)]
-    pub created_at: String,
-    #[serde(default)]
-    pub updated_at: String,
-    #[serde(default)]
-    pub user: Option<GitHubReviewCommentUser>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PullRequestReviewMetadata {
-    pub node_id: String,
-    pub url: String,
-    pub review_decision: Option<String>,
-    pub mergeable: String,
-    pub merge_state_status: String,
-    pub is_draft: bool,
-    pub is_read_by_viewer: Option<bool>,
-    pub viewer_latest_review_state: Option<String>,
-    pub latest_head_oid: String,
-    pub commit_count: i32,
-    pub labels: Vec<PullRequestLabel>,
-    pub review_requests: Vec<PullRequestReviewRequest>,
-    pub checks: PullRequestCheckSummary,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PullRequestLabel {
-    pub name: String,
-    pub color: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PullRequestReviewRequest {
-    pub reviewer_type: String,
-    pub login: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PullRequestCheckSummary {
-    pub state: Option<String>,
-    pub total_count: i32,
-    pub success_count: i32,
-    pub failure_count: i32,
-    pub pending_count: i32,
-    pub contexts: Vec<PullRequestCheckContext>,
-}
-
-impl PullRequestCheckSummary {
-    pub(super) fn add_state(&mut self, state: &str, count: i32) {
-        match state {
-            "SUCCESS" | "NEUTRAL" | "SKIPPED" => self.success_count += count,
-            "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
-            | "STARTUP_FAILURE" => self.failure_count += count,
-            _ => self.pending_count += count,
+impl From<RestReviewComment> for PullRequestReviewComment {
+    fn from(comment: RestReviewComment) -> Self {
+        Self {
+            id: comment.id,
+            in_reply_to_id: comment.in_reply_to_id,
+            path: comment.path,
+            body: comment.body,
+            commit_id: comment.commit_id,
+            original_commit_id: comment.original_commit_id,
+            line: comment.line,
+            original_line: comment.original_line,
+            side: comment.side.map(ReviewSide::from),
+            start_line: comment.start_line,
+            original_start_line: comment.original_start_line,
+            start_side: comment.start_side.map(ReviewSide::from),
+            subject_type: comment.subject_type,
+            html_url: comment.html_url,
+            created_at: comment.created_at,
+            updated_at: comment.updated_at,
+            user: comment.user.map(|user| PullRequestActor {
+                login: user.login,
+                avatar_url: user.avatar_url,
+            }),
         }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PullRequestCheckContext {
-    pub name: String,
-    pub state: String,
-    pub details_url: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PullRequestReviewSummary {
-    pub node_id: String,
-    pub database_id: Option<i64>,
-    pub state: String,
-    pub body: String,
-    pub author_login: String,
-    pub submitted_at: Option<String>,
-    pub commit_oid: String,
-    pub viewer_did_author: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct GitHubPullRequestReviewThreadComment {
-    pub node_id: String,
-    pub database_id: Option<i64>,
-    pub reply_to_node_id: Option<String>,
-    pub reply_to_database_id: Option<i64>,
-    pub author_login: String,
-    pub author_avatar_url: String,
-    pub body: String,
-    pub path: String,
-    pub line: Option<u32>,
-    pub original_line: Option<u32>,
-    pub start_line: Option<u32>,
-    pub original_start_line: Option<u32>,
-    pub subject_type: String,
-    pub url: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub outdated: bool,
-    pub state: String,
-    pub viewer_can_update: bool,
-    pub viewer_can_delete: bool,
-    pub reactions: Vec<GitHubReactionGroup>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct GitHubPullRequestReviewThread {
-    pub node_id: String,
-    pub path: String,
-    pub line: Option<u32>,
-    pub original_line: Option<u32>,
-    pub start_line: Option<u32>,
-    pub original_start_line: Option<u32>,
-    pub diff_side: Option<GitHubReviewSide>,
-    pub start_diff_side: Option<GitHubReviewSide>,
-    pub subject_type: String,
-    pub is_collapsed: bool,
-    pub is_outdated: bool,
-    pub is_resolved: bool,
-    pub viewer_can_reply: bool,
-    pub viewer_can_resolve: bool,
-    pub viewer_can_unresolve: bool,
-    pub comments: Vec<GitHubPullRequestReviewThreadComment>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct GitHubPullRequestReviewData {
-    pub metadata: PullRequestReviewMetadata,
-    pub reviews: Vec<PullRequestReviewSummary>,
-    pub threads: Vec<GitHubPullRequestReviewThread>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct GitHubReviewThreadResolution {
-    pub thread_node_id: String,
-    pub is_resolved: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -248,6 +137,16 @@ pub enum GitHubPullRequestReviewEvent {
     Comment,
 }
 
+impl From<ReviewDecision> for GitHubPullRequestReviewEvent {
+    fn from(decision: ReviewDecision) -> Self {
+        match decision {
+            ReviewDecision::Comment => Self::Comment,
+            ReviewDecision::Approve => Self::Approve,
+            ReviewDecision::RequestChanges => Self::RequestChanges,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CreatePullRequestReviewDraftComment {
     pub path: String,
@@ -272,6 +171,65 @@ pub struct CreatePullRequestReview {
     pub comments: Vec<CreatePullRequestReviewDraftComment>,
 }
 
+impl CreatePullRequestReview {
+    /// One review carrying every pending inline draft, with the first pending
+    /// general draft as its body when `body` is empty.
+    pub fn from_drafts(
+        session: &ReviewSession,
+        decision: ReviewDecision,
+        body: Option<String>,
+    ) -> Result<Self> {
+        let mut comments = Vec::new();
+        for draft in session.pending_drafts() {
+            match &draft.kind {
+                ReviewDraftKind::InlineComment => {
+                    let anchor = draft.anchor.as_ref().ok_or_else(|| {
+                        DiffyError::General("inline review draft is missing an anchor".to_owned())
+                    })?;
+                    let line_range = anchor.line_range.ok_or_else(|| {
+                        DiffyError::General(
+                            "inline review draft is missing a line range".to_owned(),
+                        )
+                    })?;
+                    let side = anchor.side.ok_or_else(|| {
+                        DiffyError::General("inline review draft is missing a side".to_owned())
+                    })?;
+                    comments.push(CreatePullRequestReviewDraftComment {
+                        path: anchor.path.clone(),
+                        body: draft.body.clone(),
+                        line: line_range.end_inclusive(),
+                        side: side.into(),
+                        start_line: line_range.multi_line_start(),
+                        start_side: line_range.multi_line_start().map(|_| side.into()),
+                    });
+                }
+                ReviewDraftKind::Reply { .. } => {
+                    return Err(DiffyError::General(
+                        "reply drafts must be submitted through the review thread reply operation"
+                            .to_owned(),
+                    ));
+                }
+                ReviewDraftKind::General => {}
+            }
+        }
+
+        let body = body.filter(|body| !body.trim().is_empty()).or_else(|| {
+            session
+                .pending_drafts()
+                .find(|draft| matches!(draft.kind, ReviewDraftKind::General))
+                .map(|draft| draft.body.clone())
+        });
+
+        let head_sha = session.pull_request.head_sha.trim();
+        Ok(Self {
+            commit_id: (!head_sha.is_empty()).then(|| head_sha.to_owned()),
+            body,
+            event: Some(decision.into()),
+            comments,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GitHubApi {
     token: String,
@@ -292,7 +250,7 @@ impl GitHubApi {
         self.token = token.into();
     }
 
-    pub fn fetch_current_user(&self) -> Result<GitHubUser> {
+    pub fn fetch_current_user(&self) -> Result<ForgeUser> {
         let page = transport::get(
             &self.token,
             &format!("{API_ROOT}/user"),
@@ -311,7 +269,7 @@ impl GitHubApi {
         let avatar_url = string_field(&json, "avatar_url");
         let display_name = if name.is_empty() { login.clone() } else { name };
 
-        Ok(GitHubUser {
+        Ok(ForgeUser {
             login,
             name: display_name,
             avatar_url,
@@ -382,10 +340,13 @@ impl GitHubApi {
                 Media::Versioned,
                 "GitHub review comments fetch",
             )?;
-            let mut page_comments: Vec<PullRequestReviewComment> =
-                serde_json::from_str(&response.body)?;
+            let page_comments: Vec<RestReviewComment> = serde_json::from_str(&response.body)?;
             let count = page_comments.len();
-            comments.append(&mut page_comments);
+            comments.extend(
+                page_comments
+                    .into_iter()
+                    .map(PullRequestReviewComment::from),
+            );
             if !response.next || count == 0 {
                 break;
             }
@@ -399,14 +360,14 @@ impl GitHubApi {
         owner: &str,
         repo: &str,
         number: i32,
-    ) -> Result<GitHubPullRequestReviewData> {
+    ) -> Result<PullRequestReviewData> {
         if self.token.trim().is_empty() {
             return Err(DiffyError::auth(
                 "GitHub authentication is required to fetch pull request review data".to_owned(),
             ));
         }
 
-        let mut result = GitHubPullRequestReviewData::default();
+        let mut result = PullRequestReviewData::default();
         let mut after: Option<String> = None;
         let query = review_graphql_query(PULL_REQUEST_REVIEW_DATA_QUERY);
         loop {
@@ -441,7 +402,7 @@ impl GitHubApi {
                     ));
                 }
             };
-            if result.metadata.node_id.is_empty() {
+            if result.metadata.id.is_empty() {
                 result.metadata = parse_pull_request_review_metadata(pull_request);
                 result.reviews =
                     parse_pull_request_reviews(pull_request.pointer("/latestReviews/nodes"));
@@ -497,7 +458,7 @@ impl GitHubApi {
         &self,
         thread_node_id: &str,
         body: &str,
-    ) -> Result<GitHubPullRequestReviewThreadComment> {
+    ) -> Result<PullRequestReviewThreadComment> {
         if self.token.trim().is_empty() {
             return Err(DiffyError::auth(
                 "GitHub authentication is required to reply to review threads".to_owned(),
@@ -523,7 +484,7 @@ impl GitHubApi {
         &self,
         comment_node_id: &str,
         body: &str,
-    ) -> Result<GitHubPullRequestReviewThreadComment> {
+    ) -> Result<PullRequestReviewThreadComment> {
         if self.token.trim().is_empty() {
             return Err(DiffyError::auth(
                 "GitHub authentication is required to update review comments".to_owned(),
@@ -547,7 +508,7 @@ impl GitHubApi {
     pub fn delete_pull_request_review_comment_graphql(
         &self,
         comment_node_id: &str,
-    ) -> Result<Option<GitHubPullRequestReviewThreadComment>> {
+    ) -> Result<Option<PullRequestReviewThreadComment>> {
         if self.token.trim().is_empty() {
             return Err(DiffyError::auth(
                 "GitHub authentication is required to delete review comments".to_owned(),
@@ -569,7 +530,7 @@ impl GitHubApi {
         &self,
         thread_node_id: &str,
         resolved: bool,
-    ) -> Result<GitHubReviewThreadResolution> {
+    ) -> Result<ReviewThreadResolution> {
         if self.token.trim().is_empty() {
             return Err(DiffyError::auth(
                 "GitHub authentication is required to update review thread resolution".to_owned(),
@@ -595,8 +556,8 @@ impl GitHubApi {
             .ok_or_else(|| {
                 DiffyError::Parse("missing review thread in GraphQL response".to_owned())
             })?;
-        Ok(GitHubReviewThreadResolution {
-            thread_node_id: string_field(thread, "id"),
+        Ok(ReviewThreadResolution {
+            thread_id: string_field(thread, "id"),
             is_resolved: bool_field(thread, "isResolved"),
         })
     }
@@ -861,7 +822,7 @@ fn parse_pull_request_review_metadata(value: &Value) -> PullRequestReviewMetadat
         .pointer("/commits/nodes/0/commit/statusCheckRollup")
         .unwrap_or(&Value::Null);
     PullRequestReviewMetadata {
-        node_id: string_field(value, "id"),
+        id: string_field(value, "id"),
         url: string_field(value, "url"),
         review_decision: optional_string_field(value, "reviewDecision"),
         mergeable: string_field(value, "mergeable"),
@@ -968,8 +929,8 @@ fn parse_pull_request_reviews(value: Option<&Value>) -> Vec<PullRequestReviewSum
         .into_iter()
         .flatten()
         .map(|node| PullRequestReviewSummary {
-            node_id: string_field(node, "id"),
-            database_id: optional_i64_field(node, "fullDatabaseId"),
+            id: string_field(node, "id"),
+            numeric_id: optional_i64_field(node, "fullDatabaseId"),
             state: string_field(node, "state"),
             body: string_field(node, "body"),
             author_login: node
@@ -986,20 +947,20 @@ fn parse_pull_request_reviews(value: Option<&Value>) -> Vec<PullRequestReviewSum
         .collect()
 }
 
-fn parse_review_threads(value: Option<&Value>) -> Vec<GitHubPullRequestReviewThread> {
+fn parse_review_threads(value: Option<&Value>) -> Vec<PullRequestReviewThread> {
     value
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|node| GitHubPullRequestReviewThread {
-            node_id: string_field(node, "id"),
+        .map(|node| PullRequestReviewThread {
+            id: string_field(node, "id"),
             path: string_field(node, "path"),
             line: optional_u32_field(node, "line"),
             original_line: optional_u32_field(node, "originalLine"),
             start_line: optional_u32_field(node, "startLine"),
             original_start_line: optional_u32_field(node, "originalStartLine"),
-            diff_side: optional_review_side(node, "diffSide"),
-            start_diff_side: optional_review_side(node, "startDiffSide"),
+            side: optional_review_side(node, "diffSide"),
+            start_side: optional_review_side(node, "startDiffSide"),
             subject_type: string_field(node, "subjectType"),
             is_collapsed: bool_field(node, "isCollapsed"),
             is_outdated: bool_field(node, "isOutdated"),
@@ -1018,15 +979,15 @@ fn parse_review_threads(value: Option<&Value>) -> Vec<GitHubPullRequestReviewThr
         .collect()
 }
 
-fn parse_thread_comment(value: &Value) -> GitHubPullRequestReviewThreadComment {
-    GitHubPullRequestReviewThreadComment {
-        node_id: string_field(value, "id"),
-        database_id: optional_i64_field(value, "fullDatabaseId"),
-        reply_to_node_id: value
+fn parse_thread_comment(value: &Value) -> PullRequestReviewThreadComment {
+    PullRequestReviewThreadComment {
+        id: string_field(value, "id"),
+        numeric_id: optional_i64_field(value, "fullDatabaseId"),
+        reply_to_id: value
             .pointer("/replyTo/id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        reply_to_database_id: value
+        reply_to_numeric_id: value
             .pointer("/replyTo/fullDatabaseId")
             .and_then(value_to_i64),
         author_login: value
@@ -1056,7 +1017,7 @@ fn parse_thread_comment(value: &Value) -> GitHubPullRequestReviewThreadComment {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .map(|group| GitHubReactionGroup {
+            .map(|group| ReactionGroup {
                 content: string_field(group, "content"),
                 count: group
                     .pointer("/users/totalCount")
@@ -1111,10 +1072,10 @@ pub(super) fn bool_field(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn optional_review_side(value: &Value, key: &str) -> Option<GitHubReviewSide> {
+fn optional_review_side(value: &Value, key: &str) -> Option<ReviewSide> {
     match value.get(key).and_then(Value::as_str) {
-        Some("LEFT") => Some(GitHubReviewSide::Left),
-        Some("RIGHT") => Some(GitHubReviewSide::Right),
+        Some("LEFT") => Some(ReviewSide::Old),
+        Some("RIGHT") => Some(ReviewSide::New),
         _ => None,
     }
 }
@@ -1130,6 +1091,29 @@ fn graphql_error_message(errors: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::review::{
+        ReviewAnchor, ReviewForge, ReviewLineRange, ReviewTarget, ReviewThreadId,
+    };
+
+    fn pull_request_info() -> PullRequestInfo {
+        PullRequestInfo {
+            title: "Review me".to_owned(),
+            state: "open".to_owned(),
+            draft: false,
+            merged: false,
+            author_login: "author".to_owned(),
+            number: 42,
+            additions: 10,
+            deletions: 2,
+            changed_files: 1,
+            base_branch: "main".to_owned(),
+            head_branch: "feature".to_owned(),
+            base_sha: "base".to_owned(),
+            head_sha: "head".to_owned(),
+            base_repo_url: String::new(),
+            head_repo_url: String::new(),
+        }
+    }
 
     #[test]
     fn only_forbidden_fields_inside_the_pull_request_are_withheld() {
@@ -1147,5 +1131,49 @@ mod tests {
             "path": ["repository", "pullRequest", "labels"],
         })));
         assert!(!withheld(json!({ "type": "FORBIDDEN" })));
+    }
+
+    #[test]
+    fn review_session_builds_github_review_from_inline_drafts() {
+        let mut session = ReviewSession::new(
+            ReviewTarget::github("owner", "repo", 42),
+            pull_request_info(),
+        );
+        session.create_inline_draft(
+            ReviewAnchor::inline("src/lib.rs", ReviewSide::New, ReviewLineRange::new(10, 3)),
+            "Please simplify this.",
+        );
+        session.create_general_draft("Overall note");
+
+        let request =
+            CreatePullRequestReview::from_drafts(&session, ReviewDecision::RequestChanges, None)
+                .unwrap();
+
+        assert_eq!(request.commit_id.as_deref(), Some("head"));
+        assert_eq!(request.body.as_deref(), Some("Overall note"));
+        assert_eq!(
+            request.event,
+            Some(GitHubPullRequestReviewEvent::RequestChanges)
+        );
+        assert_eq!(request.comments.len(), 1);
+        assert_eq!(request.comments[0].path, "src/lib.rs");
+        assert_eq!(request.comments[0].line, 12);
+        assert_eq!(request.comments[0].start_line, Some(10));
+    }
+
+    #[test]
+    fn review_session_rejects_reply_drafts_in_review_request() {
+        let mut session = ReviewSession::new(
+            ReviewTarget::github("owner", "repo", 42),
+            pull_request_info(),
+        );
+        session.create_reply_draft(
+            ReviewThreadId::remote(ReviewForge::GitHub, "thread"),
+            "Reply",
+        );
+
+        assert!(
+            CreatePullRequestReview::from_drafts(&session, ReviewDecision::Comment, None).is_err()
+        );
     }
 }

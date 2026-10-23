@@ -1400,7 +1400,7 @@ pub fn jj_capabilities(colocated: bool) -> RepoCapabilities {
         operation_log: true,
         // PR comparisons run through the git backend against the colocated
         // .git store, so they are only available in colocated workspaces.
-        github_pull_requests: colocated,
+        forge_pull_requests: colocated,
     }
 }
 
@@ -1616,7 +1616,7 @@ mod tests {
         for (dir, expected) in [(&colocated, true), (&plain, false)] {
             let location = backend.detect(dir.path()).unwrap().unwrap();
             let repo = backend.open(location).unwrap();
-            assert_eq!(repo.capabilities().github_pull_requests, expected);
+            assert_eq!(repo.capabilities().forge_pull_requests, expected);
         }
     }
 
@@ -1693,7 +1693,7 @@ mod tests {
         assert!(working.parents[0].chars().all(|c| c.is_ascii_hexdigit()));
         assert!(snapshot.capabilities.bookmarks);
         assert!(!snapshot.capabilities.staging_area);
-        assert!(snapshot.capabilities.github_pull_requests);
+        assert!(snapshot.capabilities.forge_pull_requests);
         assert!(snapshot.file_changes.iter().any(|file| {
             file.path == "README.md"
                 && file.status == FileChangeStatus::Added

@@ -17,7 +17,7 @@ use crate::app::shell::Slot;
 use crate::app::text_targets::REVIEW_OVERVIEW;
 use crate::app::tokens::{self, Ico, Layout, Rad, Sp, Sz, TextStyle, Tint};
 use crate::contracts::review::{CardKey, ReviewAction};
-use crate::core::forge::github::{
+use crate::core::forge::model::{
     PullRequestCheckContext, PullRequestInfo, PullRequestLabel, PullRequestOverview,
     PullRequestReviewer, PullRequestTimelineItem, PullRequestTimelineKind,
 };

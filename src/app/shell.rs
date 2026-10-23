@@ -32,6 +32,7 @@ use crate::contracts::shell::{
 };
 use crate::contracts::viewport::ViewportAction;
 use crate::core::compare::RendererKind;
+use crate::core::review::ReviewForge;
 use crate::core::vcs::model::RefKind;
 
 pub trait EffectDispatcher: 'static {
@@ -629,7 +630,7 @@ impl<D: EffectDispatcher> DiffyApp<D> {
                 width,
                 height,
             };
-            let signed_in = self.controllers.review.signed_in();
+            let signed_in = self.controllers.review.signed_in(ReviewForge::GitHub);
             if let Some(launcher) =
                 commands::launcher(&mut self.controllers.commands, &slot, signed_in, cx)
             {

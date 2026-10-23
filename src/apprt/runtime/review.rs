@@ -8,7 +8,7 @@ use crate::apprt::services::ReviewServices;
 use crate::apprt::transport::ScopedEventSender;
 use crate::contracts::review::{ReviewEffect, ReviewEvent, ReviewScope};
 use crate::core::review::ReviewSession;
-use crate::platform::startup::GitHubTokenStore;
+use crate::platform::startup::TokenStore;
 
 pub(crate) const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 
@@ -108,12 +108,12 @@ fn write_drafts(services: &ReviewServices, pending: &mut HashMap<String, DraftSa
 
 pub struct ReviewRuntime {
     services: ReviewServices,
-    token_store: GitHubTokenStore,
+    token_store: TokenStore,
     drafts: DraftSaver,
 }
 
 impl ReviewRuntime {
-    pub fn new(services: ReviewServices, token_store: GitHubTokenStore) -> Self {
+    pub fn new(services: ReviewServices, token_store: TokenStore) -> Self {
         Self {
             drafts: DraftSaver::new(services.clone()),
             services,
@@ -123,11 +123,11 @@ impl ReviewRuntime {
 
     pub fn dispatch(&self, effect: ReviewEffect, events: ScopedEventSender) {
         match effect {
-            ReviewEffect::GitHub { scope, request } => {
-                let github = Arc::clone(self.services.github());
+            ReviewEffect::Forge { scope, request } => {
+                let forge = Arc::clone(self.services.forge());
                 thread::spawn(move || {
-                    github.execute(*request, &mut |response| {
-                        events.send(ReviewEvent::GitHub {
+                    forge.execute(*request, &mut |response| {
+                        events.send(ReviewEvent::Forge {
                             scope,
                             response: Box::new(response),
                         });
@@ -167,61 +167,63 @@ impl ReviewRuntime {
                     events.send(event);
                 });
             }
-            ReviewEffect::LoadToken => {
-                if self.token_store == GitHubTokenStore::Disabled {
-                    events.send(ReviewEvent::TokenLoaded { token: None });
+            ReviewEffect::LoadToken(forge) => {
+                if self.token_store == TokenStore::Disabled {
+                    events.send(ReviewEvent::TokenLoaded { forge, token: None });
                     return;
                 }
                 let services = self.services.clone();
                 let store = self.token_store;
                 thread::spawn(move || {
                     let result = match store {
-                        GitHubTokenStore::Keyring => services.load_keyring_token(),
-                        GitHubTokenStore::DevFile => services.load_dev_token(),
-                        GitHubTokenStore::Disabled => Ok(None),
+                        TokenStore::Keyring => services.load_keyring_token(forge),
+                        TokenStore::DevFile => services.load_dev_token(forge),
+                        TokenStore::Disabled => Ok(None),
                     };
                     let event = match result {
-                        Ok(token) => ReviewEvent::TokenLoaded { token },
+                        Ok(token) => ReviewEvent::TokenLoaded { forge, token },
                         Err(error) => ReviewEvent::TokenLoadFailed {
+                            forge,
                             message: error.user_message(),
                         },
                     };
                     events.send(event);
                 });
             }
-            ReviewEffect::SaveToken(token) => {
-                if self.token_store == GitHubTokenStore::Disabled {
+            ReviewEffect::SaveToken { forge, token } => {
+                if self.token_store == TokenStore::Disabled {
                     return;
                 }
                 let services = self.services.clone();
                 let store = self.token_store;
                 thread::spawn(move || {
                     let result = match store {
-                        GitHubTokenStore::Keyring => services.save_keyring_token(&token),
-                        GitHubTokenStore::DevFile => services.save_dev_token(&token),
-                        GitHubTokenStore::Disabled => Ok(()),
+                        TokenStore::Keyring => services.save_keyring_token(forge, &token),
+                        TokenStore::DevFile => services.save_dev_token(forge, &token),
+                        TokenStore::Disabled => Ok(()),
                     };
                     if let Err(error) = result {
                         events.send(ReviewEvent::TokenSaveFailed {
+                            forge,
                             message: error.user_message(),
                         });
                     }
                 });
             }
-            ReviewEffect::ClearToken => {
-                if self.token_store == GitHubTokenStore::Disabled {
+            ReviewEffect::ClearToken(forge) => {
+                if self.token_store == TokenStore::Disabled {
                     return;
                 }
                 let services = self.services.clone();
                 let store = self.token_store;
                 thread::spawn(move || {
                     let result = match store {
-                        GitHubTokenStore::Keyring => services.clear_keyring_token(),
-                        GitHubTokenStore::DevFile => services.clear_dev_token(),
-                        GitHubTokenStore::Disabled => Ok(()),
+                        TokenStore::Keyring => services.clear_keyring_token(forge),
+                        TokenStore::DevFile => services.clear_dev_token(forge),
+                        TokenStore::Disabled => Ok(()),
                     };
                     if let Err(error) = result {
-                        tracing::warn!("failed to clear GitHub token: {error}");
+                        tracing::warn!("failed to clear {} token: {error}", forge.name());
                     }
                 });
             }
@@ -300,11 +302,11 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::apprt::services::LiveGitHub;
+    use crate::apprt::services::LiveForge;
     use crate::apprt::transport::RuntimeEventSender;
     use crate::contracts::shared::{AccountEpoch, JobId, WorkspaceEpoch};
     use crate::contracts::shell::{AppEvent, AppMessage};
-    use crate::core::forge::github::PullRequestInfo;
+    use crate::core::forge::model::PullRequestInfo;
     use crate::core::review::{ReviewAnchor, ReviewLineRange, ReviewSide, ReviewTarget};
     use crate::platform::persistence::SettingsStore;
     use crate::platform::review_store::ReviewStore;
@@ -329,9 +331,9 @@ mod tests {
         let services = ReviewServices::new(
             SettingsStore::new_in(dir.join("settings.json")),
             store.clone(),
-            Arc::new(LiveGitHub::new(store)),
+            Arc::new(LiveForge::new(store)),
         );
-        ReviewRuntime::new(services, GitHubTokenStore::Disabled)
+        ReviewRuntime::new(services, TokenStore::Disabled)
     }
 
     fn saved_body(dir: &std::path::Path) -> Option<String> {

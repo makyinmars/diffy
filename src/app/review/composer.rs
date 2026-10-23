@@ -21,7 +21,7 @@ pub enum ComposerTarget {
     },
     Edit {
         thread: ReviewThreadId,
-        comment_node_id: String,
+        comment_id: String,
     },
     Conversation,
 }
@@ -63,9 +63,7 @@ impl ComposerTarget {
             Self::Draft(id) | Self::Reply { draft: id, .. } => {
                 format!("review.composer.draft.{}", id.0)
             }
-            Self::Edit {
-                comment_node_id, ..
-            } => format!("review.composer.edit.{comment_node_id}"),
+            Self::Edit { comment_id, .. } => format!("review.composer.edit.{comment_id}"),
             Self::Conversation => "review.composer.conversation".to_owned(),
         }
     }

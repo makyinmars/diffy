@@ -17,12 +17,12 @@ use crate::apprt::vcs_worker::VcsWorker;
 use crate::apprt::watcher::RepoWatchWorker;
 use crate::contracts::shared::WorkspaceEpoch;
 use crate::contracts::shell::{Effect, ShellEffect, ShellEvent};
-use crate::platform::startup::GitHubTokenStore;
+use crate::platform::startup::TokenStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuntimeOptions {
     pub keyring_enabled: bool,
-    pub github_token_store: GitHubTokenStore,
+    pub token_store: TokenStore,
 }
 
 pub struct AppRuntime {
@@ -49,7 +49,7 @@ impl AppRuntime {
                 watcher,
             ),
             commands: commands::CommandsRuntime::new(services.commands),
-            review: review::ReviewRuntime::new(services.review, options.github_token_store),
+            review: review::ReviewRuntime::new(services.review, options.token_store),
             mutations: mutations::MutationsRuntime::new(
                 services.mutations,
                 vcs,

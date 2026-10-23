@@ -3,11 +3,13 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use super::api::{
-    GitHubApi, PullRequestCheckSummary, bool_field, int_field, optional_string_field,
-    parse_check_summary, string_field,
+    GitHubApi, bool_field, int_field, optional_string_field, parse_check_summary, string_field,
 };
-use super::overview::{PullRequestReviewer, actor, nodes};
+use super::overview::{actor, nodes};
 use crate::core::error::{DiffyError, Result};
+use crate::core::forge::model::{
+    MyPullRequest, PullRequestCheckSummary, PullRequestReviewer, PullRequestStats,
+};
 
 const SEARCH: &str = "is:pr is:open author:@me archived:false sort:updated-desc";
 const EXCERPT_CHARS: usize = 280;
@@ -92,40 +94,6 @@ query DiffyMyPullRequestChecks($search: String!) {
   }
 }
 "#;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PullRequestStats {
-    pub mergeable: String,
-    pub additions: i32,
-    pub deletions: i32,
-    pub changed_files: i32,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MyPullRequest {
-    pub id: String,
-    pub number: i32,
-    pub title: String,
-    pub url: String,
-    pub repository: String,
-    pub is_draft: bool,
-    pub updated_at: String,
-    pub head_branch: String,
-    pub base_branch: String,
-    pub review_decision: Option<String>,
-    pub reviewers: Vec<PullRequestReviewer>,
-    pub requested_reviewers: usize,
-    pub unresolved_threads: usize,
-    pub excerpt: String,
-    pub stats: Option<PullRequestStats>,
-    pub checks: Option<PullRequestCheckSummary>,
-}
-
-impl MyPullRequest {
-    pub fn repo_key(&self) -> String {
-        self.repository.to_ascii_lowercase()
-    }
-}
 
 impl GitHubApi {
     pub fn fetch_my_pull_requests(&self) -> Result<Vec<MyPullRequest>> {

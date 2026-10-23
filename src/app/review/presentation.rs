@@ -32,7 +32,7 @@ use crate::app::text_targets::REVIEW_COMPOSER;
 use crate::app::tokens::{self, Alpha, Ico, Rad, Sp, TextStyle};
 use crate::contracts::review::{CardKey, ComposerFormat, ReviewAction};
 use crate::contracts::shared::{FileKey, SharedContext, SourceTarget};
-use crate::core::forge::github::PullRequestTimelineKind;
+use crate::core::forge::model::PullRequestTimelineKind;
 use crate::core::review::{
     ReviewDraft, ReviewDraftKind, ReviewDraftState, ReviewResolution, ReviewSession, ReviewSide,
     ReviewThread,
@@ -181,7 +181,7 @@ fn comment_menu(actions: CommentActions, theme: &Theme) -> AnyElement {
             lucide::MORE_HORIZONTAL,
             "Comment actions",
             action(ReviewAction::ToggleCommentMenu {
-                comment_node_id: node.clone(),
+                comment_id: node.clone(),
             }),
             theme,
         );
@@ -191,7 +191,7 @@ fn comment_menu(actions: CommentActions, theme: &Theme) -> AnyElement {
         button(
             "Edit",
             ReviewAction::EditComment {
-                comment_node_id: node.clone(),
+                comment_id: node.clone(),
             },
             Tone::Ghost,
             format!("review.comment.edit.{node}"),
@@ -201,7 +201,7 @@ fn comment_menu(actions: CommentActions, theme: &Theme) -> AnyElement {
         delete_button(
             actions.confirm,
             ReviewAction::DeleteComment {
-                comment_node_id: node.clone(),
+                comment_id: node.clone(),
             },
             format!("review.comment.delete.{node}"),
         )
@@ -218,7 +218,7 @@ fn comment_menu(actions: CommentActions, theme: &Theme) -> AnyElement {
         lucide::X,
         "Close actions",
         action(ReviewAction::ToggleCommentMenu {
-            comment_node_id: node.clone(),
+            comment_id: node.clone(),
         }),
         theme,
     );
@@ -746,8 +746,8 @@ pub fn thread_line_label(anchor: Option<&crate::core::review::ReviewAnchor>) -> 
         Some(ReviewSide::Old) => "L",
         None => "",
     };
-    let line = range.github_line();
-    match range.github_start_line() {
+    let line = range.end_inclusive();
+    match range.multi_line_start() {
         Some(start) => format!("Comment on lines {side}{start}\u{2013}{side}{line}"),
         None => format!("Comment on line {side}{line}"),
     }
@@ -825,7 +825,7 @@ fn comment_rows(
                 comment.body.clone()
             };
             let actions = comment
-                .backend_node_id
+                .remote_id
                 .clone()
                 .filter(|_| {
                     comment.viewer_can_update
@@ -941,10 +941,10 @@ fn thread_model(
         resolution: resolution_action(thread),
         edit_node: first
             .filter(|c| c.viewer_can_update)
-            .and_then(|c| c.backend_node_id.clone()),
+            .and_then(|c| c.remote_id.clone()),
         delete_node: first
             .filter(|c| c.viewer_can_delete)
-            .and_then(|c| c.backend_node_id.clone()),
+            .and_then(|c| c.remote_id.clone()),
         confirm_delete: false,
         failure: failed.as_ref().map(|(_, message)| message.clone()),
         retry_draft: failed.map(|(id, _)| id),
@@ -1049,7 +1049,7 @@ impl ReviewPresentation {
             _ => None,
         });
         let viewer = controller
-            .account
+            .account(controller.active_forge())
             .user
             .as_ref()
             .map(|user| user.login.as_str());

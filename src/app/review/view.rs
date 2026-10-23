@@ -16,8 +16,8 @@ use crate::app::text_targets::{REVIEW_ACCOUNT, REVIEW_DIALOG};
 use crate::app::tokens::{self, Bp, Ico, Layout, Rad, Shadow, Sp, Sz, TextStyle};
 use crate::contracts::review::{PullsAction, ReviewAction};
 use crate::contracts::shell::ShellAction;
-use crate::core::forge::github::{PullRequestCheckSummary, PullRequestOverview};
-use crate::core::review::ReviewDecision;
+use crate::core::forge::model::{PullRequestCheckSummary, PullRequestOverview};
+use crate::core::review::{ReviewDecision, ReviewForge};
 
 const CARD_MAX_WIDTH: f32 = 600.0;
 const ACCOUNT_MENU_WIDTH: f32 = 260.0;
@@ -51,7 +51,7 @@ pub fn view(review: &mut ReviewController, slot: &Slot, cx: &mut ViewContext) ->
     let submit = review
         .active_pull_request()
         .and(review.review_counts())
-        .filter(|_| review.signed_in())
+        .filter(|_| review.signed_in(review.active_forge()))
         .map(|(_, pending, failed)| {
             let tone = if pending + failed > 0 {
                 Tone::Primary
@@ -317,7 +317,7 @@ fn checks_status(checks: &PullRequestCheckSummary, theme: &Theme) -> Option<AnyE
 
 fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
     let scale = tokens::ui_scale(theme);
-    if !review.signed_in() {
+    if !review.signed_in(ReviewForge::GitHub) {
         return controls::ghost_chip(
             GhostChip {
                 icon: lucide::GITHUB_MARK,
@@ -330,7 +330,7 @@ fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
             theme,
         );
     }
-    let account = review.account();
+    let account = review.account(ReviewForge::GitHub);
     let login = account
         .user
         .as_ref()
@@ -372,10 +372,10 @@ fn auth_modal(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyEleme
         view! { <text size={small} color={tc.text_muted}>{label}</text> }
     };
     let cancel = || controls::button("Cancel", action(ReviewAction::CloseOverlay), Tone::Ghost);
-    let (content, actions) = match &review.account().auth {
-        _ if review.signed_in() => {
+    let (content, actions) = match &review.account(ReviewForge::GitHub).auth {
+        _ if review.signed_in(ReviewForge::GitHub) => {
             let login = review
-                .account()
+                .account(ReviewForge::GitHub)
                 .user
                 .as_ref()
                 .map_or_else(|| "GitHub".to_owned(), |user| format!("@{}", user.login));
@@ -495,7 +495,7 @@ fn account_menu(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyEle
     let width = tokens::scaled(ACCOUNT_MENU_WIDTH, scale);
     let left = (slot.width - width - tokens::scaled(Sp::MD, scale)).max(0.0);
     let top = theme.metrics.title_bar_height + tokens::scaled(Sp::XS, scale);
-    let account = review.account();
+    let account = review.account(ReviewForge::GitHub);
     let (title, login) = match account.user.as_ref() {
         Some(user) if !user.name.is_empty() && user.name != user.login => {
             (user.name.clone(), format!("@{}", user.login))
@@ -615,8 +615,11 @@ pub fn accounts_settings(review: &ReviewController, theme: &Theme) -> AnyElement
     let scale = tokens::ui_scale(theme);
     let body = TextStyle::Body.font_size(theme);
     let small = TextStyle::BodySmall.font_size(theme);
-    let account = review.account();
-    let user = account.user.as_ref().filter(|_| review.signed_in());
+    let account = review.account(ReviewForge::GitHub);
+    let user = account
+        .user
+        .as_ref()
+        .filter(|_| review.signed_in(ReviewForge::GitHub));
     let (title, detail) = match (user, &account.auth) {
         (Some(user), _) if !user.name.is_empty() && user.name != user.login => {
             (user.name.clone(), format!("Signed in as @{}", user.login))
@@ -634,7 +637,7 @@ pub fn accounts_settings(review: &ReviewController, theme: &Theme) -> AnyElement
     let picture = avatar(title.clone())
         .size(Ico::XXL)
         .image(user.and(account.avatar.clone()));
-    let control = if review.signed_in() {
+    let control = if review.signed_in(ReviewForge::GitHub) {
         controls::button("Sign out", action(ReviewAction::SignOut), Tone::Secondary)
     } else {
         controls::button(

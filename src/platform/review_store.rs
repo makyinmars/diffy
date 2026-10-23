@@ -153,7 +153,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::ReviewStore;
-    use crate::core::forge::github::PullRequestInfo;
+    use crate::core::forge::model::PullRequestInfo;
     use crate::core::review::{ReviewSession, ReviewTarget};
 
     #[test]

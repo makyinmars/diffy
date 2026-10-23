@@ -19,8 +19,9 @@ use crate::app::shell::Slot;
 use crate::app::text_targets::{REVIEW_PULLS, REVIEW_PULLS_FILTER};
 use crate::app::tokens::{self, Bp, Ico, Layout, Rad, Sp, TextStyle};
 use crate::contracts::review::{PullsAction, ReviewAction};
-use crate::core::forge::github::{MyPullRequest, PullRequestCheckSummary, PullRequestReviewer};
+use crate::core::forge::model::{MyPullRequest, PullRequestCheckSummary, PullRequestReviewer};
 use crate::core::ref_catalog::{now_secs, relative_age};
+use crate::core::review::ReviewForge;
 
 const ROW_FACES: usize = 3;
 
@@ -153,7 +154,7 @@ impl Page<'_> {
             pulls(PullsAction::Refresh),
             self.theme,
         )
-        .disabled(page.loading || !self.review.signed_in());
+        .disabled(page.loading || !self.review.signed_in(ReviewForge::GitHub));
         let close = controls::button("Close", pulls(PullsAction::Close), Tone::Ghost)
             .icon(lucide::X)
             .tooltip("Esc");
@@ -703,7 +704,7 @@ pub fn pulls_page(review: &ReviewController, slot: &Slot, cx: &mut ViewContext) 
     };
     let state = review.pulls();
     let header = page.header(state);
-    let body = if review.signed_in() {
+    let body = if review.signed_in(ReviewForge::GitHub) {
         let preview_w = tokens::scaled(Layout::PULLS_PREVIEW_W, scale);
         let wide = slot.width >= tokens::scaled(Bp::NARROW, scale);
         let list_w = if wide {

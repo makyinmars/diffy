@@ -57,7 +57,7 @@ pub fn start() -> Result<(), Box<dyn std::error::Error>> {
         crate::apprt::services::AppServices::new(settings_store),
         crate::apprt::runtime::RuntimeOptions {
             keyring_enabled: options.keyring_enabled,
-            github_token_store: options.github_token_store,
+            token_store: options.token_store,
         },
     );
     let run_options = RunOptions {

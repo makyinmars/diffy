@@ -5,9 +5,9 @@ use std::path::Path;
 use keyring::Entry;
 
 use crate::core::error::{DiffyError, Result};
+use crate::core::review::ReviewForge;
 
 const SERVICE: &str = "diffy";
-const GITHUB_ACCOUNT: &str = "github.access_token";
 const OPENAI_ACCOUNT: &str = "ai.openai_api_key";
 const ANTHROPIC_ACCOUNT: &str = "ai.anthropic_api_key";
 
@@ -40,19 +40,23 @@ fn clear(account: &str) -> Result<()> {
     }
 }
 
-pub fn load_github_token() -> Result<Option<String>> {
-    load(GITHUB_ACCOUNT)
+fn token_account(forge: ReviewForge) -> String {
+    format!("{}.access_token", forge.key())
 }
 
-pub fn save_github_token(token: &str) -> Result<()> {
-    save(GITHUB_ACCOUNT, token)
+pub fn load_forge_token(forge: ReviewForge) -> Result<Option<String>> {
+    load(&token_account(forge))
 }
 
-pub fn clear_github_token() -> Result<()> {
-    clear(GITHUB_ACCOUNT)
+pub fn save_forge_token(forge: ReviewForge, token: &str) -> Result<()> {
+    save(&token_account(forge), token)
 }
 
-pub fn load_github_token_file(path: &Path) -> Result<Option<String>> {
+pub fn clear_forge_token(forge: ReviewForge) -> Result<()> {
+    clear(&token_account(forge))
+}
+
+pub fn load_token_file(path: &Path) -> Result<Option<String>> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -62,10 +66,10 @@ pub fn load_github_token_file(path: &Path) -> Result<Option<String>> {
     Ok((!token.is_empty()).then_some(token))
 }
 
-pub fn save_github_token_file(path: &Path, token: &str) -> Result<()> {
+pub fn save_token_file(path: &Path, token: &str) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         DiffyError::General(format!(
-            "GitHub token file path has no parent directory: {}",
+            "token file path has no parent directory: {}",
             path.display()
         ))
     })?;
@@ -89,7 +93,7 @@ pub fn save_github_token_file(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn clear_github_token_file(path: &Path) -> Result<()> {
+pub fn clear_token_file(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -126,20 +130,26 @@ pub fn clear_ai_key(kind: AiKeyKind) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_github_token_file, load_github_token_file, save_github_token_file};
+    use super::{clear_token_file, load_token_file, save_token_file, token_account};
+    use crate::core::review::ReviewForge;
 
     #[test]
     fn github_token_file_round_trips() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("github-token.dev");
 
-        assert_eq!(load_github_token_file(&path).unwrap(), None);
-        save_github_token_file(&path, "  gho_test_token  ").unwrap();
+        assert_eq!(load_token_file(&path).unwrap(), None);
+        save_token_file(&path, "  gho_test_token  ").unwrap();
         assert_eq!(
-            load_github_token_file(&path).unwrap().as_deref(),
+            load_token_file(&path).unwrap().as_deref(),
             Some("gho_test_token")
         );
-        clear_github_token_file(&path).unwrap();
-        assert_eq!(load_github_token_file(&path).unwrap(), None);
+        clear_token_file(&path).unwrap();
+        assert_eq!(load_token_file(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn github_keeps_its_keyring_account() {
+        assert_eq!(token_account(ReviewForge::GitHub), "github.access_token");
     }
 }

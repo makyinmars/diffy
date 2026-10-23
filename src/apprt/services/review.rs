@@ -5,17 +5,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::contracts::review::{
-    AvatarImage, GitHubRequest, GitHubResponse, PullRequestComparison, PullRequestRef, Secret,
+    AvatarImage, ForgeRequest, ForgeResponse, PullRequestComparison, Secret,
 };
 use crate::core::compare::{LayoutMode, RendererKind};
 use crate::core::error::{DiffyError, Result};
 use crate::core::forge::github::{
-    DeviceFlowState, GitHubApi, PullRequestInfo, parse_pr_url, poll_for_token, start_device_flow,
+    CreatePullRequestReview, DeviceFlowState, GitHubApi, parse_pr_url, poll_for_token,
+    start_device_flow,
 };
+use crate::core::forge::model::PullRequestInfo;
 use crate::core::frecency::{FrecencyStore, recent_repo_paths};
 use crate::core::http;
 use crate::core::repo_discovery;
-use crate::core::review::{ReviewSession, ReviewSessionKey, ReviewTarget};
+use crate::core::review::{ReviewForge, ReviewSession, ReviewSessionKey, ReviewTarget};
 use crate::core::vcs::discovery;
 use crate::core::vcs::git::{github_remotes, pr_ref_path};
 use crate::core::vcs::model::{VcsCompareRequest, VcsCompareSpec, VcsKind};
@@ -23,35 +25,34 @@ use crate::platform::persistence::SettingsStore;
 use crate::platform::review_store::ReviewStore;
 use crate::platform::secrets;
 
-const DEV_GITHUB_TOKEN_FILE_NAME: &str = "github-token.dev";
 const CLONE_CANDIDATES: usize = 400;
 
-pub trait GitHubBackend: Send + Sync + 'static {
-    fn execute(&self, request: GitHubRequest, emit: &mut dyn FnMut(GitHubResponse));
+pub trait ForgeBackend: Send + Sync + 'static {
+    fn execute(&self, request: ForgeRequest, emit: &mut dyn FnMut(ForgeResponse));
 }
 
 #[derive(Clone)]
 pub struct ReviewServices {
     settings_store: SettingsStore,
     review_store: ReviewStore,
-    github: Arc<dyn GitHubBackend>,
+    forge: Arc<dyn ForgeBackend>,
 }
 
 impl ReviewServices {
     pub fn new(
         settings_store: SettingsStore,
         review_store: ReviewStore,
-        github: Arc<dyn GitHubBackend>,
+        forge: Arc<dyn ForgeBackend>,
     ) -> Self {
         Self {
             settings_store,
             review_store,
-            github,
+            forge,
         }
     }
 
-    pub fn github(&self) -> &Arc<dyn GitHubBackend> {
-        &self.github
+    pub fn forge(&self) -> &Arc<dyn ForgeBackend> {
+        &self.forge
     }
 
     pub fn start_device_flow(&self, client_id: &str) -> Result<DeviceFlowState> {
@@ -77,32 +78,34 @@ impl ReviewServices {
         }
     }
 
-    pub fn load_keyring_token(&self) -> Result<Option<Secret>> {
-        Ok(secrets::load_github_token()?.map(Secret::new))
+    pub fn load_keyring_token(&self, forge: ReviewForge) -> Result<Option<Secret>> {
+        Ok(secrets::load_forge_token(forge)?.map(Secret::new))
     }
 
-    pub fn save_keyring_token(&self, token: &Secret) -> Result<()> {
-        secrets::save_github_token(token.expose())
+    pub fn save_keyring_token(&self, forge: ReviewForge, token: &Secret) -> Result<()> {
+        secrets::save_forge_token(forge, token.expose())
     }
 
-    pub fn clear_keyring_token(&self) -> Result<()> {
-        secrets::clear_github_token()
+    pub fn clear_keyring_token(&self, forge: ReviewForge) -> Result<()> {
+        secrets::clear_forge_token(forge)
     }
 
-    pub fn load_dev_token(&self) -> Result<Option<Secret>> {
-        Ok(secrets::load_github_token_file(&self.dev_token_path()?)?.map(Secret::new))
+    pub fn load_dev_token(&self, forge: ReviewForge) -> Result<Option<Secret>> {
+        Ok(secrets::load_token_file(&self.dev_token_path(forge))?.map(Secret::new))
     }
 
-    pub fn save_dev_token(&self, token: &Secret) -> Result<()> {
-        secrets::save_github_token_file(&self.dev_token_path()?, token.expose())
+    pub fn save_dev_token(&self, forge: ReviewForge, token: &Secret) -> Result<()> {
+        secrets::save_token_file(&self.dev_token_path(forge), token.expose())
     }
 
-    pub fn clear_dev_token(&self) -> Result<()> {
-        secrets::clear_github_token_file(&self.dev_token_path()?)
+    pub fn clear_dev_token(&self, forge: ReviewForge) -> Result<()> {
+        secrets::clear_token_file(&self.dev_token_path(forge))
     }
 
-    fn dev_token_path(&self) -> Result<PathBuf> {
-        Ok(self.settings_store.dir().join(DEV_GITHUB_TOKEN_FILE_NAME))
+    fn dev_token_path(&self, forge: ReviewForge) -> PathBuf {
+        self.settings_store
+            .dir()
+            .join(format!("{}-token.dev", forge.key()))
     }
 
     pub fn load_session(
@@ -190,11 +193,11 @@ impl ReviewServices {
 }
 
 #[derive(Clone)]
-pub struct LiveGitHub {
+pub struct LiveForge {
     review_store: ReviewStore,
 }
 
-impl LiveGitHub {
+impl LiveForge {
     pub fn new(review_store: ReviewStore) -> Self {
         Self { review_store }
     }
@@ -219,7 +222,7 @@ impl LiveGitHub {
             elapsed_ms = stage_started.elapsed().as_millis(),
             "github-pr: opened repository"
         );
-        if !repo.capabilities().github_pull_requests {
+        if !repo.capabilities().forge_pull_requests {
             return Err(DiffyError::General(
                 "this repository backend does not support GitHub pull request comparisons"
                     .to_owned(),
@@ -260,7 +263,7 @@ impl LiveGitHub {
         }
 
         let mut repo = discovery::open_repository(repo_path)?;
-        if !repo.capabilities().github_pull_requests {
+        if !repo.capabilities().forge_pull_requests {
             return Ok(None);
         }
         if repo.location().kind != VcsKind::GIT {
@@ -315,194 +318,192 @@ fn public_api(token: Option<Secret>) -> GitHubApi {
     }
 }
 
-impl GitHubBackend for LiveGitHub {
-    fn execute(&self, request: GitHubRequest, emit: &mut dyn FnMut(GitHubResponse)) {
+impl ForgeBackend for LiveForge {
+    fn execute(&self, request: ForgeRequest, emit: &mut dyn FnMut(ForgeResponse)) {
+        match request.forge() {
+            ReviewForge::GitHub => self.execute_github(request, emit),
+            ReviewForge::Bitbucket => {
+                emit(request.fail("Bitbucket pull requests aren't supported yet.".to_owned()))
+            }
+        }
+    }
+}
+
+impl LiveForge {
+    fn execute_github(&self, request: ForgeRequest, emit: &mut dyn FnMut(ForgeResponse)) {
         let response = match request {
-            GitHubRequest::LoadPullRequest {
+            ForgeRequest::LoadPullRequest {
                 url,
                 repo_path,
                 token,
             } => {
                 if let Ok(Some(comparison)) = self.cached_pull_request_comparison(&url, &repo_path)
                 {
-                    emit(GitHubResponse::PullRequestCached {
+                    emit(ForgeResponse::PullRequestCached {
                         url: url.clone(),
                         comparison,
                     });
                 }
                 match self.load_pull_request(&url, &repo_path, token) {
-                    Ok(comparison) => GitHubResponse::PullRequestLoaded { url, comparison },
-                    Err(error) => GitHubResponse::PullRequestLoadFailed {
+                    Ok(comparison) => ForgeResponse::PullRequestLoaded { url, comparison },
+                    Err(error) => ForgeResponse::PullRequestLoadFailed {
                         url,
                         message: error.user_message(),
                     },
                 }
             }
-            GitHubRequest::FetchUser { token } => {
+            ForgeRequest::FetchUser { token, .. } => {
                 if token.is_empty() {
-                    GitHubResponse::UserFetchFailed {
+                    ForgeResponse::UserFetchFailed {
                         message: "cannot fetch GitHub user without a token".to_owned(),
                     }
                 } else {
                     match GitHubApi::with_token(token.into_inner()).fetch_current_user() {
-                        Ok(user) => GitHubResponse::UserFetched(user),
-                        Err(error) => GitHubResponse::UserFetchFailed {
+                        Ok(user) => ForgeResponse::UserFetched(user),
+                        Err(error) => ForgeResponse::UserFetchFailed {
                             message: error.user_message(),
                         },
                     }
                 }
             }
-            GitHubRequest::PeekPullRequest { pr, token } => {
+            ForgeRequest::PeekPullRequest { pr, token } => {
                 match public_api(token).fetch_pull_request(&pr.owner, &pr.repo, pr.number) {
-                    Ok(info) => GitHubResponse::PullRequestPeeked { pr, info },
-                    Err(error) => GitHubResponse::PullRequestPeekFailed {
+                    Ok(info) => ForgeResponse::PullRequestPeeked { pr, info },
+                    Err(error) => ForgeResponse::PullRequestPeekFailed {
                         pr,
                         message: error.user_message(),
                     },
                 }
             }
-            GitHubRequest::FetchReviewComments { pr, token } => match public_api(token)
+            ForgeRequest::FetchReviewComments { pr, token } => match public_api(token)
                 .fetch_pull_request_review_comments(&pr.owner, &pr.repo, pr.number)
             {
-                Ok(comments) => GitHubResponse::ReviewCommentsLoaded { pr, comments },
-                Err(error) => GitHubResponse::ReviewCommentsLoadFailed {
+                Ok(comments) => ForgeResponse::ReviewCommentsLoaded { pr, comments },
+                Err(error) => ForgeResponse::ReviewCommentsLoadFailed {
                     pr,
                     message: error.user_message(),
                 },
             },
-            GitHubRequest::FetchReviewData { pr, token } => {
+            ForgeRequest::FetchReviewData { pr, token } => {
                 match api(token).fetch_pull_request_review_data(&pr.owner, &pr.repo, pr.number) {
-                    Ok(data) => GitHubResponse::ReviewDataLoaded {
+                    Ok(data) => ForgeResponse::ReviewDataLoaded {
                         pr,
                         data: Box::new(data),
                     },
-                    Err(error) => GitHubResponse::ReviewDataLoadFailed {
+                    Err(error) => ForgeResponse::ReviewDataLoadFailed {
                         pr,
                         message: error.user_message(),
                     },
                 }
             }
-            GitHubRequest::SubmitSessionDrafts {
+            ForgeRequest::SubmitSessionDrafts {
                 session,
                 decision,
                 body,
                 token,
             } => {
-                let pr = PullRequestRef {
-                    owner: session.target.owner.clone(),
-                    repo: session.target.repo.clone(),
-                    number: session.target.number,
-                };
+                let pr = session.target.clone();
                 let draft_ids = session
                     .pending_drafts()
                     .map(|draft| draft.id)
                     .collect::<Vec<_>>();
-                let result = session
-                    .build_github_review_request(decision, body)
+                let result = CreatePullRequestReview::from_drafts(&session, decision, body)
                     .and_then(|review| {
                         api(token)
                             .create_pull_request_review(&pr.owner, &pr.repo, pr.number, &review)
                     });
                 match result {
-                    Ok(review) => GitHubResponse::DraftsSubmitted {
-                        pr,
-                        review,
-                        draft_ids,
-                    },
-                    Err(error) => GitHubResponse::DraftsSubmitFailed {
+                    Ok(_) => ForgeResponse::DraftsSubmitted { pr, draft_ids },
+                    Err(error) => ForgeResponse::DraftsSubmitFailed {
                         pr,
                         draft_ids,
                         message: error.user_message(),
                     },
                 }
             }
-            GitHubRequest::AddThreadReply {
+            ForgeRequest::AddThreadReply {
                 pr,
-                thread_node_id,
+                thread_id,
                 token,
                 body,
-            } => match api(token).add_pull_request_review_thread_reply(&thread_node_id, &body) {
-                Ok(comment) => GitHubResponse::ThreadReplyAdded {
+            } => match api(token).add_pull_request_review_thread_reply(&thread_id, &body) {
+                Ok(comment) => ForgeResponse::ThreadReplyAdded {
                     pr,
-                    thread_node_id,
+                    thread_id,
                     comment,
                 },
-                Err(error) => GitHubResponse::ThreadReplyAddFailed {
+                Err(error) => ForgeResponse::ThreadReplyAddFailed {
                     pr,
-                    thread_node_id,
+                    thread_id,
                     message: error.user_message(),
                 },
             },
-            GitHubRequest::UpdateCommentGraphql {
+            ForgeRequest::UpdateComment {
                 pr,
-                comment_node_id,
+                comment_id,
                 token,
                 body,
-            } => match api(token)
-                .update_pull_request_review_comment_graphql(&comment_node_id, &body)
-            {
-                Ok(comment) => GitHubResponse::CommentGraphqlUpdated { pr, comment },
-                Err(error) => GitHubResponse::CommentGraphqlUpdateFailed {
+            } => match api(token).update_pull_request_review_comment_graphql(&comment_id, &body) {
+                Ok(comment) => ForgeResponse::CommentUpdated { pr, comment },
+                Err(error) => ForgeResponse::CommentUpdateFailed {
                     pr,
-                    comment_node_id,
+                    comment_id,
                     message: error.user_message(),
                 },
             },
-            GitHubRequest::DeleteCommentGraphql {
+            ForgeRequest::DeleteComment {
                 pr,
-                comment_node_id,
+                comment_id,
                 token,
-            } => match api(token).delete_pull_request_review_comment_graphql(&comment_node_id) {
-                Ok(comment) => GitHubResponse::CommentGraphqlDeleted {
+            } => match api(token).delete_pull_request_review_comment_graphql(&comment_id) {
+                Ok(comment) => ForgeResponse::CommentDeleted {
                     pr,
-                    comment_node_id,
+                    comment_id,
                     comment,
                 },
-                Err(error) => GitHubResponse::CommentGraphqlDeleteFailed {
+                Err(error) => ForgeResponse::CommentDeleteFailed {
                     pr,
-                    comment_node_id,
+                    comment_id,
                     message: error.user_message(),
                 },
             },
-            GitHubRequest::SetThreadResolution {
+            ForgeRequest::SetThreadResolution {
                 pr,
-                thread_node_id,
+                thread_id,
                 token,
                 resolved,
-            } => match api(token)
-                .set_pull_request_review_thread_resolution(&thread_node_id, resolved)
-            {
-                Ok(resolution) => GitHubResponse::ThreadResolutionChanged { pr, resolution },
-                Err(error) => GitHubResponse::ThreadResolutionChangeFailed {
+            } => match api(token).set_pull_request_review_thread_resolution(&thread_id, resolved) {
+                Ok(resolution) => ForgeResponse::ThreadResolutionChanged { pr, resolution },
+                Err(error) => ForgeResponse::ThreadResolutionChangeFailed {
                     pr,
-                    thread_node_id,
+                    thread_id,
                     message: error.user_message(),
                 },
             },
-            GitHubRequest::FetchPullRequestOverview { pr, token } => match public_api(token)
+            ForgeRequest::FetchPullRequestOverview { pr, token } => match public_api(token)
                 .fetch_pull_request_overview(&pr.owner, &pr.repo, pr.number)
             {
-                Ok(overview) => GitHubResponse::PullRequestOverviewLoaded {
+                Ok(overview) => ForgeResponse::PullRequestOverviewLoaded {
                     pr,
                     overview: Box::new(overview),
                 },
-                Err(error) => GitHubResponse::PullRequestOverviewLoadFailed {
+                Err(error) => ForgeResponse::PullRequestOverviewLoadFailed {
                     pr,
                     message: error.user_message(),
                 },
             },
-            GitHubRequest::FetchMyPullRequests { token } => {
+            ForgeRequest::FetchMyPullRequests { token, .. } => {
                 match GitHubApi::with_token(token.into_inner()).fetch_my_pull_requests() {
-                    Ok(pulls) => GitHubResponse::MyPullRequestsLoaded(pulls),
-                    Err(error) => GitHubResponse::MyPullRequestsLoadFailed {
+                    Ok(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
+                    Err(error) => ForgeResponse::MyPullRequestsLoadFailed {
                         message: error.user_message(),
                     },
                 }
             }
-            GitHubRequest::AddPullRequestComment { pr, token, body } => {
+            ForgeRequest::AddPullRequestComment { pr, token, body } => {
                 match api(token).add_pull_request_comment(&pr.owner, &pr.repo, pr.number, &body) {
-                    Ok(()) => GitHubResponse::PullRequestCommentAdded { pr },
-                    Err(error) => GitHubResponse::PullRequestCommentAddFailed {
+                    Ok(()) => ForgeResponse::PullRequestCommentAdded { pr },
+                    Err(error) => ForgeResponse::PullRequestCommentAddFailed {
                         pr,
                         body,
                         message: error.user_message(),

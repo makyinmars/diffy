@@ -9,11 +9,12 @@ use quark_ui::text_input::{TextEditCommand, TextEditOutcome, TextField};
 use super::state::{Pending, ReviewController, ReviewOverlay, error, info};
 use crate::app::text_targets::workspace_focus;
 use crate::contracts::commands::SettingsSnapshot;
-use crate::contracts::review::{GitHubRequest, PullsAction, ReviewEffect};
+use crate::contracts::review::{ForgeRequest, PullsAction, ReviewEffect};
 use crate::contracts::shared::{JobId, SharedContext};
 use crate::contracts::shell::{Intent, LogicalFocus, Reduction, ShellEffect};
-use crate::core::forge::github::MyPullRequest;
+use crate::core::forge::model::MyPullRequest;
 use crate::core::ref_catalog::now_secs;
+use crate::core::review::ReviewForge;
 
 const STALE_SECS: i64 = 180;
 
@@ -289,7 +290,7 @@ impl ReviewController {
             PullsAction::Open => self.open_pulls(),
             PullsAction::Close => self.close_pulls(),
             PullsAction::Refresh => {
-                if !self.signed_in() {
+                if !self.signed_in(ReviewForge::GitHub) {
                     self.open_overlay(ReviewOverlay::Auth);
                     return Reduction::changed();
                 }
@@ -383,7 +384,7 @@ impl ReviewController {
         }
         self.focus_request = Some(LogicalFocus::ReviewPulls);
         let mut reduction = Reduction::changed().effect(self.resolve_clones());
-        if self.signed_in() && !self.pulls.loading && self.pulls.stale() {
+        if self.signed_in(ReviewForge::GitHub) && !self.pulls.loading && self.pulls.stale() {
             reduction.merge(self.fetch_pulls());
         }
         reduction
@@ -404,15 +405,16 @@ impl ReviewController {
     }
 
     pub(super) fn fetch_pulls(&mut self) -> Reduction {
-        let Some(token) = self.token() else {
+        let forge = ReviewForge::GitHub;
+        let Some(token) = self.token(forge) else {
             return Reduction::default();
         };
         let scope = self.job(None, Pending::Pulls);
         self.pulls.loading = true;
         self.pulls.request = Some(scope.request);
-        Reduction::changed().effect(ReviewEffect::GitHub {
+        Reduction::changed().effect(ReviewEffect::Forge {
             scope,
-            request: Box::new(GitHubRequest::FetchMyPullRequests { token }),
+            request: Box::new(ForgeRequest::FetchMyPullRequests { forge, token }),
         })
     }
 
@@ -533,7 +535,7 @@ impl ReviewController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::forge::github::{PullRequestCheckSummary, PullRequestStats};
+    use crate::core::forge::model::{PullRequestCheckSummary, PullRequestStats};
 
     fn pull(number: i32, updated: &str) -> MyPullRequest {
         MyPullRequest {

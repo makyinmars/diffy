@@ -17,14 +17,14 @@ use super::view::default_card_width;
 use super::{AuthStatus, ReviewController, ReviewOverlay, overlay, view as title_view};
 use crate::app::shell::Slot;
 use crate::app::text_targets::{REVIEW_COMPOSER, REVIEW_PULLS_FILTER, TextCx, TextHost, focus_id};
-use crate::apprt::services::{GitHubBackend, ReviewServices};
+use crate::apprt::services::{ForgeBackend, ReviewServices};
 use crate::contracts::commands::ToastUpdate;
 use crate::contracts::navigation::{
     RepositoryContext, RepositoryRevision, RepositorySnapshot, RepositorySyncReason,
 };
 use crate::contracts::review::{
-    AvatarImage, CardKey, GitHubRequest, GitHubResponse, PullRequestComparison, PullRequestRef,
-    PullsAction, ReviewAction, ReviewEffect, ReviewEvent, Secret,
+    AvatarImage, CardKey, ForgeRequest, ForgeResponse, PullRequestComparison, PullsAction,
+    ReviewAction, ReviewEffect, ReviewEvent, Secret,
 };
 use crate::contracts::shared::{
     AccountEpoch, CompareGeneration, FileKey, FileRevision, SharedContext, Side, SourceTarget,
@@ -36,17 +36,17 @@ use crate::contracts::shell::{
 use crate::contracts::viewport::CompareManifestSnapshot;
 use crate::contracts::viewport::pipeline::ManifestFile;
 use crate::core::compare::stats::CompareFilePaths;
-use crate::core::forge::github::{
-    DeviceFlowState, GitHubPullRequestReviewData, GitHubPullRequestReviewThread,
-    GitHubPullRequestReviewThreadComment, GitHubReviewSide, GitHubReviewThreadResolution,
-    GitHubUser, MyPullRequest, PullRequestActor, PullRequestCheckContext, PullRequestCheckSummary,
-    PullRequestInfo, PullRequestLabel, PullRequestOverview, PullRequestReview, PullRequestReviewer,
-    PullRequestStats, PullRequestTimelineItem, PullRequestTimelineKind,
+use crate::core::forge::github::{CreatePullRequestReview, DeviceFlowState};
+use crate::core::forge::model::{
+    ForgeUser, MyPullRequest, PullRequestActor, PullRequestCheckContext, PullRequestCheckSummary,
+    PullRequestInfo, PullRequestLabel, PullRequestOverview, PullRequestReviewData,
+    PullRequestReviewThread, PullRequestReviewThreadComment, PullRequestReviewer, PullRequestStats,
+    PullRequestTimelineItem, PullRequestTimelineKind, ReviewThreadResolution,
 };
 use crate::core::review::{
     ReviewAnchor, ReviewComment, ReviewCommentId, ReviewDecision, ReviewDraftKind,
-    ReviewDraftState, ReviewLineRange, ReviewResolution, ReviewSession, ReviewSide, ReviewThread,
-    ReviewThreadId, ReviewThreadPermissions, ReviewThreadStatus,
+    ReviewDraftState, ReviewForge, ReviewLineRange, ReviewResolution, ReviewSession, ReviewSide,
+    ReviewTarget, ReviewThread, ReviewThreadId, ReviewThreadPermissions, ReviewThreadStatus,
 };
 use crate::platform::persistence::SettingsStore;
 use crate::platform::review_store::ReviewStore;
@@ -84,38 +84,38 @@ fn comparison(number: i32) -> PullRequestComparison {
     }
 }
 
-fn graphql_thread() -> GitHubPullRequestReviewThread {
-    GitHubPullRequestReviewThread {
-        node_id: THREAD_NODE.to_owned(),
+fn graphql_thread() -> PullRequestReviewThread {
+    PullRequestReviewThread {
+        id: THREAD_NODE.to_owned(),
         path: "src/widget.rs".to_owned(),
         line: Some(12),
-        diff_side: Some(GitHubReviewSide::Right),
+        side: Some(ReviewSide::New),
         subject_type: "LINE".to_owned(),
         viewer_can_reply: true,
         viewer_can_resolve: true,
-        comments: vec![GitHubPullRequestReviewThreadComment {
-            node_id: "comment-1".to_owned(),
-            database_id: Some(11),
+        comments: vec![PullRequestReviewThreadComment {
+            id: "comment-1".to_owned(),
+            numeric_id: Some(11),
             author_login: "alpha".to_owned(),
             author_avatar_url: "https://avatars.test/u/alpha".to_owned(),
             body: "Consider caching this.".to_owned(),
             path: "src/widget.rs".to_owned(),
             line: Some(12),
             viewer_can_update: true,
-            ..GitHubPullRequestReviewThreadComment::default()
+            ..PullRequestReviewThreadComment::default()
         }],
-        ..GitHubPullRequestReviewThread::default()
+        ..PullRequestReviewThread::default()
     }
 }
 
 fn fixture_comment(thread: &ReviewThreadId, id: i64, author: &str, body: &str) -> ReviewComment {
     ReviewComment {
-        id: ReviewCommentId::github(id),
+        id: ReviewCommentId::new(ReviewForge::GitHub, id),
         backend_id: Some(id),
-        backend_node_id: Some(format!("node-{id}")),
+        remote_id: Some(format!("node-{id}")),
         thread_id: thread.clone(),
         in_reply_to: None,
-        in_reply_to_node_id: None,
+        in_reply_to_remote_id: None,
         author_login: Some(author.to_owned()),
         author_avatar_url: None,
         body: body.to_owned(),
@@ -132,7 +132,7 @@ fn fixture_comment(thread: &ReviewThreadId, id: i64, author: &str, body: &str) -
 }
 
 fn sample_review_thread() -> ReviewThread {
-    let id = ReviewThreadId::github_node("harness-thread-1");
+    let id = ReviewThreadId::remote(ReviewForge::GitHub, "harness-thread-1");
     ReviewThread {
         comments: vec![
             fixture_comment(
@@ -155,7 +155,7 @@ fn sample_review_thread() -> ReviewThread {
             ),
         ],
         id,
-        backend_node_id: Some("harness-thread-1".to_owned()),
+        remote_id: Some("harness-thread-1".to_owned()),
         anchor: Some(ReviewAnchor::inline(
             "src/widget.rs",
             ReviewSide::New,
@@ -200,14 +200,14 @@ fn target(lines: std::ops::Range<u32>) -> SourceTarget {
 
 #[derive(Default)]
 struct Script {
-    data: Vec<GitHubPullRequestReviewThread>,
+    data: Vec<PullRequestReviewThread>,
     cached: bool,
     fail_replies: bool,
     fail_submit: bool,
     fail_overview: bool,
     pulls: Vec<MyPullRequest>,
     fail_pulls: bool,
-    requests: Vec<GitHubRequest>,
+    requests: Vec<ForgeRequest>,
 }
 
 #[derive(Clone, Default)]
@@ -220,8 +220,8 @@ impl FakeGitHub {
     }
 }
 
-impl GitHubBackend for FakeGitHub {
-    fn execute(&self, request: GitHubRequest, emit: &mut dyn FnMut(GitHubResponse)) {
+impl ForgeBackend for FakeGitHub {
+    fn execute(&self, request: ForgeRequest, emit: &mut dyn FnMut(ForgeResponse)) {
         let (data, cached, fail_replies, fail_submit, fail_overview) = self.with(|s| {
             s.requests.push(request.clone());
             (
@@ -235,124 +235,110 @@ impl GitHubBackend for FakeGitHub {
         let (pulls, fail_pulls) = self.with(|s| (s.pulls.clone(), s.fail_pulls));
         let pr_number = |url: &str| if url == OTHER_URL { 7 } else { 42 };
         match request {
-            GitHubRequest::LoadPullRequest { url, .. } => {
+            ForgeRequest::LoadPullRequest { url, .. } => {
                 let number = pr_number(&url);
                 if cached {
-                    emit(GitHubResponse::PullRequestCached {
+                    emit(ForgeResponse::PullRequestCached {
                         url: url.clone(),
                         comparison: comparison(number),
                     });
                 }
-                emit(GitHubResponse::PullRequestLoaded {
+                emit(ForgeResponse::PullRequestLoaded {
                     url,
                     comparison: comparison(number),
                 });
             }
-            GitHubRequest::FetchUser { .. } => emit(GitHubResponse::UserFetched(GitHubUser {
+            ForgeRequest::FetchUser { .. } => emit(ForgeResponse::UserFetched(ForgeUser {
                 login: "reviewer".to_owned(),
                 name: "Rae Viewer".to_owned(),
                 avatar_url: "https://avatars.test/u/1".to_owned(),
             })),
-            GitHubRequest::FetchReviewData { pr, .. } => emit(GitHubResponse::ReviewDataLoaded {
+            ForgeRequest::FetchReviewData { pr, .. } => emit(ForgeResponse::ReviewDataLoaded {
                 pr,
-                data: Box::new(GitHubPullRequestReviewData {
+                data: Box::new(PullRequestReviewData {
                     threads: data,
-                    ..GitHubPullRequestReviewData::default()
+                    ..PullRequestReviewData::default()
                 }),
             }),
-            GitHubRequest::FetchReviewComments { pr, .. } => {
-                emit(GitHubResponse::ReviewCommentsLoaded {
+            ForgeRequest::FetchReviewComments { pr, .. } => {
+                emit(ForgeResponse::ReviewCommentsLoaded {
                     pr,
                     comments: Vec::new(),
                 })
             }
-            GitHubRequest::AddThreadReply {
-                pr, thread_node_id, ..
-            } => emit(if fail_replies {
-                GitHubResponse::ThreadReplyAddFailed {
+            ForgeRequest::AddThreadReply { pr, thread_id, .. } => emit(if fail_replies {
+                ForgeResponse::ThreadReplyAddFailed {
                     pr,
-                    thread_node_id,
+                    thread_id,
                     message: "reply rejected".to_owned(),
                 }
             } else {
-                GitHubResponse::ThreadReplyAdded {
+                ForgeResponse::ThreadReplyAdded {
                     pr,
-                    thread_node_id,
-                    comment: GitHubPullRequestReviewThreadComment::default(),
+                    thread_id,
+                    comment: PullRequestReviewThreadComment::default(),
                 }
             }),
-            GitHubRequest::SubmitSessionDrafts { session, .. } => {
-                let pr = PullRequestRef {
-                    owner: session.target.owner.clone(),
-                    repo: session.target.repo.clone(),
-                    number: session.target.number,
-                };
+            ForgeRequest::SubmitSessionDrafts { session, .. } => {
+                let pr = session.target.clone();
                 let draft_ids = session.pending_drafts().map(|d| d.id).collect();
                 emit(if fail_submit {
-                    GitHubResponse::DraftsSubmitFailed {
+                    ForgeResponse::DraftsSubmitFailed {
                         pr,
                         draft_ids,
                         message: "review rejected".to_owned(),
                     }
                 } else {
-                    GitHubResponse::DraftsSubmitted {
-                        pr,
-                        review: PullRequestReview::default(),
-                        draft_ids,
-                    }
+                    ForgeResponse::DraftsSubmitted { pr, draft_ids }
                 })
             }
-            GitHubRequest::SetThreadResolution {
+            ForgeRequest::SetThreadResolution {
                 pr,
-                thread_node_id,
+                thread_id,
                 resolved,
                 ..
-            } => emit(GitHubResponse::ThreadResolutionChanged {
+            } => emit(ForgeResponse::ThreadResolutionChanged {
                 pr,
-                resolution: GitHubReviewThreadResolution {
-                    thread_node_id,
+                resolution: ReviewThreadResolution {
+                    thread_id,
                     is_resolved: resolved,
                 },
             }),
-            GitHubRequest::UpdateCommentGraphql { pr, .. } => {
-                emit(GitHubResponse::CommentGraphqlUpdated {
+            ForgeRequest::UpdateComment { pr, .. } => emit(ForgeResponse::CommentUpdated {
+                pr,
+                comment: PullRequestReviewThreadComment::default(),
+            }),
+            ForgeRequest::DeleteComment { pr, comment_id, .. } => {
+                emit(ForgeResponse::CommentDeleted {
                     pr,
-                    comment: GitHubPullRequestReviewThreadComment::default(),
+                    comment_id,
+                    comment: None,
                 })
             }
-            GitHubRequest::DeleteCommentGraphql {
-                pr,
-                comment_node_id,
-                ..
-            } => emit(GitHubResponse::CommentGraphqlDeleted {
-                pr,
-                comment_node_id,
-                comment: None,
-            }),
-            GitHubRequest::PeekPullRequest { pr, .. } => emit(GitHubResponse::PullRequestPeeked {
+            ForgeRequest::PeekPullRequest { pr, .. } => emit(ForgeResponse::PullRequestPeeked {
                 info: info(pr.number),
                 pr,
             }),
-            GitHubRequest::FetchPullRequestOverview { pr, token } => emit(if fail_overview {
-                GitHubResponse::PullRequestOverviewLoadFailed {
+            ForgeRequest::FetchPullRequestOverview { pr, token } => emit(if fail_overview {
+                ForgeResponse::PullRequestOverviewLoadFailed {
                     pr,
                     message: "overview unavailable".to_owned(),
                 }
             } else {
-                GitHubResponse::PullRequestOverviewLoaded {
+                ForgeResponse::PullRequestOverviewLoaded {
                     pr,
                     overview: Box::new(overview_fixture(token.is_some())),
                 }
             }),
-            GitHubRequest::AddPullRequestComment { pr, .. } => {
-                emit(GitHubResponse::PullRequestCommentAdded { pr })
+            ForgeRequest::AddPullRequestComment { pr, .. } => {
+                emit(ForgeResponse::PullRequestCommentAdded { pr })
             }
-            GitHubRequest::FetchMyPullRequests { .. } => emit(if fail_pulls {
-                GitHubResponse::MyPullRequestsLoadFailed {
+            ForgeRequest::FetchMyPullRequests { .. } => emit(if fail_pulls {
+                ForgeResponse::MyPullRequestsLoadFailed {
                     message: "search unavailable".to_owned(),
                 }
             } else {
-                GitHubResponse::MyPullRequestsLoaded(pulls)
+                ForgeResponse::MyPullRequestsLoaded(pulls)
             }),
         }
     }
@@ -510,9 +496,9 @@ impl Fake {
         }
         let mut events = Vec::new();
         match effect {
-            ReviewEffect::GitHub { scope, request } => {
-                self.services.github().execute(*request, &mut |response| {
-                    events.push(ReviewEvent::GitHub {
+            ReviewEffect::Forge { scope, request } => {
+                self.services.forge().execute(*request, &mut |response| {
+                    events.push(ReviewEvent::Forge {
                         scope,
                         response: Box::new(response),
                     })
@@ -535,10 +521,11 @@ impl Fake {
                     token: Secret::new("device-token"),
                 })
             }
-            ReviewEffect::LoadToken => events.push(ReviewEvent::TokenLoaded {
+            ReviewEffect::LoadToken(forge) => events.push(ReviewEvent::TokenLoaded {
+                forge,
                 token: Some(Secret::new("stored-token")),
             }),
-            ReviewEffect::SaveToken(_) | ReviewEffect::ClearToken => {}
+            ReviewEffect::SaveToken { .. } | ReviewEffect::ClearToken(_) => {}
             ReviewEffect::LoadSession {
                 scope,
                 target,
@@ -587,7 +574,7 @@ impl Fake {
         events
     }
 
-    fn requests(&self) -> Vec<GitHubRequest> {
+    fn requests(&self) -> Vec<ForgeRequest> {
         self.github.with(|s| s.requests.clone())
     }
 }
@@ -739,7 +726,7 @@ impl Driver {
     }
 
     fn thread(&self) -> ReviewThreadId {
-        ReviewThreadId::github_node(THREAD_NODE)
+        ReviewThreadId::remote(ReviewForge::GitHub, THREAD_NODE)
     }
 
     fn errors(&self) -> Vec<String> {
@@ -783,7 +770,7 @@ fn startup_loads_the_token_then_the_handed_off_pull_request() {
     let mut driver = Driver::new(Fake::new());
     driver.startup(Some(URL));
 
-    assert!(driver.review.account().token.is_some());
+    assert!(driver.review.account(ReviewForge::GitHub).token.is_some());
     assert!(driver.review.active_pull_request().is_none());
 
     driver.open_repository();
@@ -800,20 +787,20 @@ fn startup_loads_the_token_then_the_handed_off_pull_request() {
     assert_eq!(
         driver
             .review
-            .account()
+            .account(ReviewForge::GitHub)
             .user
             .as_ref()
             .map(|u| u.login.as_str()),
         Some("reviewer")
     );
-    assert!(driver.review.account().avatar.is_some());
+    assert!(driver.review.account(ReviewForge::GitHub).avatar.is_some());
     assert!(matches!(
         driver.fake.requests().as_slice(),
         [
-            GitHubRequest::FetchUser { .. },
-            GitHubRequest::LoadPullRequest { .. },
-            GitHubRequest::FetchReviewData { .. },
-            GitHubRequest::FetchPullRequestOverview { .. }
+            ForgeRequest::FetchUser { .. },
+            ForgeRequest::LoadPullRequest { .. },
+            ForgeRequest::FetchReviewData { .. },
+            ForgeRequest::FetchPullRequestOverview { .. }
         ]
     ));
 }
@@ -859,7 +846,7 @@ fn stale_results_are_rejected_after_an_account_switch() {
     driver.act(ReviewAction::LoadPullRequest {
         url: URL.to_owned(),
     });
-    assert!(driver.review.account().token.is_some());
+    assert!(driver.review.account(ReviewForge::GitHub).token.is_some());
     driver.fake.held = held;
     driver.release();
 
@@ -905,12 +892,23 @@ fn device_flow_signs_in_and_changes_the_account() {
     assert_eq!(driver.review.overlay_open(), Some(ReviewOverlay::Auth));
     driver.fake.hold = true;
     driver.act(ReviewAction::StartDeviceFlow);
-    assert_eq!(driver.review.account().auth, AuthStatus::Starting);
+    assert_eq!(
+        driver.review.account(ReviewForge::GitHub).auth,
+        AuthStatus::Starting
+    );
     driver.release();
 
-    assert_eq!(driver.review.account().auth, AuthStatus::Done);
     assert_eq!(
-        driver.review.account().token.as_ref().map(Secret::expose),
+        driver.review.account(ReviewForge::GitHub).auth,
+        AuthStatus::Done
+    );
+    assert_eq!(
+        driver
+            .review
+            .account(ReviewForge::GitHub)
+            .token
+            .as_ref()
+            .map(Secret::expose),
         Some("device-token")
     );
     assert_eq!(driver.review.overlay_open(), None);
@@ -926,12 +924,17 @@ fn sign_out_clears_the_account_and_review_target() {
     driver.act(ReviewAction::OpenAccountMenu);
     driver.act(ReviewAction::SignOut);
 
-    assert!(driver.review.account().token.is_none());
-    assert!(driver.review.account().user.is_none());
+    assert!(driver.review.account(ReviewForge::GitHub).token.is_none());
+    assert!(driver.review.account(ReviewForge::GitHub).user.is_none());
     assert!(driver.review.active_pull_request().is_none());
     assert!(driver.shared.review.is_none());
     assert_eq!(driver.shared.account.0, epoch.0 + 1);
-    assert!(driver.fake.effects.contains(&ReviewEffect::ClearToken));
+    assert!(
+        driver
+            .fake
+            .effects
+            .contains(&ReviewEffect::ClearToken(ReviewForge::GitHub))
+    );
 }
 
 #[test]
@@ -1059,7 +1062,7 @@ fn submit_review_recovers_from_partial_failure() {
         .requests()
         .into_iter()
         .filter_map(|request| match request {
-            GitHubRequest::SubmitSessionDrafts { session, .. } => Some(session.drafts.len()),
+            ForgeRequest::SubmitSessionDrafts { session, .. } => Some(session.drafts.len()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1075,7 +1078,7 @@ fn submit_review_recovers_from_partial_failure() {
         .fake
         .requests()
         .iter()
-        .filter(|request| matches!(request, GitHubRequest::SubmitSessionDrafts { .. }))
+        .filter(|request| matches!(request, ForgeRequest::SubmitSessionDrafts { .. }))
         .count();
     assert_eq!(submits, 1, "only the failed reply is resent");
 }
@@ -1129,13 +1132,13 @@ fn edit_and_delete_go_through_graphql_and_refetch() {
     let mut driver = Driver::signed_in_with_pr();
 
     driver.act(ReviewAction::EditComment {
-        comment_node_id: "comment-1".to_owned(),
+        comment_id: "comment-1".to_owned(),
     });
     assert_eq!(driver.review.host.composer_text(), "Consider caching this.");
     driver.type_text(" Please.");
     driver.act(ReviewAction::SubmitComment);
     let delete = || ReviewAction::DeleteComment {
-        comment_node_id: "comment-1".to_owned(),
+        comment_id: "comment-1".to_owned(),
     };
     driver.act(delete());
     assert!(
@@ -1143,21 +1146,21 @@ fn edit_and_delete_go_through_graphql_and_refetch() {
             .fake
             .requests()
             .iter()
-            .any(|r| matches!(r, GitHubRequest::DeleteCommentGraphql { .. }))
+            .any(|r| matches!(r, ForgeRequest::DeleteComment { .. }))
     );
     driver.act(delete());
 
     let requests = driver.fake.requests();
     assert!(requests.iter().any(|r| matches!(r,
-        GitHubRequest::UpdateCommentGraphql { body, .. } if body == "Consider caching this. Please.")));
+        ForgeRequest::UpdateComment { body, .. } if body == "Consider caching this. Please.")));
     assert!(
         requests
             .iter()
-            .any(|r| matches!(r, GitHubRequest::DeleteCommentGraphql { .. }))
+            .any(|r| matches!(r, ForgeRequest::DeleteComment { .. }))
     );
     let refetches = requests
         .iter()
-        .filter(|r| matches!(r, GitHubRequest::FetchReviewData { .. }))
+        .filter(|r| matches!(r, ForgeRequest::FetchReviewData { .. }))
         .count();
     assert_eq!(refetches, 3);
 }
@@ -1170,7 +1173,7 @@ fn overlapping_refetches_coalesce_into_one_follow_up() {
             .fake
             .requests()
             .iter()
-            .filter(|r| matches!(r, GitHubRequest::FetchReviewData { .. }))
+            .filter(|r| matches!(r, ForgeRequest::FetchReviewData { .. }))
             .count()
     };
     let before = fetches(&driver);
@@ -1179,7 +1182,7 @@ fn overlapping_refetches_coalesce_into_one_follow_up() {
     for id in ["comment-1", "comment-2", "comment-3"] {
         for _ in 0..2 {
             driver.act(ReviewAction::DeleteComment {
-                comment_node_id: id.to_owned(),
+                comment_id: id.to_owned(),
             });
         }
     }
@@ -1450,6 +1453,7 @@ fn grammar_availability_rebuilds_card_documents() {
         .driver
         .intent(Intent::GrammarAvailable(Default::default()));
     ui.send_message(ReviewEvent::TokenSaveFailed {
+        forge: ReviewForge::GitHub,
         message: "redraw".to_owned(),
     });
 
@@ -1493,8 +1497,8 @@ fn reply_composer_takes_focus_and_returns_it_on_send() {
     );
     let requests = ui.app().driver.fake.requests();
     assert!(requests.iter().any(|r| matches!(r,
-        GitHubRequest::AddThreadReply { body, thread_node_id, .. }
-            if body == "Done in the next push." && thread_node_id == THREAD_NODE)));
+        ForgeRequest::AddThreadReply { body, thread_id, .. }
+            if body == "Done in the next push." && thread_id == THREAD_NODE)));
 }
 
 #[test]
@@ -1581,7 +1585,10 @@ fn account_menu_signs_out() {
 #[test]
 fn copy_shortcut_copies_the_card_selection() {
     let mut ui = harness(sample_driver());
-    let card = CardKey::Thread(ReviewThreadId::github_node("harness-thread-1"));
+    let card = CardKey::Thread(ReviewThreadId::remote(
+        ReviewForge::GitHub,
+        "harness-thread-1",
+    ));
     let selected = {
         let driver = &mut ui.app_mut().driver;
         driver.review.host.select_all_for_test(&card);
@@ -1597,21 +1604,21 @@ fn copy_shortcut_copies_the_card_selection() {
     assert_eq!(ui.app().driver.clipboard.last(), Some(&selected));
 }
 
-fn file_thread() -> GitHubPullRequestReviewThread {
-    GitHubPullRequestReviewThread {
-        node_id: "file-thread".to_owned(),
+fn file_thread() -> PullRequestReviewThread {
+    PullRequestReviewThread {
+        id: "file-thread".to_owned(),
         path: "src/widget.rs".to_owned(),
         subject_type: "FILE".to_owned(),
         viewer_can_reply: true,
-        comments: vec![GitHubPullRequestReviewThreadComment {
-            node_id: "file-comment".to_owned(),
-            database_id: Some(21),
+        comments: vec![PullRequestReviewThreadComment {
+            id: "file-comment".to_owned(),
+            numeric_id: Some(21),
             author_login: "charlie".to_owned(),
             body: "Split this file in two.".to_owned(),
             path: "src/widget.rs".to_owned(),
-            ..GitHubPullRequestReviewThreadComment::default()
+            ..PullRequestReviewThreadComment::default()
         }],
-        ..GitHubPullRequestReviewThread::default()
+        ..PullRequestReviewThread::default()
     }
 }
 
@@ -1706,7 +1713,7 @@ fn submit_menu_approves_without_pending_comments() {
         .requests()
         .into_iter()
         .find_map(|request| match request {
-            GitHubRequest::SubmitSessionDrafts {
+            ForgeRequest::SubmitSessionDrafts {
                 decision, session, ..
             } => Some((decision, session.drafts.len())),
             _ => None,
@@ -1741,7 +1748,7 @@ fn submit_menu_offers_every_decision_and_a_summary() {
         .requests()
         .into_iter()
         .find_map(|request| match request {
-            GitHubRequest::SubmitSessionDrafts {
+            ForgeRequest::SubmitSessionDrafts {
                 decision, session, ..
             } => Some((decision, session)),
             _ => None,
@@ -1749,9 +1756,7 @@ fn submit_menu_offers_every_decision_and_a_summary() {
         .unwrap();
     assert_eq!(request.0, ReviewDecision::RequestChanges);
     assert_eq!(
-        request
-            .1
-            .build_github_review_request(request.0, None)
+        CreatePullRequestReview::from_drafts(&request.1, request.0, None)
             .unwrap()
             .body
             .as_deref(),
@@ -1762,11 +1767,7 @@ fn submit_menu_offers_every_decision_and_a_summary() {
 #[test]
 fn pull_request_peeks_are_cached() {
     let mut driver = Driver::signed_in_with_pr();
-    let pr = PullRequestRef {
-        owner: "owner".to_owned(),
-        repo: "repo".to_owned(),
-        number: 7,
-    };
+    let pr = ReviewTarget::github("owner", "repo", 7);
 
     driver.act(ReviewAction::PeekPullRequest {
         url: OTHER_URL.to_owned(),
@@ -1783,7 +1784,7 @@ fn pull_request_peeks_are_cached() {
         .fake
         .requests()
         .iter()
-        .filter(|r| matches!(r, GitHubRequest::PeekPullRequest { .. }))
+        .filter(|r| matches!(r, ForgeRequest::PeekPullRequest { .. }))
         .count();
     assert_eq!(peeks, 1);
 }
@@ -1854,7 +1855,7 @@ fn author_avatars_load_into_a_bounded_cache() {
     session.threads = (0..300)
         .map(|n| {
             let mut thread = thread.clone();
-            thread.id = ReviewThreadId::github_node(format!("t{n}"));
+            thread.id = ReviewThreadId::remote(ReviewForge::GitHub, format!("t{n}"));
             thread.comments[0].author_login = Some(format!("user{n}"));
             thread.comments[0].author_avatar_url = Some(format!("https://avatars.test/u/{n}"));
             thread
@@ -1913,7 +1914,7 @@ fn file_level_comments_live_in_the_file_header_slot() {
     driver.startup(Some(URL));
     driver.open_repository();
     let presentation = driver.review.presentation();
-    let file_card = CardKey::Thread(ReviewThreadId::github_node("file-thread"));
+    let file_card = CardKey::Thread(ReviewThreadId::remote(ReviewForge::GitHub, "file-thread"));
 
     assert!(
         presentation
@@ -2347,7 +2348,7 @@ fn accounts_settings_show_the_github_account() {
 
     assert!(contains(row, sign_out));
     ui.click_node(By::role_name(Role::Button, "Sign out"));
-    assert!(!ui.app().driver.review.signed_in());
+    assert!(!ui.app().driver.review.signed_in(ReviewForge::GitHub));
     let row = ui.find(By::role_name(Role::Group, "GitHub account")).bounds;
     let sign_in = ui.find(By::role_name(Role::Button, "Sign in"));
     assert!(contains(row, sign_in.bounds));
@@ -2397,7 +2398,7 @@ fn overview_requests(driver: &Driver) -> usize {
         .fake
         .requests()
         .iter()
-        .filter(|r| matches!(r, GitHubRequest::FetchPullRequestOverview { .. }))
+        .filter(|r| matches!(r, ForgeRequest::FetchPullRequestOverview { .. }))
         .count()
 }
 
@@ -2497,6 +2498,7 @@ fn overview_shows_loading_then_error_with_retry() {
 
     ui.app_mut().driver.release();
     ui.send_message(ReviewEvent::TokenSaveFailed {
+        forge: ReviewForge::GitHub,
         message: "redraw".to_owned(),
     });
 
@@ -2579,7 +2581,7 @@ fn conversation_comment_posts_and_refreshes_the_timeline() {
 
     let driver = &ui.app().driver;
     assert!(driver.fake.requests().iter().any(|r| matches!(r,
-        GitHubRequest::AddPullRequestComment { body, .. } if body == "Thanks, merging after CI.")));
+        ForgeRequest::AddPullRequestComment { body, .. } if body == "Thanks, merging after CI.")));
     assert_eq!(overview_requests(driver), 2);
     assert!(driver.toasts.iter().any(|toast| matches!(toast,
         ToastUpdate::Show { message, .. } if message == "Comment posted.")));
@@ -2689,7 +2691,7 @@ fn pulls_requests(driver: &Driver) -> usize {
         .fake
         .requests()
         .iter()
-        .filter(|r| matches!(r, GitHubRequest::FetchMyPullRequests { .. }))
+        .filter(|r| matches!(r, ForgeRequest::FetchMyPullRequests { .. }))
         .count()
 }
 
@@ -2720,6 +2722,7 @@ fn your_pull_requests_group_by_need_and_move_with_the_keyboard() {
     driver.focus.push(Some(LogicalFocus::Sidebar));
     let mut ui = harness(driver);
     ui.send_message(ReviewEvent::TokenSaveFailed {
+        forge: ReviewForge::GitHub,
         message: "redraw".to_owned(),
     });
 
@@ -2791,7 +2794,7 @@ fn enter_reviews_in_the_open_repository() {
     assert!(driver.activated.is_empty());
     assert_eq!(driver.review.active_pull_request().unwrap().pr.number, 42);
     assert!(driver.fake.requests().iter().any(|r| matches!(r,
-        GitHubRequest::LoadPullRequest { url, repo_path, .. }
+        ForgeRequest::LoadPullRequest { url, repo_path, .. }
             if *url == pull_url(42) && repo_path == Path::new("/tmp/repo"))));
     assert_eq!(ui.focus(), Some(focus_id(LogicalFocus::Viewport)));
 }

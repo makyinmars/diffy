@@ -5,13 +5,15 @@ use std::sync::Arc;
 use quark_ui::document::DocumentEvent;
 
 use crate::contracts::shared::{AccountEpoch, JobId, SourceTarget};
-use crate::core::forge::github::{
-    DeviceFlowState, GitHubPullRequestReviewData, GitHubPullRequestReviewThreadComment,
-    GitHubReviewThreadResolution, GitHubUser, MyPullRequest, PullRequestInfo, PullRequestOverview,
-    PullRequestReview, PullRequestReviewComment,
+use crate::core::forge::github::DeviceFlowState;
+use crate::core::forge::model::{
+    ForgeUser, MyPullRequest, PullRequestInfo, PullRequestOverview, PullRequestReviewComment,
+    PullRequestReviewData, PullRequestReviewThreadComment, ReviewThreadResolution,
 };
+use crate::core::forge::parse_pull_request_url;
 use crate::core::review::{
-    ReviewDecision, ReviewDraftId, ReviewSession, ReviewSessionKey, ReviewTarget, ReviewThreadId,
+    ReviewDecision, ReviewDraftId, ReviewForge, ReviewSession, ReviewSessionKey, ReviewTarget,
+    ReviewThreadId,
 };
 
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
@@ -80,9 +82,9 @@ pub enum ReviewAction {
     ReplyToFocused,
     ResolveFocused,
     ToggleFocused,
-    EditComment { comment_node_id: String },
-    ToggleCommentMenu { comment_node_id: String },
-    DeleteComment { comment_node_id: String },
+    EditComment { comment_id: String },
+    ToggleCommentMenu { comment_id: String },
+    DeleteComment { comment_id: String },
     SubmitReview { decision: ReviewDecision },
     DiscardDrafts,
     ToggleThread(ReviewThreadId),
@@ -135,33 +137,29 @@ pub struct ReviewScope {
     pub request: JobId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PullRequestRef {
-    pub owner: String,
-    pub repo: String,
-    pub number: i32,
-}
-
+/// A request to a pull request forge. Thread and comment ids are the forge's
+/// own ids (`ReviewThread::remote_id`, `ReviewComment::remote_id`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GitHubRequest {
+pub enum ForgeRequest {
     LoadPullRequest {
         url: String,
         repo_path: PathBuf,
         token: Option<Secret>,
     },
     FetchUser {
+        forge: ReviewForge,
         token: Secret,
     },
     PeekPullRequest {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         token: Option<Secret>,
     },
     FetchReviewComments {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         token: Option<Secret>,
     },
     FetchReviewData {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         token: Option<Secret>,
     },
     SubmitSessionDrafts {
@@ -171,40 +169,113 @@ pub enum GitHubRequest {
         token: Option<Secret>,
     },
     AddThreadReply {
-        pr: PullRequestRef,
-        thread_node_id: String,
+        pr: ReviewTarget,
+        thread_id: String,
         token: Option<Secret>,
         body: String,
     },
-    UpdateCommentGraphql {
-        pr: PullRequestRef,
-        comment_node_id: String,
+    UpdateComment {
+        pr: ReviewTarget,
+        comment_id: String,
         token: Option<Secret>,
         body: String,
     },
-    DeleteCommentGraphql {
-        pr: PullRequestRef,
-        comment_node_id: String,
+    DeleteComment {
+        pr: ReviewTarget,
+        comment_id: String,
         token: Option<Secret>,
     },
     SetThreadResolution {
-        pr: PullRequestRef,
-        thread_node_id: String,
+        pr: ReviewTarget,
+        thread_id: String,
         token: Option<Secret>,
         resolved: bool,
     },
     FetchPullRequestOverview {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         token: Option<Secret>,
     },
     AddPullRequestComment {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         token: Option<Secret>,
         body: String,
     },
     FetchMyPullRequests {
+        forge: ReviewForge,
         token: Secret,
     },
+}
+
+impl ForgeRequest {
+    pub fn forge(&self) -> ReviewForge {
+        match self {
+            Self::LoadPullRequest { url, .. } => {
+                parse_pull_request_url(url).map_or(ReviewForge::GitHub, |pr| pr.forge)
+            }
+            Self::FetchUser { forge, .. } | Self::FetchMyPullRequests { forge, .. } => *forge,
+            Self::SubmitSessionDrafts { session, .. } => session.target.forge,
+            Self::PeekPullRequest { pr, .. }
+            | Self::FetchReviewComments { pr, .. }
+            | Self::FetchReviewData { pr, .. }
+            | Self::AddThreadReply { pr, .. }
+            | Self::UpdateComment { pr, .. }
+            | Self::DeleteComment { pr, .. }
+            | Self::SetThreadResolution { pr, .. }
+            | Self::FetchPullRequestOverview { pr, .. }
+            | Self::AddPullRequestComment { pr, .. } => pr.forge,
+        }
+    }
+
+    /// The failure response this request reports when it cannot run.
+    pub fn fail(self, message: String) -> ForgeResponse {
+        match self {
+            Self::LoadPullRequest { url, .. } => {
+                ForgeResponse::PullRequestLoadFailed { url, message }
+            }
+            Self::FetchUser { .. } => ForgeResponse::UserFetchFailed { message },
+            Self::PeekPullRequest { pr, .. } => {
+                ForgeResponse::PullRequestPeekFailed { pr, message }
+            }
+            Self::FetchReviewComments { pr, .. } => {
+                ForgeResponse::ReviewCommentsLoadFailed { pr, message }
+            }
+            Self::FetchReviewData { pr, .. } => ForgeResponse::ReviewDataLoadFailed { pr, message },
+            Self::SubmitSessionDrafts { session, .. } => ForgeResponse::DraftsSubmitFailed {
+                draft_ids: session.pending_drafts().map(|draft| draft.id).collect(),
+                pr: session.target,
+                message,
+            },
+            Self::AddThreadReply { pr, thread_id, .. } => ForgeResponse::ThreadReplyAddFailed {
+                pr,
+                thread_id,
+                message,
+            },
+            Self::UpdateComment { pr, comment_id, .. } => ForgeResponse::CommentUpdateFailed {
+                pr,
+                comment_id,
+                message,
+            },
+            Self::DeleteComment { pr, comment_id, .. } => ForgeResponse::CommentDeleteFailed {
+                pr,
+                comment_id,
+                message,
+            },
+            Self::SetThreadResolution { pr, thread_id, .. } => {
+                ForgeResponse::ThreadResolutionChangeFailed {
+                    pr,
+                    thread_id,
+                    message,
+                }
+            }
+            Self::FetchPullRequestOverview { pr, .. } => {
+                ForgeResponse::PullRequestOverviewLoadFailed { pr, message }
+            }
+            Self::AddPullRequestComment { pr, body, .. } => {
+                ForgeResponse::PullRequestCommentAddFailed { pr, body, message }
+            }
+            Self::FetchMyPullRequests { .. } => ForgeResponse::MyPullRequestsLoadFailed { message },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +286,7 @@ pub struct PullRequestComparison {
 }
 
 #[derive(Debug, Clone)]
-pub enum GitHubResponse {
+pub enum ForgeResponse {
     PullRequestCached {
         url: String,
         comparison: PullRequestComparison,
@@ -228,95 +299,94 @@ pub enum GitHubResponse {
         url: String,
         message: String,
     },
-    UserFetched(GitHubUser),
+    UserFetched(ForgeUser),
     UserFetchFailed {
         message: String,
     },
     PullRequestPeeked {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         info: PullRequestInfo,
     },
     PullRequestPeekFailed {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         message: String,
     },
     ReviewCommentsLoaded {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         comments: Vec<PullRequestReviewComment>,
     },
     ReviewCommentsLoadFailed {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         message: String,
     },
     ReviewDataLoaded {
-        pr: PullRequestRef,
-        data: Box<GitHubPullRequestReviewData>,
+        pr: ReviewTarget,
+        data: Box<PullRequestReviewData>,
     },
     ReviewDataLoadFailed {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         message: String,
     },
     DraftsSubmitted {
-        pr: PullRequestRef,
-        review: PullRequestReview,
+        pr: ReviewTarget,
         draft_ids: Vec<ReviewDraftId>,
     },
     DraftsSubmitFailed {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         draft_ids: Vec<ReviewDraftId>,
         message: String,
     },
     ThreadReplyAdded {
-        pr: PullRequestRef,
-        thread_node_id: String,
-        comment: GitHubPullRequestReviewThreadComment,
+        pr: ReviewTarget,
+        thread_id: String,
+        comment: PullRequestReviewThreadComment,
     },
     ThreadReplyAddFailed {
-        pr: PullRequestRef,
-        thread_node_id: String,
+        pr: ReviewTarget,
+        thread_id: String,
         message: String,
     },
-    CommentGraphqlUpdated {
-        pr: PullRequestRef,
-        comment: GitHubPullRequestReviewThreadComment,
+    CommentUpdated {
+        pr: ReviewTarget,
+        comment: PullRequestReviewThreadComment,
     },
-    CommentGraphqlUpdateFailed {
-        pr: PullRequestRef,
-        comment_node_id: String,
+    CommentUpdateFailed {
+        pr: ReviewTarget,
+        comment_id: String,
         message: String,
     },
-    CommentGraphqlDeleted {
-        pr: PullRequestRef,
-        comment_node_id: String,
-        comment: Option<GitHubPullRequestReviewThreadComment>,
+    CommentDeleted {
+        pr: ReviewTarget,
+        comment_id: String,
+        comment: Option<PullRequestReviewThreadComment>,
     },
-    CommentGraphqlDeleteFailed {
-        pr: PullRequestRef,
-        comment_node_id: String,
+    CommentDeleteFailed {
+        pr: ReviewTarget,
+        comment_id: String,
         message: String,
     },
     ThreadResolutionChanged {
-        pr: PullRequestRef,
-        resolution: GitHubReviewThreadResolution,
+        pr: ReviewTarget,
+        resolution: ReviewThreadResolution,
     },
     ThreadResolutionChangeFailed {
-        pr: PullRequestRef,
-        thread_node_id: String,
+        pr: ReviewTarget,
+        thread_id: String,
         message: String,
     },
     PullRequestOverviewLoaded {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         overview: Box<PullRequestOverview>,
     },
     PullRequestOverviewLoadFailed {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         message: String,
     },
     PullRequestCommentAdded {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
     },
     PullRequestCommentAddFailed {
-        pr: PullRequestRef,
+        pr: ReviewTarget,
         body: String,
         message: String,
     },
@@ -328,9 +398,9 @@ pub enum GitHubResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewEffect {
-    GitHub {
+    Forge {
         scope: ReviewScope,
-        request: Box<GitHubRequest>,
+        request: Box<ForgeRequest>,
     },
     StartDeviceFlow {
         flow: JobId,
@@ -342,9 +412,12 @@ pub enum ReviewEffect {
         device_code: String,
         interval_seconds: u32,
     },
-    LoadToken,
-    SaveToken(Secret),
-    ClearToken,
+    LoadToken(ReviewForge),
+    SaveToken {
+        forge: ReviewForge,
+        token: Secret,
+    },
+    ClearToken(ReviewForge),
     LoadSession {
         scope: ReviewScope,
         target: ReviewTarget,
@@ -380,9 +453,9 @@ pub struct AvatarImage {
 
 #[derive(Debug, Clone)]
 pub enum ReviewEvent {
-    GitHub {
+    Forge {
         scope: ReviewScope,
-        response: Box<GitHubResponse>,
+        response: Box<ForgeResponse>,
     },
     DeviceFlowStarted {
         flow: JobId,
@@ -401,12 +474,15 @@ pub enum ReviewEvent {
         message: String,
     },
     TokenLoaded {
+        forge: ReviewForge,
         token: Option<Secret>,
     },
     TokenLoadFailed {
+        forge: ReviewForge,
         message: String,
     },
     TokenSaveFailed {
+        forge: ReviewForge,
         message: String,
     },
     SessionLoaded {
@@ -449,12 +525,12 @@ pub enum ReviewEvent {
 impl ReviewEvent {
     pub fn account_scoped(&self) -> bool {
         match self {
-            Self::GitHub { response, .. } => matches!(
+            Self::Forge { response, .. } => matches!(
                 **response,
-                GitHubResponse::UserFetched(_)
-                    | GitHubResponse::UserFetchFailed { .. }
-                    | GitHubResponse::MyPullRequestsLoaded(_)
-                    | GitHubResponse::MyPullRequestsLoadFailed { .. }
+                ForgeResponse::UserFetched(_)
+                    | ForgeResponse::UserFetchFailed { .. }
+                    | ForgeResponse::MyPullRequestsLoaded(_)
+                    | ForgeResponse::MyPullRequestsLoadFailed { .. }
             ),
             Self::DeviceFlowStarted { .. }
             | Self::DeviceFlowStartFailed { .. }
@@ -496,12 +572,15 @@ mod tests {
             Action::Review(ReviewAction::SignOut)
         );
         assert_eq!(
-            Effect::from(ReviewEffect::LoadToken),
-            Effect::Review(ReviewEffect::LoadToken)
+            Effect::from(ReviewEffect::LoadToken(ReviewForge::GitHub)),
+            Effect::Review(ReviewEffect::LoadToken(ReviewForge::GitHub))
         );
         assert!(matches!(
-            AppEvent::from(ReviewEvent::TokenLoaded { token: None }),
-            AppEvent::Review(ReviewEvent::TokenLoaded { token: None })
+            AppEvent::from(ReviewEvent::TokenLoaded {
+                forge: ReviewForge::GitHub,
+                token: None
+            }),
+            AppEvent::Review(ReviewEvent::TokenLoaded { token: None, .. })
         ));
     }
 }

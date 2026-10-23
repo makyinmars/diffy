@@ -1,67 +1,14 @@
 use serde_json::{Value, json};
 
 use super::api::{
-    GitHubApi, PullRequestCheckSummary, PullRequestLabel, bool_field, int_field,
-    optional_string_field, parse_check_summary, parse_labels, string_field,
+    GitHubApi, bool_field, int_field, optional_string_field, parse_check_summary, parse_labels,
+    string_field,
 };
 use crate::core::error::{DiffyError, Result};
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PullRequestActor {
-    pub login: String,
-    pub avatar_url: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PullRequestReviewer {
-    pub actor: PullRequestActor,
-    pub state: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PullRequestTimelineKind {
-    Comment,
-    Review { state: String, comments: i32 },
-    Commit { short_oid: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PullRequestTimelineItem {
-    pub id: String,
-    pub kind: PullRequestTimelineKind,
-    pub author: PullRequestActor,
-    pub body: String,
-    pub created_at: String,
-    pub url: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PullRequestOverview {
-    pub title: String,
-    pub body: String,
-    pub url: String,
-    pub state: String,
-    pub is_draft: bool,
-    pub author: PullRequestActor,
-    pub created_at: String,
-    pub updated_at: String,
-    pub base_branch: String,
-    pub head_branch: String,
-    pub additions: i32,
-    pub deletions: i32,
-    pub changed_files: i32,
-    pub commit_count: i32,
-    pub mergeable: String,
-    pub merge_state_status: String,
-    pub review_decision: Option<String>,
-    pub labels: Vec<PullRequestLabel>,
-    pub reviewers: Vec<PullRequestReviewer>,
-    pub team_reviewers: usize,
-    pub checks: PullRequestCheckSummary,
-    pub timeline: Vec<PullRequestTimelineItem>,
-    pub timeline_total: usize,
-    pub detailed: bool,
-}
+use crate::core::forge::model::{
+    PullRequestActor, PullRequestCheckSummary, PullRequestLabel, PullRequestOverview,
+    PullRequestReviewer, PullRequestTimelineItem, PullRequestTimelineKind,
+};
 
 const PULL_REQUEST_OVERVIEW_QUERY: &str = r#"
 query DiffyPullRequestOverview($owner: String!, $repo: String!, $number: Int!) {

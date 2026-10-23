@@ -8,36 +8,37 @@ use tempfile::TempDir;
 
 use super::{AppRuntime, RuntimeOptions};
 use crate::apprt::runtime::commands::SETTINGS_SAVE_DEBOUNCE;
-use crate::apprt::services::{AppServices, GitHubBackend};
+use crate::apprt::services::{AppServices, ForgeBackend};
 use crate::apprt::transport::RuntimeEventSender;
 use crate::contracts::commands::{CommandsEffect, CommandsEvent};
 use crate::contracts::review::{
-    GitHubRequest, GitHubResponse, PullRequestRef, ReviewEffect, ReviewEvent, ReviewScope,
+    ForgeRequest, ForgeResponse, ReviewEffect, ReviewEvent, ReviewScope,
 };
 use crate::contracts::shared::{AccountEpoch, CompareGeneration, JobId, WorkspaceEpoch};
 use crate::contracts::shell::{AppEvent, AppMessage, EventEnvelope};
 use crate::contracts::viewport::ViewportEvent;
 use crate::contracts::viewport::pipeline::{PipelineEffect, PipelineEvent, TotalStatsRequest};
 use crate::core::compare::{LayoutMode, RendererKind};
-use crate::core::forge::github::PullRequestInfo;
+use crate::core::forge::model::PullRequestInfo;
+use crate::core::review::ReviewTarget;
 use crate::core::vcs::model::{VcsCompareRequest, VcsCompareSpec};
 use crate::platform::persistence::{Settings, SettingsStore};
 use crate::platform::review_store::ReviewStore;
 
 struct FakeGitHub;
 
-impl GitHubBackend for FakeGitHub {
-    fn execute(&self, request: GitHubRequest, emit: &mut dyn FnMut(GitHubResponse)) {
+impl ForgeBackend for FakeGitHub {
+    fn execute(&self, request: ForgeRequest, emit: &mut dyn FnMut(ForgeResponse)) {
         match request {
-            GitHubRequest::PeekPullRequest { pr, .. } => {
+            ForgeRequest::PeekPullRequest { pr, .. } => {
                 let info = PullRequestInfo {
                     number: pr.number,
                     title: "Example".to_owned(),
                     ..PullRequestInfo::default()
                 };
-                emit(GitHubResponse::PullRequestPeeked { pr, info });
+                emit(ForgeResponse::PullRequestPeeked { pr, info });
             }
-            _ => emit(GitHubResponse::UserFetchFailed {
+            _ => emit(ForgeResponse::UserFetchFailed {
                 message: "unexpected request".to_owned(),
             }),
         }
@@ -55,7 +56,7 @@ fn harness() -> Harness {
     let dir = TempDir::new().unwrap();
     let store = SettingsStore::new_in(dir.path());
     let review_store = ReviewStore::for_settings_store(&store);
-    let services = AppServices::with_github(store.clone(), review_store, Arc::new(FakeGitHub));
+    let services = AppServices::with_forge(store.clone(), review_store, Arc::new(FakeGitHub));
     let (tx, messages) = mpsc::channel();
     let runtime = AppRuntime::new(
         services,
@@ -132,15 +133,11 @@ fn github_effects_report_through_the_backend_with_their_scope() {
         account: AccountEpoch(2),
         request: JobId(9),
     };
-    let pr = PullRequestRef {
-        owner: "octo".to_owned(),
-        repo: "repo".to_owned(),
-        number: 12,
-    };
+    let pr = ReviewTarget::github("octo", "repo", 12);
     harness.runtime.dispatch(
-        ReviewEffect::GitHub {
+        ReviewEffect::Forge {
             scope,
-            request: Box::new(GitHubRequest::PeekPullRequest {
+            request: Box::new(ForgeRequest::PeekPullRequest {
                 pr: pr.clone(),
                 token: None,
             }),
@@ -151,7 +148,7 @@ fn github_effects_report_through_the_backend_with_their_scope() {
 
     let envelope = next_envelope(&harness.messages);
     assert_eq!(envelope.workspace, WorkspaceEpoch(3));
-    let AppEvent::Review(ReviewEvent::GitHub {
+    let AppEvent::Review(ReviewEvent::Forge {
         scope: reported,
         response,
     }) = envelope.event
@@ -160,7 +157,7 @@ fn github_effects_report_through_the_backend_with_their_scope() {
     };
     assert_eq!(reported, scope);
     match *response {
-        GitHubResponse::PullRequestPeeked { pr: peeked, info } => {
+        ForgeResponse::PullRequestPeeked { pr: peeked, info } => {
             assert_eq!(peeked, pr);
             assert_eq!(info.number, 12);
         }

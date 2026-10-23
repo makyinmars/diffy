@@ -7,16 +7,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::contracts::shared::{FileKey, FileRevision, Side, SourceTarget};
 use crate::core::compare::stats::CompareFilePaths;
-use crate::core::error::{DiffyError, Result};
-use crate::core::forge::github::{
-    CreatePullRequestReview, CreatePullRequestReviewDraftComment, GitHubPullRequestReviewData,
-    GitHubPullRequestReviewEvent, GitHubPullRequestReviewThread, GitHubReviewSide, PullRequestInfo,
-    PullRequestReviewComment, PullRequestReviewMetadata, PullRequestReviewSummary,
+use crate::core::forge::model::{
+    PullRequestInfo, PullRequestReviewComment, PullRequestReviewData, PullRequestReviewMetadata,
+    PullRequestReviewSummary, PullRequestReviewThread, PullRequestReviewThreadComment,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
 pub enum ReviewForge {
     GitHub,
+    Bitbucket,
+}
+
+impl ReviewForge {
+    /// Lowercase key for storage keys, review ids, keyring accounts and file
+    /// names. Persisted GitHub data depends on `"github"`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::Bitbucket => "bitbucket",
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub",
+            Self::Bitbucket => "Bitbucket",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
@@ -36,6 +53,19 @@ impl ReviewTarget {
             number,
         }
     }
+
+    pub fn web_url(&self) -> String {
+        match self.forge {
+            ReviewForge::GitHub => format!(
+                "https://github.com/{}/{}/pull/{}",
+                self.owner, self.repo, self.number
+            ),
+            ReviewForge::Bitbucket => format!(
+                "https://bitbucket.org/{}/{}/pull-requests/{}",
+                self.owner, self.repo, self.number
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
@@ -53,15 +83,14 @@ impl ReviewSessionKey {
     }
 
     pub fn storage_key(&self) -> String {
-        match self.target.forge {
-            ReviewForge::GitHub => format!(
-                "github/{}/{}/{}/{}",
-                sanitize_key_part(&self.target.owner),
-                sanitize_key_part(&self.target.repo),
-                self.target.number,
-                sanitize_key_part(&self.head_sha)
-            ),
-        }
+        format!(
+            "{}/{}/{}/{}/{}",
+            self.target.forge.key(),
+            sanitize_key_part(&self.target.owner),
+            sanitize_key_part(&self.target.repo),
+            self.target.number,
+            sanitize_key_part(&self.head_sha)
+        )
     }
 }
 
@@ -69,24 +98,6 @@ impl ReviewSessionKey {
 pub enum ReviewSide {
     Old,
     New,
-}
-
-impl From<GitHubReviewSide> for ReviewSide {
-    fn from(side: GitHubReviewSide) -> Self {
-        match side {
-            GitHubReviewSide::Left => Self::Old,
-            GitHubReviewSide::Right => Self::New,
-        }
-    }
-}
-
-impl From<ReviewSide> for GitHubReviewSide {
-    fn from(side: ReviewSide) -> Self {
-        match side {
-            ReviewSide::Old => Self::Left,
-            ReviewSide::New => Self::Right,
-        }
-    }
 }
 
 impl From<ReviewSide> for Side {
@@ -139,11 +150,8 @@ impl ReviewLineRange {
         self.end_exclusive().saturating_sub(1)
     }
 
-    pub const fn github_line(self) -> u32 {
-        self.end_inclusive()
-    }
-
-    pub const fn github_start_line(self) -> Option<u32> {
+    /// The first line when the range spans several lines.
+    pub const fn multi_line_start(self) -> Option<u32> {
         if self.len > 1 { Some(self.start) } else { None }
     }
 
@@ -168,7 +176,7 @@ pub enum ReviewSubject {
 }
 
 impl ReviewSubject {
-    fn from_github_subject(value: Option<&str>) -> Self {
+    fn from_subject_type(value: Option<&str>) -> Self {
         match value.unwrap_or_default().to_ascii_lowercase().as_str() {
             "line" => Self::Line,
             "file" => Self::File,
@@ -201,16 +209,16 @@ impl ReviewAnchor {
         }
     }
 
-    pub fn from_github_comment(comment: &PullRequestReviewComment) -> Option<Self> {
+    pub fn from_comment(comment: &PullRequestReviewComment) -> Option<Self> {
         if comment.path.is_empty() {
             return None;
         }
 
-        let side = comment.side.or(comment.start_side).map(ReviewSide::from);
+        let side = comment.side.or(comment.start_side);
         let line_range = review_line_range(comment.start_line, comment.line);
         let original_line_range =
             review_line_range(comment.original_start_line, comment.original_line);
-        let subject = ReviewSubject::from_github_subject(comment.subject_type.as_deref());
+        let subject = ReviewSubject::from_subject_type(comment.subject_type.as_deref());
         if side.is_none() && line_range.is_none() && original_line_range.is_none() {
             return Some(Self {
                 path: comment.path.clone(),
@@ -234,11 +242,8 @@ impl ReviewAnchor {
         })
     }
 
-    pub fn from_github_thread(thread: &GitHubPullRequestReviewThread) -> Self {
-        let side = thread
-            .diff_side
-            .or(thread.start_diff_side)
-            .map(ReviewSide::from);
+    pub fn from_thread(thread: &PullRequestReviewThread) -> Self {
+        let side = thread.side.or(thread.start_side);
         let line_range = review_line_range(thread.start_line, thread.line);
         let original_line_range =
             review_line_range(thread.original_start_line, thread.original_line);
@@ -247,7 +252,7 @@ impl ReviewAnchor {
             side,
             line_range,
             original_line_range,
-            subject: ReviewSubject::from_github_subject(Some(&thread.subject_type)),
+            subject: ReviewSubject::from_subject_type(Some(&thread.subject_type)),
             commit_id: None,
             original_commit_id: None,
         }
@@ -334,12 +339,12 @@ impl ReviewAnchor {
 pub struct ReviewCommentId(pub String);
 
 impl ReviewCommentId {
-    pub fn github(id: i64) -> Self {
-        Self(format!("github:{id}"))
+    pub fn new(forge: ReviewForge, id: i64) -> Self {
+        Self(format!("{}:{id}", forge.key()))
     }
 
-    pub fn github_node(id: impl Into<String>) -> Self {
-        Self(format!("github-node:{}", id.into()))
+    pub fn remote(forge: ReviewForge, id: impl Into<String>) -> Self {
+        Self(format!("{}-node:{}", forge.key(), id.into()))
     }
 }
 
@@ -347,12 +352,14 @@ impl ReviewCommentId {
 pub struct ReviewThreadId(pub String);
 
 impl ReviewThreadId {
-    pub fn github_root(id: i64) -> Self {
-        Self(format!("github-thread:{id}"))
+    /// A thread grouped from flat comments under its root comment.
+    pub fn root(forge: ReviewForge, id: i64) -> Self {
+        Self(format!("{}-thread:{id}", forge.key()))
     }
 
-    pub fn github_node(id: impl Into<String>) -> Self {
-        Self(format!("github-thread-node:{}", id.into()))
+    /// A thread the forge tracks under its own id.
+    pub fn remote(forge: ReviewForge, id: impl Into<String>) -> Self {
+        Self(format!("{}-thread-node:{}", forge.key(), id.into()))
     }
 }
 
@@ -367,10 +374,13 @@ pub struct ReviewReactionGroup {
 pub struct ReviewComment {
     pub id: ReviewCommentId,
     pub backend_id: Option<i64>,
-    pub backend_node_id: Option<String>,
+    /// The forge's id for edits and deletes, when it can be changed.
+    #[serde(alias = "backend_node_id")]
+    pub remote_id: Option<String>,
     pub thread_id: ReviewThreadId,
     pub in_reply_to: Option<ReviewCommentId>,
-    pub in_reply_to_node_id: Option<String>,
+    #[serde(alias = "in_reply_to_node_id")]
+    pub in_reply_to_remote_id: Option<String>,
     pub author_login: Option<String>,
     #[serde(default)]
     pub author_avatar_url: Option<String>,
@@ -388,17 +398,19 @@ pub struct ReviewComment {
 }
 
 impl ReviewComment {
-    pub fn from_github_comment(comment: &PullRequestReviewComment) -> Self {
+    pub fn from_comment(forge: ReviewForge, comment: &PullRequestReviewComment) -> Self {
         let root_id = comment.in_reply_to_id.unwrap_or(comment.id);
-        let anchor = ReviewAnchor::from_github_comment(comment);
+        let anchor = ReviewAnchor::from_comment(comment);
         let outdated = anchor.as_ref().is_some_and(ReviewAnchor::is_outdated);
         Self {
-            id: ReviewCommentId::github(comment.id),
+            id: ReviewCommentId::new(forge, comment.id),
             backend_id: Some(comment.id),
-            backend_node_id: None,
-            thread_id: ReviewThreadId::github_root(root_id),
-            in_reply_to: comment.in_reply_to_id.map(ReviewCommentId::github),
-            in_reply_to_node_id: None,
+            remote_id: None,
+            thread_id: ReviewThreadId::root(forge, root_id),
+            in_reply_to: comment
+                .in_reply_to_id
+                .map(|id| ReviewCommentId::new(forge, id)),
+            in_reply_to_remote_id: None,
             author_login: comment
                 .user
                 .as_ref()
@@ -420,32 +432,33 @@ impl ReviewComment {
         }
     }
 
-    pub fn from_github_thread_comment(
-        thread: &GitHubPullRequestReviewThread,
-        comment: &crate::core::forge::github::GitHubPullRequestReviewThreadComment,
+    pub fn from_thread_comment(
+        forge: ReviewForge,
+        thread: &PullRequestReviewThread,
+        comment: &PullRequestReviewThreadComment,
     ) -> Self {
-        let thread_id = ReviewThreadId::github_node(thread.node_id.clone());
+        let thread_id = ReviewThreadId::remote(forge, thread.id.clone());
         let id = comment
-            .database_id
-            .map(ReviewCommentId::github)
-            .unwrap_or_else(|| ReviewCommentId::github_node(comment.node_id.clone()));
+            .numeric_id
+            .map(|id| ReviewCommentId::new(forge, id))
+            .unwrap_or_else(|| ReviewCommentId::remote(forge, comment.id.clone()));
         let in_reply_to = comment
-            .reply_to_database_id
-            .map(ReviewCommentId::github)
+            .reply_to_numeric_id
+            .map(|id| ReviewCommentId::new(forge, id))
             .or_else(|| {
                 comment
-                    .reply_to_node_id
+                    .reply_to_id
                     .clone()
-                    .map(ReviewCommentId::github_node)
+                    .map(|id| ReviewCommentId::remote(forge, id))
             });
-        let anchor = Some(ReviewAnchor::from_github_thread(thread));
+        let anchor = Some(ReviewAnchor::from_thread(thread));
         Self {
             id,
-            backend_id: comment.database_id,
-            backend_node_id: Some(comment.node_id.clone()),
+            backend_id: comment.numeric_id,
+            remote_id: Some(comment.id.clone()),
             thread_id,
             in_reply_to,
-            in_reply_to_node_id: comment.reply_to_node_id.clone(),
+            in_reply_to_remote_id: comment.reply_to_id.clone(),
             author_login: non_empty(&comment.author_login),
             author_avatar_url: non_empty(&comment.author_avatar_url),
             body: comment.body.clone(),
@@ -500,7 +513,9 @@ pub struct ReviewThreadPermissions {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ReviewThread {
     pub id: ReviewThreadId,
-    pub backend_node_id: Option<String>,
+    /// The forge's id for replies and resolution, when it tracks threads.
+    #[serde(alias = "backend_node_id")]
+    pub remote_id: Option<String>,
     pub anchor: Option<ReviewAnchor>,
     pub comments: Vec<ReviewComment>,
     pub status: ReviewThreadStatus,
@@ -553,16 +568,6 @@ pub enum ReviewDecision {
     RequestChanges,
 }
 
-impl From<ReviewDecision> for GitHubPullRequestReviewEvent {
-    fn from(decision: ReviewDecision) -> Self {
-        match decision {
-            ReviewDecision::Comment => Self::Comment,
-            ReviewDecision::Approve => Self::Approve,
-            ReviewDecision::RequestChanges => Self::RequestChanges,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ReviewSessionMetrics {
     pub unresolved_threads: usize,
@@ -605,30 +610,31 @@ impl ReviewSession {
         ReviewSessionKey::new(self.target.clone(), self.pull_request.head_sha.clone())
     }
 
-    pub fn from_github_review_comments(
+    pub fn from_review_comments(
         target: ReviewTarget,
         pull_request: PullRequestInfo,
         comments: Vec<PullRequestReviewComment>,
     ) -> Self {
         let mut session = Self::new(target, pull_request);
         session.status = ReviewSessionStatus::Ready;
-        session.replace_github_comments(comments);
+        session.replace_comments(comments);
         session
     }
 
-    pub fn replace_github_comments(&mut self, comments: Vec<PullRequestReviewComment>) {
-        self.threads = build_threads(comments);
+    pub fn replace_comments(&mut self, comments: Vec<PullRequestReviewComment>) {
+        self.threads = build_threads(self.target.forge, comments);
         self.status = ReviewSessionStatus::Ready;
         self.status_message = None;
     }
 
-    pub fn apply_github_review_data(&mut self, data: GitHubPullRequestReviewData) {
+    pub fn apply_review_data(&mut self, data: PullRequestReviewData) {
+        let forge = self.target.forge;
         self.metadata = Some(data.metadata);
         self.reviews = data.reviews;
         self.threads = data
             .threads
             .iter()
-            .map(ReviewThread::from_github_thread)
+            .map(|thread| ReviewThread::from_thread(forge, thread))
             .collect();
         self.status = ReviewSessionStatus::Ready;
         self.status_message = None;
@@ -665,11 +671,11 @@ impl ReviewSession {
         true
     }
 
-    pub fn thread_node_id(&self, thread_id: &ReviewThreadId) -> Option<String> {
+    pub fn thread_remote_id(&self, thread_id: &ReviewThreadId) -> Option<String> {
         self.threads
             .iter()
             .find(|thread| &thread.id == thread_id)
-            .and_then(|thread| thread.backend_node_id.clone())
+            .and_then(|thread| thread.remote_id.clone())
     }
 
     pub fn create_inline_draft(
@@ -764,59 +770,6 @@ impl ReviewSession {
         metrics
     }
 
-    pub fn build_github_review_request(
-        &self,
-        decision: ReviewDecision,
-        body: Option<String>,
-    ) -> Result<CreatePullRequestReview> {
-        let mut comments = Vec::new();
-        for draft in self.pending_drafts() {
-            match &draft.kind {
-                ReviewDraftKind::InlineComment => {
-                    let anchor = draft.anchor.as_ref().ok_or_else(|| {
-                        DiffyError::General("inline review draft is missing an anchor".to_owned())
-                    })?;
-                    let line_range = anchor.line_range.ok_or_else(|| {
-                        DiffyError::General(
-                            "inline review draft is missing a line range".to_owned(),
-                        )
-                    })?;
-                    let side = anchor.side.ok_or_else(|| {
-                        DiffyError::General("inline review draft is missing a side".to_owned())
-                    })?;
-                    comments.push(CreatePullRequestReviewDraftComment {
-                        path: anchor.path.clone(),
-                        body: draft.body.clone(),
-                        line: line_range.github_line(),
-                        side: side.into(),
-                        start_line: line_range.github_start_line(),
-                        start_side: line_range.github_start_line().map(|_| side.into()),
-                    });
-                }
-                ReviewDraftKind::Reply { .. } => {
-                    return Err(DiffyError::General(
-                        "reply drafts must be submitted through the review thread reply operation"
-                            .to_owned(),
-                    ));
-                }
-                ReviewDraftKind::General => {}
-            }
-        }
-
-        let body = body.filter(|body| !body.trim().is_empty()).or_else(|| {
-            self.pending_drafts()
-                .find(|draft| matches!(draft.kind, ReviewDraftKind::General))
-                .map(|draft| draft.body.clone())
-        });
-
-        Ok(CreatePullRequestReview {
-            commit_id: non_empty(&self.pull_request.head_sha),
-            body,
-            event: Some(decision.into()),
-            comments,
-        })
-    }
-
     pub fn draft_count(&self) -> usize {
         self.drafts.len()
     }
@@ -856,7 +809,7 @@ impl ReviewSession {
     }
 }
 
-fn build_threads(comments: Vec<PullRequestReviewComment>) -> Vec<ReviewThread> {
+fn build_threads(forge: ReviewForge, comments: Vec<PullRequestReviewComment>) -> Vec<ReviewThread> {
     let mut grouped: BTreeMap<i64, Vec<PullRequestReviewComment>> = BTreeMap::new();
     for comment in comments {
         grouped
@@ -874,17 +827,17 @@ fn build_threads(comments: Vec<PullRequestReviewComment>) -> Vec<ReviewThread> {
                     .then_with(|| a.updated_at.cmp(&b.updated_at))
                     .then_with(|| a.id.cmp(&b.id))
             });
-            let thread_id = ReviewThreadId::github_root(root_id);
+            let thread_id = ReviewThreadId::root(forge, root_id);
             let normalized = comments
                 .iter()
-                .map(ReviewComment::from_github_comment)
+                .map(|comment| ReviewComment::from_comment(forge, comment))
                 .collect::<Vec<_>>();
             let anchor = normalized.iter().find_map(|comment| comment.anchor.clone());
             let outdated = normalized.iter().any(|comment| comment.outdated)
                 || anchor.as_ref().is_some_and(ReviewAnchor::is_outdated);
             ReviewThread {
                 id: thread_id,
-                backend_node_id: None,
+                remote_id: None,
                 anchor,
                 comments: normalized,
                 status: ReviewThreadStatus {
@@ -899,9 +852,9 @@ fn build_threads(comments: Vec<PullRequestReviewComment>) -> Vec<ReviewThread> {
 }
 
 impl ReviewThread {
-    pub fn from_github_thread(thread: &GitHubPullRequestReviewThread) -> Self {
-        let id = ReviewThreadId::github_node(thread.node_id.clone());
-        let anchor = Some(ReviewAnchor::from_github_thread(thread));
+    pub fn from_thread(forge: ReviewForge, thread: &PullRequestReviewThread) -> Self {
+        let id = ReviewThreadId::remote(forge, thread.id.clone());
+        let anchor = Some(ReviewAnchor::from_thread(thread));
         let resolution = if thread.is_resolved {
             ReviewResolution::Resolved
         } else {
@@ -910,11 +863,11 @@ impl ReviewThread {
         let comments = thread
             .comments
             .iter()
-            .map(|comment| ReviewComment::from_github_thread_comment(thread, comment))
+            .map(|comment| ReviewComment::from_thread_comment(forge, thread, comment))
             .collect();
         Self {
             id,
-            backend_node_id: Some(thread.node_id.clone()),
+            remote_id: Some(thread.id.clone()),
             anchor,
             comments,
             status: ReviewThreadStatus {
@@ -962,7 +915,7 @@ fn sanitize_key_part(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::forge::github::GitHubReviewCommentUser;
+    use crate::core::forge::model::PullRequestActor;
 
     fn github_comment(
         id: i64,
@@ -978,15 +931,15 @@ mod tests {
             original_commit_id: "base".to_owned(),
             line: Some(12),
             original_line: Some(12),
-            side: Some(GitHubReviewSide::Right),
+            side: Some(ReviewSide::New),
             start_line: Some(10),
             original_start_line: Some(10),
-            start_side: Some(GitHubReviewSide::Right),
+            start_side: Some(ReviewSide::New),
             subject_type: Some("line".to_owned()),
             html_url: format!("https://github.test/comment/{id}"),
             created_at: format!("2026-01-01T00:00:0{id}Z"),
             updated_at: String::new(),
-            user: Some(GitHubReviewCommentUser {
+            user: Some(PullRequestActor {
                 login: "reviewer".to_owned(),
                 avatar_url: String::new(),
             }),
@@ -1015,7 +968,7 @@ mod tests {
 
     #[test]
     fn github_review_comments_are_grouped_into_threads() {
-        let session = ReviewSession::from_github_review_comments(
+        let session = ReviewSession::from_review_comments(
             ReviewTarget::github("owner", "repo", 42),
             pull_request_info(),
             vec![
@@ -1026,7 +979,7 @@ mod tests {
 
         assert_eq!(session.threads.len(), 1);
         let thread = &session.threads[0];
-        assert_eq!(thread.id, ReviewThreadId::github_root(1));
+        assert_eq!(thread.id, ReviewThreadId::root(ReviewForge::GitHub, 1));
         assert_eq!(thread.comments.len(), 2);
         assert_eq!(thread.comments[0].body, "root");
         assert_eq!(thread.comments[1].body, "reply");
@@ -1039,7 +992,7 @@ mod tests {
 
     #[test]
     fn github_anchor_maps_to_zero_based_source_target() {
-        let anchor = ReviewAnchor::from_github_comment(&github_comment(1, None, "root")).unwrap();
+        let anchor = ReviewAnchor::from_comment(&github_comment(1, None, "root")).unwrap();
 
         let target = anchor
             .to_source_target(
@@ -1107,7 +1060,7 @@ mod tests {
         let mut comment = github_comment(1, None, "root");
         comment.line = None;
         comment.start_line = None;
-        let anchor = ReviewAnchor::from_github_comment(&comment).unwrap();
+        let anchor = ReviewAnchor::from_comment(&comment).unwrap();
 
         assert!(anchor.is_outdated());
         let target = anchor
@@ -1133,7 +1086,7 @@ mod tests {
 
         assert_eq!(anchor.side, Some(ReviewSide::Old));
         assert_eq!(anchor.line_range, Some(ReviewLineRange::new(5, 2)));
-        assert_eq!(anchor.line_range.unwrap().github_line(), 6);
+        assert_eq!(anchor.line_range.unwrap().end_inclusive(), 6);
         assert_eq!(
             anchor.to_source_target(
                 FileKey(4),
@@ -1235,6 +1188,58 @@ mod tests {
     }
 
     #[test]
+    fn github_sessions_keep_their_saved_keys_and_ids() {
+        let key = ReviewSessionKey::new(ReviewTarget::github("o w", "repo", 7), "abc");
+        assert_eq!(key.storage_key(), "github/o_w/repo/7/abc");
+        assert_eq!(
+            ReviewThreadId::remote(ReviewForge::GitHub, "T").0,
+            "github-thread-node:T"
+        );
+        assert_eq!(
+            ReviewThreadId::root(ReviewForge::GitHub, 3).0,
+            "github-thread:3"
+        );
+        assert_eq!(ReviewCommentId::new(ReviewForge::GitHub, 4).0, "github:4");
+        assert_eq!(
+            ReviewCommentId::remote(ReviewForge::GitHub, "C").0,
+            "github-node:C"
+        );
+
+        let thread: ReviewThread = serde_json::from_str(
+            r#"{
+                "id": "github-thread-node:T",
+                "backend_node_id": "T",
+                "anchor": null,
+                "comments": [{
+                    "id": "github:4", "backend_id": 4, "backend_node_id": "C",
+                    "thread_id": "github-thread-node:T", "in_reply_to": null,
+                    "in_reply_to_node_id": "P", "author_login": null, "body": "",
+                    "anchor": null, "html_url": null, "created_at": null, "updated_at": null,
+                    "outdated": false, "state": null,
+                    "viewer_can_update": false, "viewer_can_delete": false
+                }],
+                "status": {"resolution": "Unresolved", "outdated": false, "collapsed": false},
+                "permissions": {"can_reply": true, "can_resolve": true, "can_unresolve": false}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(thread.remote_id.as_deref(), Some("T"));
+        assert_eq!(thread.comments[0].remote_id.as_deref(), Some("C"));
+        assert_eq!(
+            thread.comments[0].in_reply_to_remote_id.as_deref(),
+            Some("P")
+        );
+
+        let summary: PullRequestReviewSummary = serde_json::from_str(
+            r#"{"node_id": "R", "database_id": 9, "state": "APPROVED", "body": "",
+                "author_login": "a", "submitted_at": null, "commit_oid": "",
+                "viewer_did_author": false}"#,
+        )
+        .unwrap();
+        assert_eq!((summary.id.as_str(), summary.numeric_id), ("R", Some(9)));
+    }
+
+    #[test]
     fn review_session_tracks_local_drafts() {
         let mut session = ReviewSession::new(
             ReviewTarget::github("owner", "repo", 42),
@@ -1252,49 +1257,6 @@ mod tests {
         assert_eq!(
             session.remove_draft(first).unwrap().kind,
             ReviewDraftKind::General
-        );
-    }
-
-    #[test]
-    fn review_session_builds_github_review_from_inline_drafts() {
-        let mut session = ReviewSession::new(
-            ReviewTarget::github("owner", "repo", 42),
-            pull_request_info(),
-        );
-        session.create_inline_draft(
-            ReviewAnchor::inline("src/lib.rs", ReviewSide::New, ReviewLineRange::new(10, 3)),
-            "Please simplify this.",
-        );
-        session.create_general_draft("Overall note");
-
-        let request = session
-            .build_github_review_request(ReviewDecision::RequestChanges, None)
-            .unwrap();
-
-        assert_eq!(request.commit_id.as_deref(), Some("head"));
-        assert_eq!(request.body.as_deref(), Some("Overall note"));
-        assert_eq!(
-            request.event,
-            Some(GitHubPullRequestReviewEvent::RequestChanges)
-        );
-        assert_eq!(request.comments.len(), 1);
-        assert_eq!(request.comments[0].path, "src/lib.rs");
-        assert_eq!(request.comments[0].line, 12);
-        assert_eq!(request.comments[0].start_line, Some(10));
-    }
-
-    #[test]
-    fn review_session_rejects_reply_drafts_in_review_request() {
-        let mut session = ReviewSession::new(
-            ReviewTarget::github("owner", "repo", 42),
-            pull_request_info(),
-        );
-        session.create_reply_draft(ReviewThreadId::github_node("thread"), "Reply");
-
-        assert!(
-            session
-                .build_github_review_request(ReviewDecision::Comment, None)
-                .is_err()
         );
     }
 }

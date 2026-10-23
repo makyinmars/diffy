@@ -516,10 +516,10 @@ impl VcsRepository for GitRepository {
     fn resolve_pull_request_comparison(
         &mut self,
         pull_request_url: &str,
-        github_token: &str,
-    ) -> Result<(crate::core::forge::github::PullRequestInfo, String, String)> {
+        token: &str,
+    ) -> Result<(crate::core::forge::model::PullRequestInfo, String, String)> {
         self.service
-            .resolve_pull_request_comparison(pull_request_url, github_token)
+            .resolve_pull_request_comparison(pull_request_url, token)
     }
 
     fn compare_working_file(&mut self, path: &str) -> Result<CompareOutput> {

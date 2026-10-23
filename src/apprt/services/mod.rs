@@ -20,7 +20,7 @@ pub use commands::CommandsServices;
 pub use delivery::DeliveryServices;
 pub use mutations::MutationsServices;
 pub use navigation::NavigationServices;
-pub use review::{GitHubBackend, LiveGitHub, ReviewServices};
+pub use review::{ForgeBackend, LiveForge, ReviewServices};
 pub use viewport::ViewportServices;
 
 #[derive(Clone)]
@@ -37,21 +37,21 @@ pub struct AppServices {
 impl AppServices {
     pub fn new(settings_store: SettingsStore) -> Self {
         let review_store = ReviewStore::for_settings_store(&settings_store);
-        let github = Arc::new(LiveGitHub::new(review_store.clone()));
-        Self::with_github(settings_store, review_store, github)
+        let forge = Arc::new(LiveForge::new(review_store.clone()));
+        Self::with_forge(settings_store, review_store, forge)
     }
 
-    pub fn with_github(
+    pub fn with_forge(
         settings_store: SettingsStore,
         review_store: ReviewStore,
-        github: Arc<dyn GitHubBackend>,
+        forge: Arc<dyn ForgeBackend>,
     ) -> Self {
         Self {
             shell: ShellServices,
             viewport: ViewportServices::default(),
             navigation: NavigationServices,
             commands: CommandsServices::new(settings_store.clone()),
-            review: ReviewServices::new(settings_store, review_store, github),
+            review: ReviewServices::new(settings_store, review_store, forge),
             mutations: MutationsServices,
             delivery: DeliveryServices,
         }
