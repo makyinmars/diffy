@@ -221,19 +221,6 @@ pub struct GitHubReviewThreadResolution {
     pub is_resolved: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CreatePullRequestReviewComment {
-    pub body: String,
-    pub commit_id: String,
-    pub path: String,
-    pub line: u32,
-    pub side: GitHubReviewSide,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_line: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_side: Option<GitHubReviewSide>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullRequestReview {
     pub id: i64,
@@ -273,19 +260,6 @@ pub struct CreatePullRequestReviewDraftComment {
     pub start_side: Option<GitHubReviewSide>,
 }
 
-impl From<CreatePullRequestReviewComment> for CreatePullRequestReviewDraftComment {
-    fn from(comment: CreatePullRequestReviewComment) -> Self {
-        Self {
-            path: comment.path,
-            body: comment.body,
-            line: comment.line,
-            side: comment.side,
-            start_line: comment.start_line,
-            start_side: comment.start_side,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CreatePullRequestReview {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -296,23 +270,6 @@ pub struct CreatePullRequestReview {
     pub event: Option<GitHubPullRequestReviewEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<CreatePullRequestReviewDraftComment>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SubmitPullRequestReview {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
-    pub event: GitHubPullRequestReviewEvent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CreatePullRequestReviewReply {
-    pub body: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct UpdatePullRequestReviewComment {
-    pub body: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -514,96 +471,6 @@ impl GitHubApi {
         Ok(result)
     }
 
-    pub fn create_pull_request_review_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: i32,
-        comment: &CreatePullRequestReviewComment,
-    ) -> Result<PullRequestReviewComment> {
-        if self.token.trim().is_empty() {
-            return Err(DiffyError::auth(
-                "GitHub authentication is required to add review comments".to_owned(),
-            ));
-        }
-        let body = transport::send(
-            &self.token,
-            Method::POST,
-            &format!("{API_ROOT}/repos/{owner}/{repo}/pulls/{number}/comments"),
-            Some(serde_json::to_string(comment)?),
-            "GitHub review comment create",
-        )?;
-        serde_json::from_str(&body).map_err(Into::into)
-    }
-
-    pub fn create_pull_request_review_reply(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: i32,
-        comment_id: i64,
-        reply: &CreatePullRequestReviewReply,
-    ) -> Result<PullRequestReviewComment> {
-        if self.token.trim().is_empty() {
-            return Err(DiffyError::auth(
-                "GitHub authentication is required to reply to review comments".to_owned(),
-            ));
-        }
-        let body = transport::send(
-            &self.token,
-            Method::POST,
-            &format!(
-                "{API_ROOT}/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies"
-            ),
-            Some(serde_json::to_string(reply)?),
-            "GitHub review comment reply",
-        )?;
-        serde_json::from_str(&body).map_err(Into::into)
-    }
-
-    pub fn update_pull_request_review_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        comment_id: i64,
-        update: &UpdatePullRequestReviewComment,
-    ) -> Result<PullRequestReviewComment> {
-        if self.token.trim().is_empty() {
-            return Err(DiffyError::auth(
-                "GitHub authentication is required to update review comments".to_owned(),
-            ));
-        }
-        let body = transport::send(
-            &self.token,
-            Method::PATCH,
-            &format!("{API_ROOT}/repos/{owner}/{repo}/pulls/comments/{comment_id}"),
-            Some(serde_json::to_string(update)?),
-            "GitHub review comment update",
-        )?;
-        serde_json::from_str(&body).map_err(Into::into)
-    }
-
-    pub fn delete_pull_request_review_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        comment_id: i64,
-    ) -> Result<()> {
-        if self.token.trim().is_empty() {
-            return Err(DiffyError::auth(
-                "GitHub authentication is required to delete review comments".to_owned(),
-            ));
-        }
-        transport::send(
-            &self.token,
-            Method::DELETE,
-            &format!("{API_ROOT}/repos/{owner}/{repo}/pulls/comments/{comment_id}"),
-            None,
-            "GitHub review comment delete",
-        )?;
-        Ok(())
-    }
-
     pub fn create_pull_request_review(
         &self,
         owner: &str,
@@ -626,33 +493,9 @@ impl GitHubApi {
         serde_json::from_str(&body).map_err(Into::into)
     }
 
-    pub fn submit_pull_request_review(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: i32,
-        review_id: i64,
-        submit: &SubmitPullRequestReview,
-    ) -> Result<PullRequestReview> {
-        if self.token.trim().is_empty() {
-            return Err(DiffyError::auth(
-                "GitHub authentication is required to submit pull request reviews".to_owned(),
-            ));
-        }
-        let body = transport::send(
-            &self.token,
-            Method::POST,
-            &format!("{API_ROOT}/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/events"),
-            Some(serde_json::to_string(submit)?),
-            "GitHub pull request review submit",
-        )?;
-        serde_json::from_str(&body).map_err(Into::into)
-    }
-
     pub fn add_pull_request_review_thread_reply(
         &self,
         thread_node_id: &str,
-        review_node_id: Option<&str>,
         body: &str,
     ) -> Result<GitHubPullRequestReviewThreadComment> {
         if self.token.trim().is_empty() {
@@ -664,7 +507,7 @@ impl GitHubApi {
             &review_graphql_query(ADD_REVIEW_THREAD_REPLY_MUTATION),
             json!({
                 "threadId": thread_node_id,
-                "reviewId": review_node_id,
+                "reviewId": Value::Null,
                 "body": body,
             }),
         )?;

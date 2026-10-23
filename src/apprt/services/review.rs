@@ -382,67 +382,6 @@ impl GitHubBackend for LiveGitHub {
                     },
                 }
             }
-            GitHubRequest::CreateReviewComment { pr, token, comment } => match api(token)
-                .create_pull_request_review_comment(&pr.owner, &pr.repo, pr.number, &comment)
-            {
-                Ok(comment) => GitHubResponse::ReviewCommentCreated { pr, comment },
-                Err(error) => GitHubResponse::ReviewCommentCreateFailed {
-                    pr,
-                    message: error.user_message(),
-                },
-            },
-            GitHubRequest::CreateReviewReply {
-                pr,
-                comment_id,
-                token,
-                reply,
-            } => match api(token).create_pull_request_review_reply(
-                &pr.owner, &pr.repo, pr.number, comment_id, &reply,
-            ) {
-                Ok(comment) => GitHubResponse::ReviewCommentReplied { pr, comment },
-                Err(error) => GitHubResponse::ReviewCommentReplyFailed {
-                    pr,
-                    message: error.user_message(),
-                },
-            },
-            GitHubRequest::UpdateReviewComment {
-                pr,
-                comment_id,
-                token,
-                update,
-            } => match api(token)
-                .update_pull_request_review_comment(&pr.owner, &pr.repo, comment_id, &update)
-            {
-                Ok(comment) => GitHubResponse::ReviewCommentUpdated { pr, comment },
-                Err(error) => GitHubResponse::ReviewCommentUpdateFailed {
-                    pr,
-                    comment_id,
-                    message: error.user_message(),
-                },
-            },
-            GitHubRequest::DeleteReviewComment {
-                pr,
-                comment_id,
-                token,
-            } => match api(token)
-                .delete_pull_request_review_comment(&pr.owner, &pr.repo, comment_id)
-            {
-                Ok(()) => GitHubResponse::ReviewCommentDeleted { pr, comment_id },
-                Err(error) => GitHubResponse::ReviewCommentDeleteFailed {
-                    pr,
-                    comment_id,
-                    message: error.user_message(),
-                },
-            },
-            GitHubRequest::CreateReview { pr, token, review } => match api(token)
-                .create_pull_request_review(&pr.owner, &pr.repo, pr.number, &review)
-            {
-                Ok(review) => GitHubResponse::ReviewCreated { pr, review },
-                Err(error) => GitHubResponse::ReviewCreateFailed {
-                    pr,
-                    message: error.user_message(),
-                },
-            },
             GitHubRequest::SubmitSessionDrafts {
                 session,
                 decision,
@@ -480,14 +419,9 @@ impl GitHubBackend for LiveGitHub {
             GitHubRequest::AddThreadReply {
                 pr,
                 thread_node_id,
-                review_node_id,
                 token,
                 body,
-            } => match api(token).add_pull_request_review_thread_reply(
-                &thread_node_id,
-                review_node_id.as_deref(),
-                &body,
-            ) {
+            } => match api(token).add_pull_request_review_thread_reply(&thread_node_id, &body) {
                 Ok(comment) => GitHubResponse::ThreadReplyAdded {
                     pr,
                     thread_node_id,
@@ -542,21 +476,6 @@ impl GitHubBackend for LiveGitHub {
                 Err(error) => GitHubResponse::ThreadResolutionChangeFailed {
                     pr,
                     thread_node_id,
-                    message: error.user_message(),
-                },
-            },
-            GitHubRequest::SubmitReview {
-                pr,
-                review_id,
-                token,
-                submit,
-            } => match api(token)
-                .submit_pull_request_review(&pr.owner, &pr.repo, pr.number, review_id, &submit)
-            {
-                Ok(review) => GitHubResponse::ReviewSubmitted { pr, review },
-                Err(error) => GitHubResponse::ReviewSubmitFailed {
-                    pr,
-                    review_id,
                     message: error.user_message(),
                 },
             },

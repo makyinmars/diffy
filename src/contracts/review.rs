@@ -6,11 +6,9 @@ use quark_ui::document::DocumentEvent;
 
 use crate::contracts::shared::{AccountEpoch, JobId, SourceTarget};
 use crate::core::forge::github::{
-    CreatePullRequestReview, CreatePullRequestReviewComment, CreatePullRequestReviewReply,
     DeviceFlowState, GitHubPullRequestReviewData, GitHubPullRequestReviewThreadComment,
     GitHubReviewThreadResolution, GitHubUser, MyPullRequest, PullRequestInfo, PullRequestOverview,
-    PullRequestReview, PullRequestReviewComment, SubmitPullRequestReview,
-    UpdatePullRequestReviewComment,
+    PullRequestReview, PullRequestReviewComment,
 };
 use crate::core::review::{
     ReviewDecision, ReviewDraftId, ReviewSession, ReviewSessionKey, ReviewTarget, ReviewThreadId,
@@ -166,33 +164,6 @@ pub enum GitHubRequest {
         pr: PullRequestRef,
         token: Option<Secret>,
     },
-    CreateReviewComment {
-        pr: PullRequestRef,
-        token: Option<Secret>,
-        comment: CreatePullRequestReviewComment,
-    },
-    CreateReviewReply {
-        pr: PullRequestRef,
-        comment_id: i64,
-        token: Option<Secret>,
-        reply: CreatePullRequestReviewReply,
-    },
-    UpdateReviewComment {
-        pr: PullRequestRef,
-        comment_id: i64,
-        token: Option<Secret>,
-        update: UpdatePullRequestReviewComment,
-    },
-    DeleteReviewComment {
-        pr: PullRequestRef,
-        comment_id: i64,
-        token: Option<Secret>,
-    },
-    CreateReview {
-        pr: PullRequestRef,
-        token: Option<Secret>,
-        review: CreatePullRequestReview,
-    },
     SubmitSessionDrafts {
         session: Box<ReviewSession>,
         decision: ReviewDecision,
@@ -202,7 +173,6 @@ pub enum GitHubRequest {
     AddThreadReply {
         pr: PullRequestRef,
         thread_node_id: String,
-        review_node_id: Option<String>,
         token: Option<Secret>,
         body: String,
     },
@@ -222,12 +192,6 @@ pub enum GitHubRequest {
         thread_node_id: String,
         token: Option<Secret>,
         resolved: bool,
-    },
-    SubmitReview {
-        pr: PullRequestRef,
-        review_id: i64,
-        token: Option<Secret>,
-        submit: SubmitPullRequestReview,
     },
     FetchPullRequestOverview {
         pr: PullRequestRef,
@@ -292,48 +256,6 @@ pub enum GitHubResponse {
         pr: PullRequestRef,
         message: String,
     },
-    ReviewCommentCreated {
-        pr: PullRequestRef,
-        comment: PullRequestReviewComment,
-    },
-    ReviewCommentCreateFailed {
-        pr: PullRequestRef,
-        message: String,
-    },
-    ReviewCommentReplied {
-        pr: PullRequestRef,
-        comment: PullRequestReviewComment,
-    },
-    ReviewCommentReplyFailed {
-        pr: PullRequestRef,
-        message: String,
-    },
-    ReviewCommentUpdated {
-        pr: PullRequestRef,
-        comment: PullRequestReviewComment,
-    },
-    ReviewCommentUpdateFailed {
-        pr: PullRequestRef,
-        comment_id: i64,
-        message: String,
-    },
-    ReviewCommentDeleted {
-        pr: PullRequestRef,
-        comment_id: i64,
-    },
-    ReviewCommentDeleteFailed {
-        pr: PullRequestRef,
-        comment_id: i64,
-        message: String,
-    },
-    ReviewCreated {
-        pr: PullRequestRef,
-        review: PullRequestReview,
-    },
-    ReviewCreateFailed {
-        pr: PullRequestRef,
-        message: String,
-    },
     DraftsSubmitted {
         pr: PullRequestRef,
         review: PullRequestReview,
@@ -342,15 +264,6 @@ pub enum GitHubResponse {
     DraftsSubmitFailed {
         pr: PullRequestRef,
         draft_ids: Vec<ReviewDraftId>,
-        message: String,
-    },
-    ReviewSubmitted {
-        pr: PullRequestRef,
-        review: PullRequestReview,
-    },
-    ReviewSubmitFailed {
-        pr: PullRequestRef,
-        review_id: i64,
         message: String,
     },
     ThreadReplyAdded {

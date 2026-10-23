@@ -644,72 +644,6 @@ impl ReviewSession {
         self.next_draft_id = self.next_draft_id.max(persisted.next_draft_id);
     }
 
-    pub fn apply_github_comment(&mut self, comment: PullRequestReviewComment) {
-        let normalized = ReviewComment::from_github_comment(&comment);
-        if let Some(thread) = self
-            .threads
-            .iter_mut()
-            .find(|thread| thread.id == normalized.thread_id)
-        {
-            if thread.anchor.is_none() {
-                thread.anchor = normalized.anchor.clone();
-            }
-            thread.status.outdated |= normalized.outdated;
-            thread.comments.push(normalized);
-            thread.comments.sort_by(|a, b| {
-                a.created_at
-                    .cmp(&b.created_at)
-                    .then_with(|| a.updated_at.cmp(&b.updated_at))
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            return;
-        }
-
-        let anchor = normalized.anchor.clone();
-        let outdated =
-            normalized.outdated || anchor.as_ref().is_some_and(ReviewAnchor::is_outdated);
-        self.threads.push(ReviewThread {
-            id: normalized.thread_id.clone(),
-            backend_node_id: None,
-            anchor,
-            comments: vec![normalized],
-            status: ReviewThreadStatus {
-                resolution: ReviewResolution::Unknown,
-                outdated,
-                collapsed: false,
-            },
-            permissions: ReviewThreadPermissions::default(),
-        });
-        self.threads.sort_by(|a, b| a.id.cmp(&b.id));
-    }
-
-    pub fn append_reply(&mut self, comment: &PullRequestReviewComment) -> bool {
-        let Some(root) = comment.in_reply_to_id else {
-            return false;
-        };
-        let Some(thread) = self.threads.iter_mut().find(|thread| {
-            thread
-                .comments
-                .iter()
-                .any(|existing| existing.backend_id == Some(root))
-        }) else {
-            return false;
-        };
-        if thread
-            .comments
-            .iter()
-            .any(|existing| existing.backend_id == Some(comment.id))
-        {
-            return false;
-        }
-        let mut reply = ReviewComment::from_github_comment(comment);
-        reply.thread_id = thread.id.clone();
-        reply.viewer_can_update = true;
-        reply.viewer_can_delete = true;
-        thread.comments.push(reply);
-        true
-    }
-
     pub fn mark_thread_resolution(
         &mut self,
         thread_id: &ReviewThreadId,
@@ -736,14 +670,6 @@ impl ReviewSession {
             .iter()
             .find(|thread| &thread.id == thread_id)
             .and_then(|thread| thread.backend_node_id.clone())
-    }
-
-    pub fn comment_node_id(&self, comment_id: &ReviewCommentId) -> Option<String> {
-        self.threads
-            .iter()
-            .flat_map(|thread| thread.comments.iter())
-            .find(|comment| &comment.id == comment_id)
-            .and_then(|comment| comment.backend_node_id.clone())
     }
 
     pub fn create_inline_draft(

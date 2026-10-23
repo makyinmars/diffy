@@ -354,7 +354,6 @@ impl GitHubBackend for FakeGitHub {
             } else {
                 GitHubResponse::MyPullRequestsLoaded(pulls)
             }),
-            other => panic!("unexpected request {other:?}"),
         }
     }
 }

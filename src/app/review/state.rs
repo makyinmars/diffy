@@ -1112,7 +1112,6 @@ impl ReviewController {
                     GitHubRequest::AddThreadReply {
                         pr,
                         thread_node_id: node,
-                        review_node_id: None,
                         token: Some(token),
                         body,
                     },
@@ -1236,7 +1235,6 @@ impl ReviewController {
                         GitHubRequest::AddThreadReply {
                             pr: pr.clone(),
                             thread_node_id,
-                            review_node_id: None,
                             token: Some(token.clone()),
                             body,
                         },
@@ -1578,28 +1576,11 @@ impl ReviewController {
                 self.expanded.remove(&id);
                 self.after_mutation(false)
             }
-            GitHubResponse::ReviewCommentReplied { comment, .. } => {
-                if let Some(session) = self.session_mut() {
-                    session.append_reply(&comment);
-                }
-                self.after_mutation(true)
-            }
             GitHubResponse::CommentGraphqlUpdated { .. }
-            | GitHubResponse::CommentGraphqlDeleted { .. }
-            | GitHubResponse::ReviewCommentCreated { .. }
-            | GitHubResponse::ReviewCommentUpdated { .. }
-            | GitHubResponse::ReviewCommentDeleted { .. }
-            | GitHubResponse::ReviewCreated { .. }
-            | GitHubResponse::ReviewSubmitted { .. } => self.after_mutation(true),
+            | GitHubResponse::CommentGraphqlDeleted { .. } => self.after_mutation(true),
             GitHubResponse::CommentGraphqlUpdateFailed { message, .. }
             | GitHubResponse::CommentGraphqlDeleteFailed { message, .. }
-            | GitHubResponse::ThreadResolutionChangeFailed { message, .. }
-            | GitHubResponse::ReviewCommentCreateFailed { message, .. }
-            | GitHubResponse::ReviewCommentReplyFailed { message, .. }
-            | GitHubResponse::ReviewCommentUpdateFailed { message, .. }
-            | GitHubResponse::ReviewCommentDeleteFailed { message, .. }
-            | GitHubResponse::ReviewCreateFailed { message, .. }
-            | GitHubResponse::ReviewSubmitFailed { message, .. } => {
+            | GitHubResponse::ThreadResolutionChangeFailed { message, .. } => {
                 Reduction::changed().intent(error(message))
             }
             GitHubResponse::PullRequestPeeked { pr, info } => {
