@@ -599,6 +599,26 @@ impl LiveForge {
                     },
                 }
             }
+            ForgeRequest::FetchUser { token, .. } => {
+                match bitbucket_api(Some(token)).fetch_current_user() {
+                    Ok(user) => ForgeResponse::UserFetched(user.user),
+                    Err(error) => ForgeResponse::UserFetchFailed {
+                        message: error.user_message(),
+                    },
+                }
+            }
+            ForgeRequest::FetchReviewData { pr, token } => {
+                match bitbucket_api(token).fetch_review_data(&pr) {
+                    Ok(data) => ForgeResponse::ReviewDataLoaded {
+                        pr,
+                        data: Box::new(data),
+                    },
+                    Err(error) => ForgeResponse::ReviewDataLoadFailed {
+                        pr,
+                        message: error.user_message(),
+                    },
+                }
+            }
             other => other.fail("This isn't available for Bitbucket pull requests yet.".to_owned()),
         };
         emit(response);

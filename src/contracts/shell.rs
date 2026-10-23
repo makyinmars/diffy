@@ -65,6 +65,8 @@ pub enum LogicalFocus {
     ReviewOverview,
     ReviewPulls,
     ReviewPullsFilter,
+    ReviewBitbucketEmail,
+    ReviewBitbucketToken,
     DeliveryLanguages,
     TitleBar,
     PullRequestBar,

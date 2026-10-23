@@ -6,12 +6,15 @@ use std::sync::Arc;
 use quark_components::AvatarImage;
 use quark_ui::FocusId;
 use quark_ui::element::ScrollHandle;
-use quark_ui::text_input::{InlineStyle, TextEditCommand, TextEditOutcome};
+use quark_ui::text_input::{InlineStyle, TextEditCommand, TextEditOutcome, TextField};
 
 use super::composer::ComposerTarget;
 use super::presentation::{CardHost, ReviewPresentation};
 use super::pulls::PullsPage;
-use crate::app::text_targets::{REVIEW_COMPOSER, REVIEW_PULLS_FILTER, TextCx, TextHost};
+use crate::app::text_targets::{
+    REVIEW_BITBUCKET_EMAIL, REVIEW_BITBUCKET_TOKEN, REVIEW_COMPOSER, REVIEW_PULLS_FILTER, TextCx,
+    TextHost,
+};
 use crate::contracts::commands::{
     CommandDescriptor, CommandSource, CommandsAction, SettingsSnapshot, ToastKind, ToastUpdate,
 };
@@ -43,8 +46,18 @@ pub(super) const AVATAR_CACHE_LIMIT: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewOverlay {
     Auth,
+    BitbucketAuth,
     AccountMenu,
     SubmitReview,
+}
+
+impl ReviewOverlay {
+    pub fn sign_in(forge: ReviewForge) -> Self {
+        match forge {
+            ReviewForge::GitHub => Self::Auth,
+            ReviewForge::Bitbucket => Self::BitbucketAuth,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +133,8 @@ pub struct Account {
     pub auth: AuthStatus,
     pub flow: Option<JobId>,
     pub token_loaded: bool,
+    /// A pasted token being checked; it is kept only once the user loads.
+    candidate: Option<Secret>,
 }
 
 #[derive(Debug, Default)]
@@ -236,6 +251,8 @@ pub struct ReviewController {
     pub(super) file_comments: Option<String>,
     pub(super) overview: OverviewState,
     pub(super) pulls: PullsPage,
+    pub(super) bitbucket_email: TextField,
+    pub(super) bitbucket_token: TextField,
     pub(super) host: CardHost,
     presentation: Rc<ReviewPresentation>,
 }
@@ -264,6 +281,8 @@ impl Default for ReviewController {
             file_comments: None,
             overview: OverviewState::default(),
             pulls: PullsPage::default(),
+            bitbucket_email: TextField::new(""),
+            bitbucket_token: TextField::new(""),
             presentation: Rc::new(ReviewPresentation::empty(host.clone())),
             host,
         }
@@ -332,6 +351,16 @@ fn author_avatar_url(key: &str) -> Option<String> {
     avatar_url_sized(&base, REVIEW_AVATAR_PX)
 }
 
+fn is_github_avatar(url: &str) -> bool {
+    let host = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    host.eq_ignore_ascii_case("avatars.githubusercontent.com") || host.ends_with(".github.com")
+}
+
 fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -344,10 +373,15 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
+/// GitHub avatar URLs take a size; other forges' avatar URLs are opaque and
+/// are fetched as given.
 pub(super) fn avatar_url_sized(base: &str, size: u32) -> Option<String> {
     let base = base.trim();
     if base.is_empty() {
         return None;
+    }
+    if !is_github_avatar(base) {
+        return Some(base.to_owned());
     }
     let (path, query) = base.split_once('?').unwrap_or((base, ""));
     let mut parts: Vec<&str> = query
@@ -476,9 +510,58 @@ impl ReviewController {
         if let Some(closed) = self.overlay.take() {
             self.focus_request = Some(match closed {
                 ReviewOverlay::SubmitReview => LogicalFocus::Viewport,
-                ReviewOverlay::Auth | ReviewOverlay::AccountMenu => LogicalFocus::ReviewAccount,
+                ReviewOverlay::Auth | ReviewOverlay::BitbucketAuth | ReviewOverlay::AccountMenu => {
+                    LogicalFocus::ReviewAccount
+                }
             });
         }
+    }
+
+    fn open_sign_in(&mut self, forge: ReviewForge) -> Reduction {
+        self.open_overlay(ReviewOverlay::sign_in(forge));
+        let account = self.accounts.get_mut(forge);
+        if account.auth == AuthStatus::Done && !self.signed_in(forge) {
+            self.accounts.get_mut(forge).auth = AuthStatus::Idle;
+        }
+        if forge == ReviewForge::Bitbucket {
+            self.focus_request = Some(if self.bitbucket_email.text().trim().is_empty() {
+                LogicalFocus::ReviewBitbucketEmail
+            } else {
+                LogicalFocus::ReviewBitbucketToken
+            });
+        }
+        Reduction::changed()
+    }
+
+    /// Check a pasted Bitbucket API token by reading the user it belongs to.
+    /// The token is saved only when that works.
+    fn sign_in_bitbucket(&mut self) -> Reduction {
+        let forge = ReviewForge::Bitbucket;
+        let email = self.bitbucket_email.text().trim().to_owned();
+        let token = self.bitbucket_token.text().trim().to_owned();
+        if token.is_empty() {
+            self.accounts.get_mut(forge).auth =
+                AuthStatus::Failed("Paste an API token to sign in.".to_owned());
+            self.focus_request = Some(LogicalFocus::ReviewBitbucketToken);
+            return Reduction::changed();
+        }
+        let secret = Secret::new(if email.is_empty() {
+            token
+        } else {
+            format!("{email}:{token}")
+        });
+        let scope = self.job(None, Pending::User(forge));
+        let account = self.accounts.get_mut(forge);
+        account.flow = Some(scope.request);
+        account.auth = AuthStatus::Starting;
+        account.candidate = Some(secret.clone());
+        Reduction::changed().effect(ReviewEffect::Forge {
+            scope,
+            request: Box::new(ForgeRequest::FetchUser {
+                forge,
+                token: secret,
+            }),
+        })
     }
 
     pub fn is_modal_open(&self) -> bool {
@@ -626,11 +709,13 @@ impl ReviewController {
     }
 
     fn require_token(&mut self, why: &str) -> Result<Secret, Reduction> {
-        match self.token(self.active_forge()) {
+        let forge = self.active_forge();
+        match self.token(forge) {
             Some(token) => Ok(token),
             None => {
-                self.open_overlay(ReviewOverlay::Auth);
-                Err(Reduction::changed().intent(info(why)))
+                let mut reduction = self.open_sign_in(forge);
+                reduction = reduction.intent(info(why));
+                Err(reduction)
             }
         }
     }
@@ -677,6 +762,12 @@ impl ReviewController {
             return None;
         }
         let token = self.token(pr.forge);
+        if pr.forge == ReviewForge::Bitbucket {
+            return Some(self.forge_request(
+                Pending::ReviewData,
+                ForgeRequest::FetchReviewData { pr, token },
+            ));
+        }
         Some(match token {
             Some(token) => self.forge_request(
                 Pending::ReviewData,
@@ -702,22 +793,29 @@ impl ReviewController {
 
     fn startup(&mut self, startup: &crate::contracts::shell::AppStartup) -> Reduction {
         self.client_id = startup.options.github_client_id.clone();
-        let forge = ReviewForge::GitHub;
-        self.accounts.get_mut(forge).user = startup.settings.forge_user(forge).cloned();
         self.pending_url = startup.options.args.open_pr.clone();
         if self.repo_path.is_none() {
             self.repo_path = startup.options.args.repo.clone();
         }
         let mut reduction = Reduction::changed();
-        match startup.options.github_token.clone() {
-            Some(token) => {
-                let account = self.accounts.get_mut(forge);
-                account.token = Some(Secret::new(token));
-                account.token_loaded = true;
-                reduction.merge(self.fetch_user(forge));
-                reduction.merge(self.load_pending());
+        for (forge, token) in [
+            (ReviewForge::GitHub, startup.options.github_token.clone()),
+            (
+                ReviewForge::Bitbucket,
+                startup.options.bitbucket_token.clone(),
+            ),
+        ] {
+            self.accounts.get_mut(forge).user = startup.settings.forge_user(forge).cloned();
+            match token {
+                Some(token) => {
+                    let account = self.accounts.get_mut(forge);
+                    account.token = Some(Secret::new(token));
+                    account.token_loaded = true;
+                    reduction.merge(self.fetch_user(forge));
+                    reduction.merge(self.load_pending());
+                }
+                None => reduction = reduction.effect(ReviewEffect::LoadToken(forge)),
             }
-            None => reduction = reduction.effect(ReviewEffect::LoadToken(forge)),
         }
         reduction
     }
@@ -885,21 +983,27 @@ impl ReviewController {
         reduction
     }
 
-    fn sign_out(&mut self, cx: &SharedContext) -> Reduction {
+    fn sign_out(&mut self, forge: ReviewForge, cx: &SharedContext) -> Reduction {
         let mut reduction = Reduction::changed();
-        if self.pr.is_some() {
+        if self
+            .pr
+            .as_ref()
+            .is_some_and(|active| active.pr.forge == forge)
+        {
             reduction.merge(self.close_pull_request());
         }
-        let forge = ReviewForge::GitHub;
         *self.accounts.get_mut(forge) = Account {
             token_loaded: true,
             ..Account::default()
         };
+        if forge == ReviewForge::Bitbucket {
+            self.bitbucket_token.set_text("");
+        }
         self.close_overlay();
         reduction = reduction
             .effect(ReviewEffect::ClearToken(forge))
             .intent(self.bump_account())
-            .intent(info("Signed out of GitHub."));
+            .intent(info(format!("Signed out of {}.", forge.name())));
         reduction.merge(self.publish_user(cx, forge, None));
         reduction
     }
@@ -1435,6 +1539,43 @@ impl ReviewController {
         })
     }
 
+    /// A pasted token loaded its user: keep it, sign in, and reload what
+    /// the open pull request shows.
+    fn token_verified(&mut self, forge: ReviewForge) -> Reduction {
+        let account = self.accounts.get_mut(forge);
+        account.flow = None;
+        account.auth = AuthStatus::Done;
+        let Some(token) = account.candidate.take() else {
+            return Reduction::default();
+        };
+        account.token = Some(token.clone());
+        account.token_loaded = true;
+        if forge == ReviewForge::Bitbucket {
+            self.bitbucket_token.set_text("");
+        }
+        if self.overlay == Some(ReviewOverlay::sign_in(forge)) {
+            self.close_overlay();
+        }
+        let mut reduction = Reduction::changed()
+            .effect(ReviewEffect::SaveToken { forge, token })
+            .intent(self.bump_account())
+            .intent(info(format!("Signed in to {}.", forge.name())));
+        reduction.merge(self.load_pending());
+        if self
+            .pr
+            .as_ref()
+            .is_some_and(|pr| pr.pr.forge == forge && pr.comparison.is_some())
+        {
+            if let Some(effect) = self.fetch_review() {
+                reduction = reduction.effect(effect);
+            }
+            if let Some(effect) = self.fetch_overview() {
+                reduction = reduction.effect(effect);
+            }
+        }
+        reduction
+    }
+
     fn reduce_forge(
         &mut self,
         scope: ReviewScope,
@@ -1467,8 +1608,11 @@ impl ReviewController {
                 let Pending::User(forge) = kind else {
                     return Reduction::default();
                 };
-                let previous = self.account(forge).user.as_ref().map(|u| u.login.clone());
                 let mut reduction = Reduction::changed();
+                if self.account(forge).flow == Some(scope.request) {
+                    reduction.merge(self.token_verified(forge));
+                }
+                let previous = self.account(forge).user.as_ref().map(|u| u.login.clone());
                 if previous.is_some_and(|login| login != user.login) && self.pr.is_some() {
                     reduction.merge(self.close_pull_request());
                     reduction = reduction.intent(self.bump_account());
@@ -1486,7 +1630,17 @@ impl ReviewController {
                 reduction
             }
             ForgeResponse::UserFetchFailed { message } => {
-                tracing::warn!("failed to fetch GitHub user: {message}");
+                let Pending::User(forge) = kind else {
+                    return Reduction::default();
+                };
+                let account = self.accounts.get_mut(forge);
+                if account.flow == Some(scope.request) {
+                    account.flow = None;
+                    account.candidate = None;
+                    account.auth = AuthStatus::Failed(message);
+                    return Reduction::changed();
+                }
+                tracing::warn!("failed to fetch {} user: {message}", forge.name());
                 Reduction::default()
             }
             ForgeResponse::ReviewDataLoaded { data, .. } => {
@@ -1504,6 +1658,17 @@ impl ReviewController {
             }
             ForgeResponse::ReviewDataLoadFailed { pr, message } => {
                 tracing::warn!("failed to fetch pull request review data: {message}");
+                if pr.forge == ReviewForge::Bitbucket {
+                    if let Some(session) = self.session_mut() {
+                        session.status = ReviewSessionStatus::Failed;
+                        session.status_message = Some(message);
+                    }
+                    let mut reduction = Reduction::changed();
+                    if let Some(effect) = self.queued_review_fetch() {
+                        reduction = reduction.effect(effect);
+                    }
+                    return reduction;
+                }
                 if let Some(session) = self.session_mut() {
                     session.status_message = Some(message);
                 }
@@ -1733,14 +1898,9 @@ impl ReviewController {
 
     fn reduce_other(&mut self, action: ReviewAction, cx: &SharedContext) -> Reduction {
         match action {
-            ReviewAction::OpenAuthModal => {
-                self.open_overlay(ReviewOverlay::Auth);
-                let forge = ReviewForge::GitHub;
-                if self.account(forge).auth == AuthStatus::Done && !self.signed_in(forge) {
-                    self.accounts.get_mut(forge).auth = AuthStatus::Idle;
-                }
-                Reduction::changed()
-            }
+            ReviewAction::OpenAuthModal => self.open_sign_in(self.active_forge()),
+            ReviewAction::OpenSignIn(forge) => self.open_sign_in(forge),
+            ReviewAction::SignInBitbucket => self.sign_in_bitbucket(),
             ReviewAction::CloseOverlay => {
                 self.close_overlay();
                 Reduction::changed()
@@ -1758,7 +1918,7 @@ impl ReviewController {
                 self.open_overlay(ReviewOverlay::AccountMenu);
                 Reduction::changed()
             }
-            ReviewAction::SignOut => self.sign_out(cx),
+            ReviewAction::SignOut(forge) => self.sign_out(forge, cx),
             ReviewAction::LoadPullRequest { url } => self.open_pull_request(url),
             ReviewAction::PreviewPullRequest => self.preview_pull_request(cx),
             ReviewAction::PeekPullRequest { url } => self.peek_pull_request(&url),
@@ -2325,10 +2485,22 @@ impl Controller for ReviewController {
     }
 }
 
+impl ReviewController {
+    fn sign_in_field(&mut self, target: FocusId) -> Option<&mut TextField> {
+        match target {
+            REVIEW_BITBUCKET_EMAIL => Some(&mut self.bitbucket_email),
+            REVIEW_BITBUCKET_TOKEN => Some(&mut self.bitbucket_token),
+            _ => None,
+        }
+    }
+}
+
 impl TextHost for ReviewController {
     fn owns_text(&self, target: FocusId) -> bool {
         (target == REVIEW_COMPOSER && self.composer.as_ref().is_some_and(|c| !c.preview))
             || (target == REVIEW_PULLS_FILTER && self.pulls.open)
+            || target == REVIEW_BITBUCKET_EMAIL
+            || target == REVIEW_BITBUCKET_TOKEN
     }
 
     fn edit_text(
@@ -2342,6 +2514,9 @@ impl TextHost for ReviewController {
         }
         if target == REVIEW_PULLS_FILTER {
             return Some(self.edit_pulls_filter(command, cx.now_ms));
+        }
+        if let Some(field) = self.sign_in_field(target) {
+            return Some(field.apply_at(command, cx.now_ms));
         }
         let outcome = match command {
             TextEditCommand::ToggleStyle(style) => {
@@ -2401,6 +2576,10 @@ impl TextHost for ReviewController {
             self.pulls.filter.set_preedit(text, cursor);
             return true;
         }
+        if let Some(field) = self.sign_in_field(target) {
+            field.set_preedit(text, cursor);
+            return true;
+        }
         self.host.composer_preedit(text, cursor);
         self.bump_presentation();
         true
@@ -2421,6 +2600,13 @@ impl TextHost for ReviewController {
             return Some(TextEditOutcome {
                 text_changed,
                 selection_changed: true,
+                ..TextEditOutcome::default()
+            });
+        }
+        if let Some(field) = self.sign_in_field(target) {
+            field.set_text(value);
+            return Some(TextEditOutcome {
+                text_changed: true,
                 ..TextEditOutcome::default()
             });
         }
@@ -2524,7 +2710,7 @@ impl CommandSource for ReviewController {
             CommandDescriptor::new(
                 "review.sign_out",
                 "Sign out of GitHub",
-                ReviewAction::SignOut,
+                ReviewAction::SignOut(ReviewForge::GitHub),
             )
         } else {
             CommandDescriptor::new(
@@ -2532,6 +2718,20 @@ impl CommandSource for ReviewController {
                 "Sign in to GitHub",
                 ReviewAction::OpenAuthModal,
             )
+        });
+        out.push(if self.signed_in(ReviewForge::Bitbucket) {
+            CommandDescriptor::new(
+                "review.sign_out_bitbucket",
+                "Sign out of Bitbucket",
+                ReviewAction::SignOut(ReviewForge::Bitbucket),
+            )
+        } else {
+            CommandDescriptor::new(
+                "review.sign_in_bitbucket",
+                "Sign in to Bitbucket",
+                ReviewAction::OpenSignIn(ReviewForge::Bitbucket),
+            )
+            .detail("Paste an Atlassian API token")
         });
     }
 }

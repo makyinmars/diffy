@@ -46,6 +46,8 @@ pub struct Args {
 pub struct StartupOptions {
     pub args: Args,
     pub github_token: Option<String>,
+    /// `BITBUCKET_TOKEN`, as `email:token` when `BITBUCKET_EMAIL` is set.
+    pub bitbucket_token: Option<String>,
     pub github_client_id: String,
     pub log_debug: bool,
     pub keyring_enabled: bool,
@@ -133,7 +135,9 @@ impl StartupOptions {
     pub fn load() -> Self {
         let env_defaults = StartupEnvDefaults::load(env_var);
         let keyring_enabled = keyring_enabled_from_env(env_flag);
-        Self::from_parts_with_token_store(
+        let bitbucket_token =
+            bitbucket_token_from_env(env_var("BITBUCKET_TOKEN"), env_var("BITBUCKET_EMAIL"));
+        let options = Self::from_parts_with_token_store(
             env_defaults.apply(Args::parse()),
             env_var("GITHUB_TOKEN"),
             env_var("DIFFY_GITHUB_CLIENT_ID")
@@ -142,7 +146,11 @@ impl StartupOptions {
             env_flag("DIFFY_LOG_DEBUG"),
             keyring_enabled,
             token_store_from_env(env_flag, keyring_enabled),
-        )
+        );
+        Self {
+            bitbucket_token,
+            ..options
+        }
     }
 
     pub fn from_parts(
@@ -187,6 +195,7 @@ impl StartupOptions {
         Self {
             args,
             github_token: github_token.filter(|value| !value.is_empty()),
+            bitbucket_token: None,
             github_client_id,
             log_debug,
             keyring_enabled,
@@ -316,6 +325,20 @@ where
     !cfg!(debug_assertions)
 }
 
+/// A Bitbucket API token goes out as Basic auth with the account email when
+/// one is given, as a Bearer token otherwise.
+fn bitbucket_token_from_env(token: Option<String>, email: Option<String>) -> Option<String> {
+    let token = token
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())?;
+    match email.map(|email| email.trim().to_owned()) {
+        Some(email) if !email.is_empty() && !token.contains(':') => {
+            Some(format!("{email}:{token}"))
+        }
+        _ => Some(token),
+    }
+}
+
 fn token_store_from_env<FFlag>(env_flag: FFlag, keyring_enabled: bool) -> TokenStore
 where
     FFlag: Fn(&str) -> bool,
@@ -342,7 +365,8 @@ mod tests {
 
     use super::{
         Args, StartupEnvDefaults, StartupOptions, TokenStore, app_config_dir, app_log_dir,
-        config_dir_from, config_dir_override, keyring_enabled_from_env, token_store_from_env,
+        bitbucket_token_from_env, config_dir_from, config_dir_override, keyring_enabled_from_env,
+        token_store_from_env,
     };
     use crate::core::compare::{CompareMode, LayoutMode, RendererKind};
 
@@ -442,6 +466,28 @@ mod tests {
         assert!(keyring_enabled_from_env(|name| {
             enabled.get(name).is_some_and(|value| *value == "1")
         }));
+    }
+
+    #[test]
+    fn bitbucket_env_token_pairs_with_the_email_when_given() {
+        let some = |value: &str| Some(value.to_owned());
+        assert_eq!(
+            bitbucket_token_from_env(some(" ATATT3x "), some("me@example.com")),
+            some("me@example.com:ATATT3x")
+        );
+        assert_eq!(
+            bitbucket_token_from_env(some("ATATT3x"), None),
+            some("ATATT3x")
+        );
+        assert_eq!(
+            bitbucket_token_from_env(some("me@example.com:ATATT3x"), some("other@example.com")),
+            some("me@example.com:ATATT3x")
+        );
+        assert_eq!(
+            bitbucket_token_from_env(some("  "), some("me@example.com")),
+            None
+        );
+        assert_eq!(bitbucket_token_from_env(None, some("me@example.com")), None);
     }
 
     #[test]

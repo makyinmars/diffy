@@ -1,9 +1,23 @@
+use std::sync::{Mutex, PoisonError};
+
 use serde_json::Value;
 
+use super::comments::{self, Viewer};
 use super::transport::{self, API_ROOT, Credentials};
 use crate::core::error::{DiffyError, Result};
-use crate::core::forge::model::PullRequestInfo;
+use crate::core::forge::model::{ForgeUser, PullRequestInfo, PullRequestReviewData};
 use crate::core::review::ReviewTarget;
+
+/// The signed-in Bitbucket account. `uuid` decides which comments the viewer
+/// may edit; nicknames are display names and need not be unique.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitbucketUser {
+    pub user: ForgeUser,
+    pub uuid: String,
+}
+
+// Users already read per credential, so review refreshes do not re-read them.
+static VIEWERS: Mutex<Vec<(u64, BitbucketUser)>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Clone, Default)]
 pub struct BitbucketApi {
@@ -13,6 +27,59 @@ pub struct BitbucketApi {
 impl BitbucketApi {
     pub fn new(credentials: Credentials) -> Self {
         Self { credentials }
+    }
+
+    pub fn fetch_current_user(&self) -> Result<BitbucketUser> {
+        let value = transport::get_json(
+            &self.credentials,
+            &format!("{API_ROOT}/user"),
+            "Bitbucket user fetch",
+        )?;
+        let user = parse_user(&value)?;
+        let mut viewers = VIEWERS.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = self.credentials.key();
+        viewers.retain(|(known, _)| *known != key);
+        viewers.push((key, user.clone()));
+        Ok(user)
+    }
+
+    fn viewer(&self) -> Option<BitbucketUser> {
+        if self.credentials.is_anonymous() {
+            return None;
+        }
+        let key = self.credentials.key();
+        let cached = VIEWERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(known, _)| *known == key)
+            .map(|(_, user)| user.clone());
+        cached.or_else(|| match self.fetch_current_user() {
+            Ok(user) => Some(user),
+            Err(error) => {
+                tracing::warn!("bitbucket: could not read the signed-in user: {error}");
+                None
+            }
+        })
+    }
+
+    pub fn fetch_review_data(&self, pr: &ReviewTarget) -> Result<PullRequestReviewData> {
+        let comments = transport::get_pages(
+            &self.credentials,
+            &pull_request_url(pr, "/comments?pagelen=100"),
+            "Bitbucket comments fetch",
+        )?;
+        let viewer = self.viewer();
+        Ok(PullRequestReviewData {
+            threads: comments::threads(
+                &comments,
+                Viewer {
+                    signed_in: !self.credentials.is_anonymous(),
+                    uuid: viewer.as_ref().map(|viewer| viewer.uuid.as_str()),
+                },
+            ),
+            ..PullRequestReviewData::default()
+        })
     }
 
     pub fn fetch_pull_request(&self, pr: &ReviewTarget) -> Result<PullRequestInfo> {
@@ -91,6 +158,24 @@ pub(super) fn apply_diffstat(info: &mut PullRequestInfo, files: &[Value]) {
     info.additions = sum("lines_added");
     info.deletions = sum("lines_removed");
     info.changed_files = i32::try_from(files.len()).unwrap_or(i32::MAX);
+}
+
+pub(super) fn parse_user(value: &Value) -> Result<BitbucketUser> {
+    let login = login(Some(value));
+    if login.is_empty() {
+        return Err(DiffyError::Parse(
+            "missing account in Bitbucket user response".to_owned(),
+        ));
+    }
+    let name = str_at(value, "/display_name");
+    Ok(BitbucketUser {
+        user: ForgeUser {
+            name: if name.is_empty() { login.clone() } else { name },
+            avatar_url: str_at(value, "/links/avatar/href"),
+            login,
+        },
+        uuid: str_at(value, "/uuid"),
+    })
 }
 
 /// The name Diffy shows as `@login` for a Bitbucket account: its nickname,
@@ -224,6 +309,29 @@ mod tests {
             (info.additions, info.deletions, info.changed_files),
             (13, 5, 3)
         );
+    }
+
+    #[test]
+    fn current_user_maps_nickname_display_name_and_avatar() {
+        let user = parse_user(&json!({
+            "type": "user",
+            "display_name": "Ada Lovelace",
+            "nickname": "ada",
+            "account_id": "557058:ada",
+            "uuid": "{d301aafa-0000-4000-8000-000000000001}",
+            "links": { "avatar": { "href": "https://avatar.example/ada/128" } }
+        }))
+        .unwrap();
+        assert_eq!(
+            user.user,
+            ForgeUser {
+                login: "ada".to_owned(),
+                name: "Ada Lovelace".to_owned(),
+                avatar_url: "https://avatar.example/ada/128".to_owned(),
+            }
+        );
+        assert_eq!(user.uuid, "{d301aafa-0000-4000-8000-000000000001}");
+        assert!(parse_user(&json!({ "type": "user" })).is_err());
     }
 
     #[test]

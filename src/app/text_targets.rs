@@ -31,6 +31,8 @@ pub const TITLE_BAR: FocusId = FocusId::from_key("title.repo");
 pub const PULL_REQUEST_BAR: FocusId = FocusId::from_key("review.pull_request.title");
 pub const REVIEW_PULLS: FocusId = FocusId::from_key("diffy.review.pulls");
 pub const REVIEW_PULLS_FILTER: FocusId = FocusId::from_key("diffy.review.pulls.filter");
+pub const REVIEW_BITBUCKET_EMAIL: FocusId = FocusId::from_key("diffy.review.bitbucket.email");
+pub const REVIEW_BITBUCKET_TOKEN: FocusId = FocusId::from_key("diffy.review.bitbucket.token");
 
 pub fn focus_id(focus: LogicalFocus) -> FocusId {
     match focus {
@@ -53,6 +55,8 @@ pub fn focus_id(focus: LogicalFocus) -> FocusId {
         LogicalFocus::ReviewOverview => REVIEW_OVERVIEW,
         LogicalFocus::ReviewPulls => REVIEW_PULLS,
         LogicalFocus::ReviewPullsFilter => REVIEW_PULLS_FILTER,
+        LogicalFocus::ReviewBitbucketEmail => REVIEW_BITBUCKET_EMAIL,
+        LogicalFocus::ReviewBitbucketToken => REVIEW_BITBUCKET_TOKEN,
         LogicalFocus::DeliveryLanguages => crate::app::delivery::LANGUAGES_TOGGLE,
         LogicalFocus::TitleBar => TITLE_BAR,
         LogicalFocus::PullRequestBar => PULL_REQUEST_BAR,

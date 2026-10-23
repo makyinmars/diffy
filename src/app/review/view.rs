@@ -1,6 +1,7 @@
 use quark::{Px, view};
 use quark_app::ViewContext;
 use quark_components::{Avatar, Modal, avatar, badge};
+use quark_ui::FocusId;
 use quark_ui::accessibility::AccessibilityRole;
 use quark_ui::element::*;
 use quark_ui::icons::lucide;
@@ -12,7 +13,9 @@ use super::controls::{self, GhostChip, Tone};
 use super::overview::{CheckTone, check_icon, info_state, reviewer_state, state_badge};
 use super::state::{AuthStatus, ReviewOverlay};
 use crate::app::shell::Slot;
-use crate::app::text_targets::{REVIEW_ACCOUNT, REVIEW_DIALOG};
+use crate::app::text_targets::{
+    REVIEW_ACCOUNT, REVIEW_BITBUCKET_EMAIL, REVIEW_BITBUCKET_TOKEN, REVIEW_DIALOG,
+};
 use crate::app::tokens::{self, Bp, Ico, Layout, Rad, Shadow, Sp, Sz, TextStyle};
 use crate::contracts::review::{PullsAction, ReviewAction};
 use crate::contracts::shell::ShellAction;
@@ -20,6 +23,9 @@ use crate::core::forge::model::{PullRequestCheckSummary, PullRequestOverview};
 use crate::core::review::{ReviewDecision, ReviewForge};
 
 const CARD_MAX_WIDTH: f32 = 600.0;
+const ATLASSIAN_API_TOKENS_URL: &str =
+    "https://id.atlassian.com/manage-profile/security/api-tokens";
+const BITBUCKET_SCOPES: &str = "read:user:bitbucket, read:repository:bitbucket, read:pullrequest:bitbucket, write:pullrequest:bitbucket";
 const ACCOUNT_MENU_WIDTH: f32 = 260.0;
 const REVIEWER_STACK_MAX: usize = 4;
 
@@ -315,14 +321,23 @@ fn checks_status(checks: &PullRequestCheckSummary, theme: &Theme) -> Option<AnyE
     })
 }
 
+fn forge_icon(forge: ReviewForge) -> &'static str {
+    match forge {
+        ReviewForge::GitHub => lucide::GITHUB_MARK,
+        ReviewForge::Bitbucket => lucide::KEY,
+    }
+}
+
 fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
     let scale = tokens::ui_scale(theme);
-    if !review.signed_in(ReviewForge::GitHub) {
+    let forge = review.active_forge();
+    if !review.signed_in(forge) {
+        let accessible = format!("Sign in to {}", forge.name());
         return controls::ghost_chip(
             GhostChip {
-                icon: lucide::GITHUB_MARK,
+                icon: forge_icon(forge),
                 label: "Sign in",
-                accessible: "Sign in to GitHub",
+                accessible: &accessible,
                 focus: REVIEW_ACCOUNT,
                 test_id: "review.sign_in",
             },
@@ -330,12 +345,12 @@ fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
             theme,
         );
     }
-    let account = review.account(ReviewForge::GitHub);
+    let account = review.account(forge);
     let login = account
         .user
         .as_ref()
         .map(|user| user.login.clone())
-        .unwrap_or_else(|| "GitHub".to_owned());
+        .unwrap_or_else(|| forge.name().to_owned());
     let picture = avatar(login).size(Ico::XL).image(account.avatar.clone());
     view! { scale,
         <div
@@ -344,7 +359,7 @@ fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
             hover_bg={theme.colors.ghost_element_hover}
             p={Sp::XXS}
             accessibility_role={AccessibilityRole::Button}
-            aria-label="GitHub account"
+            aria-label={format!("{} account", forge.name())}
             focus_ring={REVIEW_ACCOUNT}
             test_id="review.account"
             on:click={action(ReviewAction::OpenAccountMenu)}
@@ -358,6 +373,7 @@ pub fn overlay(review: &ReviewController, slot: &Slot, cx: &mut ViewContext) -> 
     let theme = cx.theme;
     match review.overlay_open()? {
         ReviewOverlay::Auth => Some(auth_modal(review, slot, theme)),
+        ReviewOverlay::BitbucketAuth => Some(bitbucket_auth_modal(review, slot, cx)),
         ReviewOverlay::AccountMenu => Some(account_menu(review, slot, theme)),
         ReviewOverlay::SubmitReview => Some(submit_menu(review, slot, theme)),
     }
@@ -488,6 +504,107 @@ fn auth_modal(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyEleme
     }
 }
 
+/// The email and API token fields that sign in to Bitbucket. The token is
+/// checked against Bitbucket before Diffy keeps it.
+fn bitbucket_form(review: &ReviewController, cancel: bool, cx: &ViewContext) -> AnyElement {
+    let theme = cx.theme;
+    let tc = &theme.colors;
+    let scale = tokens::ui_scale(theme);
+    let small = TextStyle::BodySmall.font_size(theme);
+    let height = tokens::scaled(Sz::INPUT, scale);
+    let field = |label: &str, placeholder: &str, focus: FocusId, masked: bool| {
+        let value = if focus == REVIEW_BITBUCKET_EMAIL {
+            &review.bitbucket_email
+        } else {
+            &review.bitbucket_token
+        };
+        let focused = cx.is_focused(focus);
+        let input = text_input(label.to_owned(), value.text())
+            .field(value)
+            .focus_target(focus)
+            .focused(focused)
+            .masked(masked)
+            .bare()
+            .placeholder(placeholder.to_owned())
+            .w_full()
+            .h(height);
+        view! { scale,
+            <div class="flex-row items-center w-full" px={Sp::SM} rounded={Rad::LG}
+                 bg={tc.editor_surface}
+                 border={if focused { tc.focus_border } else { tc.border }}
+                 on:key:enter={action(ReviewAction::SignInBitbucket)}>
+                {input}
+            </div>
+        }
+    };
+    let note = |label: String| view! { <text size={small} color={tc.text_muted}>{label}</text> };
+    let account = review.account(ReviewForge::Bitbucket);
+    let checking = account.auth == AuthStatus::Starting;
+    let status = match &account.auth {
+        AuthStatus::Starting => Some(view! { scale,
+            <div test_id="review.bitbucket.checking">{note("Checking the token\u{2026}".to_owned())}</div>
+        }),
+        AuthStatus::Failed(message) => Some(view! { scale,
+            <div class="flex-row items-center w-full" gap={Sp::SM} test_id="review.bitbucket.error">
+                <icon svg={lucide::ALERT_CIRCLE} size={Px(small)} color={tc.status_error} />
+                <text size={Px(small)} color={tc.status_error}>{message.clone()}</text>
+            </div>
+        }),
+        _ => None,
+    };
+    let create = controls::button(
+        "Create token",
+        action(ReviewAction::OpenLink(ATLASSIAN_API_TOKENS_URL.to_owned())),
+        Tone::Ghost,
+    )
+    .icon(lucide::EXTERNAL_LINK);
+    let cancel =
+        cancel.then(|| controls::button("Cancel", action(ReviewAction::CloseOverlay), Tone::Ghost));
+    let sign_in = controls::button(
+        "Sign in to Bitbucket",
+        action(ReviewAction::SignInBitbucket),
+        Tone::Primary,
+    )
+    .disabled(checking || review.bitbucket_token.text().trim().is_empty());
+    view! { scale,
+        <div class="flex-col w-full" gap={Sp::SM} test_id="review.bitbucket.form">
+            {field("Atlassian account email", "you@example.com", REVIEW_BITBUCKET_EMAIL, false)}
+            {field("Bitbucket API token", "Paste token\u{2026}", REVIEW_BITBUCKET_TOKEN, true)}
+            {note(format!("Create a Bitbucket API token with scopes {BITBUCKET_SCOPES}. Without an email the token is sent as a Bearer token."))}
+            {?status}
+            <div class="flex-row items-center w-full" gap={Sp::SM}>
+                {create}
+                <spacer />
+                {?cancel}
+                {sign_in}
+            </div>
+        </div>
+    }
+}
+
+fn bitbucket_auth_modal(review: &ReviewController, slot: &Slot, cx: &ViewContext) -> AnyElement {
+    let scale = tokens::ui_scale(cx.theme);
+    let modal = Modal::new(
+        "Sign in to Bitbucket",
+        "Load private pull requests and post reviews with an Atlassian API token.",
+        lucide::KEY,
+        tokens::scaled(Sz::MODAL_SM, scale),
+        slot.width,
+        slot.height,
+        action(ReviewAction::CloseOverlay),
+    )
+    .padding(Sp::XL)
+    .gap(Sp::MD)
+    .body_child(bitbucket_form(review, true, cx));
+    view! {
+        <div class="absolute" left={0.0} top={0.0} w={slot.width} h={slot.height}
+             focus_ring={REVIEW_DIALOG}
+             on:key:escape={action(ReviewAction::CloseOverlay)}>
+            {modal}
+        </div>
+    }
+}
+
 fn account_menu(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyElement {
     let tc = &theme.colors;
     let scale = tokens::ui_scale(theme);
@@ -495,18 +612,23 @@ fn account_menu(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyEle
     let width = tokens::scaled(ACCOUNT_MENU_WIDTH, scale);
     let left = (slot.width - width - tokens::scaled(Sp::MD, scale)).max(0.0);
     let top = theme.metrics.title_bar_height + tokens::scaled(Sp::XS, scale);
-    let account = review.account(ReviewForge::GitHub);
+    let forge = review.active_forge();
+    let account = review.account(forge);
     let (title, login) = match account.user.as_ref() {
         Some(user) if !user.name.is_empty() && user.name != user.login => {
             (user.name.clone(), format!("@{}", user.login))
         }
         Some(user) => (format!("@{}", user.login), String::new()),
-        None => ("GitHub".to_owned(), String::new()),
+        None => (forge.name().to_owned(), String::new()),
     };
     let picture = avatar(title.clone())
         .size(Ico::HERO)
         .image(account.avatar.clone());
-    let sign_out = controls::button("Sign out", action(ReviewAction::SignOut), Tone::Ghost);
+    let sign_out = controls::button(
+        "Sign out",
+        action(ReviewAction::SignOut(forge)),
+        Tone::Ghost,
+    );
     view! { scale,
         <div class="absolute" left={0.0} top={0.0} w={Px(slot.width)} h={Px(slot.height)}
              bg={Color::TRANSPARENT}
@@ -516,7 +638,7 @@ fn account_menu(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyEle
                  bg={tc.elevated_surface} border={tc.border} rounded={Rad::XL}
                  shadow_preset={Shadow::DROPDOWN}
                  accessibility_role={AccessibilityRole::Menu}
-                 aria-label="GitHub account"
+                 aria-label={format!("{} account", forge.name())}
                  focus_ring={REVIEW_DIALOG}
                  test_id="review.account_menu"
                  on:click={quark_ui::element::NoopAction}>
@@ -610,61 +732,88 @@ pub fn author_avatar(review: &ReviewController, name: &str, email: &str) -> Avat
     avatar(name.to_owned()).image(review.author_face(email))
 }
 
-pub fn accounts_settings(review: &ReviewController, theme: &Theme) -> AnyElement {
+pub fn accounts_settings(review: &ReviewController, cx: &ViewContext) -> AnyElement {
+    let theme = cx.theme;
     let tc = &theme.colors;
     let scale = tokens::ui_scale(theme);
     let body = TextStyle::Body.font_size(theme);
     let small = TextStyle::BodySmall.font_size(theme);
-    let account = review.account(ReviewForge::GitHub);
-    let user = account
-        .user
-        .as_ref()
-        .filter(|_| review.signed_in(ReviewForge::GitHub));
-    let (title, detail) = match (user, &account.auth) {
-        (Some(user), _) if !user.name.is_empty() && user.name != user.login => {
-            (user.name.clone(), format!("Signed in as @{}", user.login))
-        }
-        (Some(user), _) => (format!("@{}", user.login), "Signed in".to_owned()),
-        (None, AuthStatus::Starting | AuthStatus::Awaiting(_)) => (
-            "GitHub".to_owned(),
-            "Waiting for you to approve in the browser\u{2026}".to_owned(),
-        ),
-        (None, _) => (
-            "GitHub".to_owned(),
-            "Sign in to load pull requests and post reviews.".to_owned(),
-        ),
-    };
-    let picture = avatar(title.clone())
-        .size(Ico::XXL)
-        .image(user.and(account.avatar.clone()));
-    let control = if review.signed_in(ReviewForge::GitHub) {
-        controls::button("Sign out", action(ReviewAction::SignOut), Tone::Secondary)
-    } else {
-        controls::button(
-            "Sign in",
-            action(ReviewAction::OpenAuthModal),
-            Tone::Primary,
-        )
-        .icon(lucide::GITHUB_MARK)
-    };
     view! { scale,
         <div class="flex-col w-full" gap={Sp::LG} test_id="settings.accounts">
             <div class="flex-col" gap={Sp::XXS}>
                 <text size={Px(body)} class="font-semibold" color={tc.text_strong}>"Accounts"</text>
                 <text size={Px(small)} color={tc.text_muted}>"Services Diffy signs in to."</text>
             </div>
-            <div class="flex-row items-center w-full" gap={Sp::MD} p={Sp::LG}
-                 bg={tc.elevated_surface} border={tc.border_variant} rounded={Rad::XL}
-                 accessibility_role={AccessibilityRole::Group}
-                 aria-label="GitHub account"
-                 test_id="settings.accounts.github">
+            {account_card(review, ReviewForge::GitHub, cx)}
+            {account_card(review, ReviewForge::Bitbucket, cx)}
+        </div>
+    }
+}
+
+fn account_card(review: &ReviewController, forge: ReviewForge, cx: &ViewContext) -> AnyElement {
+    let theme = cx.theme;
+    let tc = &theme.colors;
+    let scale = tokens::ui_scale(theme);
+    let body = TextStyle::Body.font_size(theme);
+    let small = TextStyle::BodySmall.font_size(theme);
+    let signed_in = review.signed_in(forge);
+    let account = review.account(forge);
+    let user = account.user.as_ref().filter(|_| signed_in);
+    let (title, detail) = match (user, &account.auth, forge) {
+        (Some(user), _, _) if !user.name.is_empty() && user.name != user.login => {
+            (user.name.clone(), format!("Signed in as @{}", user.login))
+        }
+        (Some(user), _, _) => (format!("@{}", user.login), "Signed in".to_owned()),
+        (None, AuthStatus::Starting | AuthStatus::Awaiting(_), ReviewForge::GitHub) => (
+            "GitHub".to_owned(),
+            "Waiting for you to approve in the browser\u{2026}".to_owned(),
+        ),
+        (None, _, ReviewForge::GitHub) => (
+            "GitHub".to_owned(),
+            "Sign in to load pull requests and post reviews.".to_owned(),
+        ),
+        (None, _, ReviewForge::Bitbucket) => (
+            "Bitbucket".to_owned(),
+            "Paste an Atlassian API token to load private pull requests and post reviews."
+                .to_owned(),
+        ),
+    };
+    let picture = avatar(title.clone())
+        .size(Ico::XXL)
+        .image(user.and(account.avatar.clone()));
+    let control = match (signed_in, forge) {
+        (true, _) => Some(controls::button(
+            "Sign out",
+            action(ReviewAction::SignOut(forge)),
+            Tone::Secondary,
+        )),
+        (false, ReviewForge::GitHub) => Some(
+            controls::button(
+                "Sign in",
+                action(ReviewAction::OpenSignIn(forge)),
+                Tone::Primary,
+            )
+            .icon(lucide::GITHUB_MARK),
+        ),
+        (false, ReviewForge::Bitbucket) => None,
+    };
+    let form =
+        (!signed_in && forge == ReviewForge::Bitbucket).then(|| bitbucket_form(review, false, cx));
+    view! { scale,
+        <div class="flex-col w-full" gap={Sp::MD} p={Sp::LG}
+             bg={tc.elevated_surface} border={tc.border_variant} rounded={Rad::XL}
+             accessibility_role={AccessibilityRole::Group}
+             aria-label={format!("{} account", forge.name())}
+             test_id={format!("settings.accounts.{}", forge.key())}>
+            <div class="flex-row items-center w-full" gap={Sp::MD}>
                 {picture}
                 <div class="flex-col flex-1" min_w={0.0} gap={Sp::XXS}>
                     <text size={Px(body)} class="font-medium truncate" color={tc.text}>{title}</text>
                     <text size={Px(small)} class="truncate" color={tc.text_muted}>{detail}</text>
                 </div>
-                {control}
+                {?control}
             </div>
+            {?form}
         </div>
     }
 }

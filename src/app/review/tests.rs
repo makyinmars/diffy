@@ -16,7 +16,10 @@ use quark_ui::text_input::{TextEditCommand, TextEditOutcome};
 use super::view::default_card_width;
 use super::{AuthStatus, ReviewController, ReviewOverlay, overlay, view as title_view};
 use crate::app::shell::Slot;
-use crate::app::text_targets::{REVIEW_COMPOSER, REVIEW_PULLS_FILTER, TextCx, TextHost, focus_id};
+use crate::app::text_targets::{
+    REVIEW_BITBUCKET_EMAIL, REVIEW_BITBUCKET_TOKEN, REVIEW_COMPOSER, REVIEW_PULLS_FILTER, TextCx,
+    TextHost, focus_id,
+};
 use crate::apprt::services::{ForgeBackend, ReviewServices};
 use crate::contracts::commands::ToastUpdate;
 use crate::contracts::navigation::{
@@ -207,6 +210,7 @@ struct Script {
     fail_overview: bool,
     pulls: Vec<MyPullRequest>,
     fail_pulls: bool,
+    rejected_tokens: Vec<String>,
     requests: Vec<ForgeRequest>,
 }
 
@@ -247,6 +251,13 @@ impl ForgeBackend for FakeGitHub {
                     url,
                     comparison: comparison(number),
                 });
+            }
+            ForgeRequest::FetchUser { token, .. }
+                if self.with(|s| s.rejected_tokens.iter().any(|t| t == token.expose())) =>
+            {
+                emit(ForgeResponse::UserFetchFailed {
+                    message: "Bitbucket user fetch returned 401 Unauthorized".to_owned(),
+                })
             }
             ForgeRequest::FetchUser { .. } => emit(ForgeResponse::UserFetched(ForgeUser {
                 login: "reviewer".to_owned(),
@@ -523,7 +534,7 @@ impl Fake {
             }
             ReviewEffect::LoadToken(forge) => events.push(ReviewEvent::TokenLoaded {
                 forge,
-                token: Some(Secret::new("stored-token")),
+                token: (forge == ReviewForge::GitHub).then(|| Secret::new("stored-token")),
             }),
             ReviewEffect::SaveToken { .. } | ReviewEffect::ClearToken(_) => {}
             ReviewEffect::LoadSession {
@@ -842,7 +853,7 @@ fn stale_results_are_rejected_after_an_account_switch() {
     });
     let held = std::mem::take(&mut driver.fake.held);
     driver.fake.hold = false;
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
     driver.act(ReviewAction::StartDeviceFlow);
     driver.act(ReviewAction::LoadPullRequest {
         url: URL.to_owned(),
@@ -885,7 +896,7 @@ fn stale_results_are_rejected_after_a_pull_request_switch() {
 fn device_flow_signs_in_and_changes_the_account() {
     let mut driver = Driver::new(Fake::new());
     driver.startup(None);
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
     let epoch = driver.shared.account;
     driver.toasts.clear();
 
@@ -923,7 +934,7 @@ fn sign_out_clears_the_account_and_review_target() {
     let epoch = driver.shared.account;
 
     driver.act(ReviewAction::OpenAccountMenu);
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
 
     assert!(driver.review.account(ReviewForge::GitHub).token.is_none());
     assert!(driver.review.account(ReviewForge::GitHub).user.is_none());
@@ -1204,7 +1215,7 @@ fn overlapping_refetches_coalesce_into_one_follow_up() {
 #[test]
 fn commenting_signed_out_opens_sign_in() {
     let mut driver = Driver::signed_in_with_pr();
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
     driver.act(ReviewAction::ReplyToThread(driver.thread()));
 
     assert_eq!(driver.review.overlay_open(), Some(ReviewOverlay::Auth));
@@ -1323,7 +1334,7 @@ impl UiApp for App {
         });
         let accounts = self
             .accounts
-            .then(|| super::accounts_settings(&self.driver.review, cx.theme));
+            .then(|| super::accounts_settings(&self.driver.review, cx));
         view! {
             <div w={width} h={height} class="flex-col relative overflow-hidden">
                 <div w={width} h={title_height} class="flex-row items-center">{title}</div>
@@ -1389,7 +1400,7 @@ fn sample_driver() -> Driver {
 fn signed_out_title_offers_sign_in_and_the_device_code() {
     let mut driver = Driver::new(Fake::new());
     driver.startup(None);
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
     driver.fake.hold = true;
     let mut ui = harness(driver);
 
@@ -2126,7 +2137,7 @@ fn command_source_offers_review_commands() {
     assert!(commands.contains(&("review.preview_pull_request", true)));
     assert!(commands.contains(&("review.your_pull_requests", true)));
 
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
     let commands = ids(&driver);
     assert!(commands.contains(&("review.sign_in", true)));
     assert!(commands.contains(&("review.submit", false)));
@@ -2136,7 +2147,7 @@ fn command_source_offers_review_commands() {
 fn sign_in_modal_closes_with_cancel_or_escape() {
     let mut driver = Driver::new(Fake::new());
     driver.startup(None);
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
     let mut ui = harness(driver);
 
     ui.click_node(By::role_name(Role::Button, "Sign in to GitHub"));
@@ -2257,7 +2268,7 @@ fn same_height(ui: &UiTestHarness<App>, labels: &[&str]) {
 fn signed_out() -> Driver {
     let mut driver = Driver::new(Fake::new());
     driver.startup(None);
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
     driver
 }
 
@@ -2337,6 +2348,95 @@ fn card_actions_share_one_button_height() {
     same_height(&ui, &["Reply", "Resolve thread"]);
     ui.click_node(By::role_name(Role::Button, "Reply"));
     same_height(&ui, &["Write", "Preview", "Reply", "Cancel"]);
+}
+
+fn type_into(driver: &mut Driver, target: quark_ui::FocusId, text: &str) {
+    let cx = TextCx {
+        shared: &driver.shared,
+        now_ms: 0,
+    };
+    driver
+        .review
+        .set_text_value(target, text.to_owned(), &cx)
+        .unwrap();
+}
+
+#[test]
+fn bitbucket_tokens_are_kept_only_after_they_load_a_user() {
+    let mut driver = Driver::signed_in_with_pr();
+    driver
+        .fake
+        .github
+        .with(|s| s.rejected_tokens.push("me@example.com:expired".to_owned()));
+    driver.act(ReviewAction::OpenSignIn(ReviewForge::Bitbucket));
+    assert_eq!(
+        driver.review.overlay_open(),
+        Some(ReviewOverlay::BitbucketAuth)
+    );
+
+    type_into(&mut driver, REVIEW_BITBUCKET_EMAIL, "me@example.com");
+    type_into(&mut driver, REVIEW_BITBUCKET_TOKEN, "expired");
+    driver.act(ReviewAction::SignInBitbucket);
+
+    let account = driver.review.account(ReviewForge::Bitbucket);
+    assert!(matches!(&account.auth, AuthStatus::Failed(message) if message.contains("401")));
+    assert!(!driver.review.signed_in(ReviewForge::Bitbucket));
+    assert!(!driver.fake.effects.iter().any(|effect| matches!(
+        effect,
+        ReviewEffect::SaveToken {
+            forge: ReviewForge::Bitbucket,
+            ..
+        }
+    )));
+    assert_eq!(
+        driver.review.overlay_open(),
+        Some(ReviewOverlay::BitbucketAuth)
+    );
+
+    type_into(&mut driver, REVIEW_BITBUCKET_TOKEN, "fresh");
+    driver.act(ReviewAction::SignInBitbucket);
+
+    assert!(driver.review.signed_in(ReviewForge::Bitbucket));
+    assert!(driver.review.signed_in(ReviewForge::GitHub));
+    assert_eq!(
+        driver.review.account(ReviewForge::Bitbucket).auth,
+        AuthStatus::Done
+    );
+    assert!(driver.fake.effects.iter().any(|effect| matches!(
+        effect,
+        ReviewEffect::SaveToken {
+            forge: ReviewForge::Bitbucket,
+            token,
+        } if token.expose() == "me@example.com:fresh"
+    )));
+    assert_eq!(driver.review.overlay_open(), None);
+    assert_eq!(driver.review.bitbucket_token.text(), "");
+    assert!(driver.review.active_pull_request().is_some());
+}
+
+#[test]
+fn accounts_settings_offer_a_bitbucket_token_sign_in() {
+    let mut app = App::new(Driver::signed_in_with_pr());
+    app.accounts = true;
+    let ui = UiTestHarness::new(app, (1100.0, 900.0), 2.0);
+    let card = ui
+        .find(By::role_name(Role::Group, "Bitbucket account"))
+        .bounds;
+    let email = ui
+        .find(By::role_name(Role::TextInput, "Atlassian account email"))
+        .bounds;
+    let token = ui
+        .find(By::role_name(Role::PasswordInput, "Bitbucket API token"))
+        .bounds;
+    let sign_in = ui
+        .find(By::role_name(Role::Button, "Sign in to Bitbucket"))
+        .bounds;
+
+    for bounds in [email, token, sign_in] {
+        assert!(contains(card, bounds));
+    }
+    assert!(email.y < token.y && token.y < sign_in.y);
+    assert!(ui.painted_text().contains("read:pullrequest:bitbucket"));
 }
 
 #[test]
@@ -2911,7 +3011,7 @@ fn pull_request_lists_from_a_previous_account_are_dropped() {
     driver.fake.hold = false;
     assert!(driver.review.pulls().loading);
 
-    driver.act(ReviewAction::SignOut);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
     driver.fake.held = held;
     driver.release();
 

@@ -936,7 +936,7 @@ impl<D: EffectDispatcher> UiApp for DiffyApp<D> {
                     cx,
                 ),
                 SettingsSection::Accounts => {
-                    review::accounts_settings(&self.controllers.review, cx.theme)
+                    review::accounts_settings(&self.controllers.review, cx)
                 }
                 _ => delivery::updates_settings(
                     &self.controllers.delivery,

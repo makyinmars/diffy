@@ -18,11 +18,18 @@ const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 // Pages are followed through `next`; this bounds a runaway listing.
 const MAX_PAGES: usize = 50;
 
-/// How requests authenticate. An Atlassian API token goes out as HTTP Basic
-/// auth with the account email as the username.
-#[derive(Clone, Default, PartialEq, Eq)]
+/// How requests authenticate with an Atlassian API token: HTTP Basic auth
+/// with the account email as the username, or (since August 2026) the token
+/// alone as a Bearer token.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Credentials {
-    basic: Option<(String, String)>,
+    auth: Option<Auth>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Auth {
+    Basic { email: String, token: String },
+    Bearer(String),
 }
 
 impl Credentials {
@@ -30,33 +37,47 @@ impl Credentials {
         Self::default()
     }
 
-    /// `email:api_token`, the form Diffy stores. RFC 7617 forbids `:` in the
-    /// user part, so the first `:` separates the two.
+    /// `email:api_token` or a bare `api_token`, the forms Diffy stores.
+    /// RFC 7617 forbids `:` in the user part and API tokens hold no `@`, so
+    /// an email before the first `:` marks Basic auth.
     pub fn parse(secret: &str) -> Option<Self> {
-        let (email, token) = secret.trim().split_once(':')?;
-        let (email, token) = (email.trim(), token.trim());
-        (!email.is_empty() && !token.is_empty()).then(|| Self {
-            basic: Some((email.to_owned(), token.to_owned())),
-        })
+        let secret = secret.trim();
+        if secret.is_empty() {
+            return None;
+        }
+        let auth = match secret.split_once(':') {
+            Some((email, token)) if email.contains('@') => {
+                let (email, token) = (email.trim(), token.trim());
+                if token.is_empty() {
+                    return None;
+                }
+                Auth::Basic {
+                    email: email.to_owned(),
+                    token: token.to_owned(),
+                }
+            }
+            _ => Auth::Bearer(secret.to_owned()),
+        };
+        Some(Self { auth: Some(auth) })
     }
 
     pub fn is_anonymous(&self) -> bool {
-        self.basic.is_none()
+        self.auth.is_none()
     }
 
-    fn key(&self) -> u64 {
+    pub(super) fn key(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
-        self.basic.hash(&mut hasher);
+        self.auth.hash(&mut hasher);
         hasher.finish()
     }
 }
 
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.basic.is_some() {
-            "Credentials(basic)"
-        } else {
-            "Credentials(anonymous)"
+        f.write_str(match self.auth {
+            Some(Auth::Basic { .. }) => "Credentials(basic)",
+            Some(Auth::Bearer(_)) => "Credentials(bearer)",
+            None => "Credentials(anonymous)",
         })
     }
 }
@@ -110,8 +131,12 @@ pub(super) fn send(
             .timeout(REQUEST_TIMEOUT)
             .header(USER_AGENT, AGENT)
             .header(ACCEPT, "application/json");
-        if let Some((email, token)) = &credentials.basic {
-            request = request.basic_auth(email, Some(token));
+        match &credentials.auth {
+            Some(Auth::Basic { email, token }) => {
+                request = request.basic_auth(email, Some(token));
+            }
+            Some(Auth::Bearer(token)) => request = request.bearer_auth(token),
+            None => {}
         }
         request = match body {
             Some(body) => request.header(CONTENT_TYPE, "application/json").body(body),
@@ -213,13 +238,18 @@ mod tests {
     #[test]
     fn credentials_split_email_and_token_and_never_print_them() {
         let credentials = Credentials::parse(" me@example.com:ATATT3x:tail ").unwrap();
-        assert_eq!(
-            credentials.basic,
-            Some(("me@example.com".to_owned(), "ATATT3x:tail".to_owned()))
-        );
+        assert!(matches!(
+            &credentials.auth,
+            Some(Auth::Basic { email, token }) if email == "me@example.com" && token == "ATATT3x:tail"
+        ));
         assert_eq!(format!("{credentials:?}"), "Credentials(basic)");
-        assert!(Credentials::parse("token-only").is_none());
-        assert!(Credentials::parse(":token").is_none());
+
+        let bearer = Credentials::parse("ATATT3xToken=").unwrap();
+        assert!(matches!(&bearer.auth, Some(Auth::Bearer(token)) if token == "ATATT3xToken="));
+        assert_eq!(format!("{bearer:?}"), "Credentials(bearer)");
+
+        assert!(Credentials::parse("me@example.com:").is_none());
+        assert!(Credentials::parse("  ").is_none());
         assert!(Credentials::anonymous().is_anonymous());
     }
 

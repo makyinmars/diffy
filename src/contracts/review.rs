@@ -63,13 +63,19 @@ pub enum CardKey {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReviewAction {
+    /// Sign in to the open pull request's forge (GitHub when none is open).
     OpenAuthModal,
+    OpenSignIn(ReviewForge),
     CloseOverlay,
     StartDeviceFlow,
     OpenDeviceFlowBrowser,
+    /// Check the typed Bitbucket API token and keep it if it works.
+    SignInBitbucket,
     OpenAccountMenu,
-    SignOut,
-    LoadPullRequest { url: String },
+    SignOut(ReviewForge),
+    LoadPullRequest {
+        url: String,
+    },
     PreviewPullRequest,
     OpenPullRequestInBrowser,
     OpenComposer,
@@ -82,21 +88,37 @@ pub enum ReviewAction {
     ReplyToFocused,
     ResolveFocused,
     ToggleFocused,
-    EditComment { comment_id: String },
-    ToggleCommentMenu { comment_id: String },
-    DeleteComment { comment_id: String },
-    SubmitReview { decision: ReviewDecision },
+    EditComment {
+        comment_id: String,
+    },
+    ToggleCommentMenu {
+        comment_id: String,
+    },
+    DeleteComment {
+        comment_id: String,
+    },
+    SubmitReview {
+        decision: ReviewDecision,
+    },
     DiscardDrafts,
     ToggleThread(ReviewThreadId),
-    SetThreadResolved { id: ReviewThreadId, resolved: bool },
+    SetThreadResolved {
+        id: ReviewThreadId,
+        resolved: bool,
+    },
     EditDraft(ReviewDraftId),
     DeleteDraft(ReviewDraftId),
-    CardDocument { card: CardKey, event: DocumentEvent },
+    CardDocument {
+        card: CardKey,
+        event: DocumentEvent,
+    },
     CopyCardSelection(CardKey),
     ScrollComposer(i32),
     OpenSubmitMenu,
     RequestAuthorAvatars(Vec<String>),
-    PeekPullRequest { url: String },
+    PeekPullRequest {
+        url: String,
+    },
     ToggleFileComments(String),
     OpenOverview,
     CloseOverview,
@@ -568,8 +590,8 @@ mod tests {
     #[test]
     fn routes_through_root_contracts() {
         assert_eq!(
-            Action::from(ReviewAction::SignOut),
-            Action::Review(ReviewAction::SignOut)
+            Action::from(ReviewAction::SignOut(ReviewForge::GitHub)),
+            Action::Review(ReviewAction::SignOut(ReviewForge::GitHub))
         );
         assert_eq!(
             Effect::from(ReviewEffect::LoadToken(ReviewForge::GitHub)),
