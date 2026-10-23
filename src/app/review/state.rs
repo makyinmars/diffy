@@ -1748,16 +1748,23 @@ impl ReviewController {
                 self.after_mutation(true).intent(info("Review submitted."))
             }
             ForgeResponse::DraftsSubmitFailed {
-                draft_ids, message, ..
+                submitted,
+                draft_ids,
+                message,
+                ..
             } => {
                 if let Some(session) = self.session_mut() {
+                    for id in &submitted {
+                        session.remove_draft(*id);
+                    }
                     for id in &draft_ids {
                         session.mark_draft_failed(*id, message.clone());
                     }
                     session.status = ReviewSessionStatus::Failed;
                     session.status_message = Some(message.clone());
                 }
-                self.after_mutation(false).intent(error(message))
+                self.after_mutation(!submitted.is_empty())
+                    .intent(error(message))
             }
             ForgeResponse::ThreadResolutionChanged { pr, resolution } => {
                 let id = ReviewThreadId::remote(pr.forge, resolution.thread_id);

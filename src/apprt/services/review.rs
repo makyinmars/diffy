@@ -14,7 +14,7 @@ use crate::core::forge::github::{
     CreatePullRequestReview, DeviceFlowState, GitHubApi, parse_pr_url, poll_for_token,
     start_device_flow,
 };
-use crate::core::forge::model::PullRequestInfo;
+use crate::core::forge::model::{PullRequestInfo, ReviewThreadResolution};
 use crate::core::frecency::{FrecencyStore, recent_repo_paths};
 use crate::core::http;
 use crate::core::repo_discovery;
@@ -472,6 +472,7 @@ impl LiveForge {
                     Ok(_) => ForgeResponse::DraftsSubmitted { pr, draft_ids },
                     Err(error) => ForgeResponse::DraftsSubmitFailed {
                         pr,
+                        submitted: Vec::new(),
                         draft_ids,
                         message: error.user_message(),
                     },
@@ -603,6 +604,102 @@ impl LiveForge {
                 match bitbucket_api(Some(token)).fetch_current_user() {
                     Ok(user) => ForgeResponse::UserFetched(user.user),
                     Err(error) => ForgeResponse::UserFetchFailed {
+                        message: error.user_message(),
+                    },
+                }
+            }
+            ForgeRequest::SubmitSessionDrafts {
+                session,
+                decision,
+                token,
+                ..
+            } => {
+                let pr = session.target.clone();
+                let submission = bitbucket_api(token).submit_drafts(&session, decision);
+                match submission.failure {
+                    None => ForgeResponse::DraftsSubmitted {
+                        pr,
+                        draft_ids: submission.posted,
+                    },
+                    Some((draft_ids, message)) => ForgeResponse::DraftsSubmitFailed {
+                        pr,
+                        submitted: submission.posted,
+                        draft_ids,
+                        message,
+                    },
+                }
+            }
+            ForgeRequest::AddThreadReply {
+                pr,
+                thread_id,
+                token,
+                body,
+            } => match bitbucket_api(token).reply(&pr, &thread_id, &body) {
+                Ok(comment) => ForgeResponse::ThreadReplyAdded {
+                    pr,
+                    thread_id,
+                    comment,
+                },
+                Err(error) => ForgeResponse::ThreadReplyAddFailed {
+                    pr,
+                    thread_id,
+                    message: error.user_message(),
+                },
+            },
+            ForgeRequest::UpdateComment {
+                pr,
+                comment_id,
+                token,
+                body,
+            } => match bitbucket_api(token).update_comment(&pr, &comment_id, &body) {
+                Ok(comment) => ForgeResponse::CommentUpdated { pr, comment },
+                Err(error) => ForgeResponse::CommentUpdateFailed {
+                    pr,
+                    comment_id,
+                    message: error.user_message(),
+                },
+            },
+            ForgeRequest::DeleteComment {
+                pr,
+                comment_id,
+                token,
+            } => match bitbucket_api(token).delete_comment(&pr, &comment_id) {
+                Ok(()) => ForgeResponse::CommentDeleted {
+                    pr,
+                    comment_id,
+                    comment: None,
+                },
+                Err(error) => ForgeResponse::CommentDeleteFailed {
+                    pr,
+                    comment_id,
+                    message: error.user_message(),
+                },
+            },
+            ForgeRequest::SetThreadResolution {
+                pr,
+                thread_id,
+                token,
+                resolved,
+            } => match bitbucket_api(token).set_resolution(&pr, &thread_id, resolved) {
+                Ok(()) => ForgeResponse::ThreadResolutionChanged {
+                    pr,
+                    resolution: ReviewThreadResolution {
+                        thread_id,
+                        is_resolved: resolved,
+                    },
+                },
+                Err(error) => ForgeResponse::ThreadResolutionChangeFailed {
+                    pr,
+                    thread_id,
+                    message: error.user_message(),
+                },
+            },
+            ForgeRequest::AddPullRequestComment { pr, token, body } => {
+                match bitbucket_api(token).add_general_comment(&pr, &body) {
+                    Ok(()) => ForgeResponse::PullRequestCommentAdded { pr },
+                    Err(error) => ForgeResponse::PullRequestCommentAddFailed {
+                        pr,
+                        body,
                         message: error.user_message(),
                     },
                 }

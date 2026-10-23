@@ -263,6 +263,7 @@ impl ForgeRequest {
             }
             Self::FetchReviewData { pr, .. } => ForgeResponse::ReviewDataLoadFailed { pr, message },
             Self::SubmitSessionDrafts { session, .. } => ForgeResponse::DraftsSubmitFailed {
+                submitted: Vec::new(),
                 draft_ids: session.pending_drafts().map(|draft| draft.id).collect(),
                 pr: session.target,
                 message,
@@ -353,8 +354,11 @@ pub enum ForgeResponse {
         pr: ReviewTarget,
         draft_ids: Vec<ReviewDraftId>,
     },
+    /// `submitted` drafts went through before the failure; `draft_ids`
+    /// did not. Bitbucket posts drafts one by one, so both can be non-empty.
     DraftsSubmitFailed {
         pr: ReviewTarget,
+        submitted: Vec<ReviewDraftId>,
         draft_ids: Vec<ReviewDraftId>,
         message: String,
     },

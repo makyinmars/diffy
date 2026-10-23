@@ -29,6 +29,10 @@ impl BitbucketApi {
         Self { credentials }
     }
 
+    pub(super) fn credentials(&self) -> &Credentials {
+        &self.credentials
+    }
+
     pub fn fetch_current_user(&self) -> Result<BitbucketUser> {
         let value = transport::get_json(
             &self.credentials,

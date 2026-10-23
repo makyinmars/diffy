@@ -21,6 +21,7 @@ use crate::core::forge::model::{
     PullRequestCheckContext, PullRequestInfo, PullRequestLabel, PullRequestOverview,
     PullRequestReviewer, PullRequestTimelineItem, PullRequestTimelineKind,
 };
+use crate::core::review::ReviewForge;
 
 fn action(action: ReviewAction) -> quark_ui::Action {
     action.into()
@@ -531,7 +532,11 @@ impl Page<'_> {
     }
 
     fn details(&self, overview: &PullRequestOverview) -> AnyElement {
-        let mut children = vec![self.reviewers(overview), self.labels(overview)];
+        let mut children = vec![self.reviewers(overview)];
+        // Bitbucket pull requests have no labels.
+        if self.review.active_forge() == ReviewForge::GitHub {
+            children.push(self.labels(overview));
+        }
         children.extend(self.checks(overview));
         children.push(self.merge_status(overview));
         children.push(self.changes(overview));

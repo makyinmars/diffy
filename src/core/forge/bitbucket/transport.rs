@@ -122,6 +122,19 @@ pub(super) fn send(
     body: Option<&Value>,
     context: &str,
 ) -> Result<String> {
+    send_accepting(credentials, method, url, body, context, &[])
+}
+
+/// Like [`send`], also treating the `accepted` failure statuses as done
+/// (resolving an already resolved thread answers 409).
+pub(super) fn send_accepting(
+    credentials: &Credentials,
+    method: Method,
+    url: &str,
+    body: Option<&Value>,
+    context: &str,
+    accepted: &[StatusCode],
+) -> Result<String> {
     let credential = credentials.key();
     paused(credential, SystemTime::now())?;
     let body = body.map(Value::to_string);
@@ -155,7 +168,7 @@ pub(super) fn send(
         Ok((status, text))
     })?;
     settle(credential, status, SystemTime::now())?;
-    if status.is_success() {
+    if status.is_success() || accepted.contains(&status) {
         Ok(text)
     } else {
         Err(failure(status, &text, context))

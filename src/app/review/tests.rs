@@ -211,6 +211,8 @@ struct Script {
     pulls: Vec<MyPullRequest>,
     fail_pulls: bool,
     rejected_tokens: Vec<String>,
+    /// Post only the first draft, the way Bitbucket stops partway.
+    partial_submit: bool,
     requests: Vec<ForgeRequest>,
 }
 
@@ -290,12 +292,25 @@ impl ForgeBackend for FakeGitHub {
                     comment: PullRequestReviewThreadComment::default(),
                 }
             }),
+            ForgeRequest::SubmitSessionDrafts { session, .. }
+                if self.with(|s| s.partial_submit) =>
+            {
+                let mut draft_ids: Vec<_> = session.pending_drafts().map(|d| d.id).collect();
+                let rest = draft_ids.split_off(1);
+                emit(ForgeResponse::DraftsSubmitFailed {
+                    pr: session.target.clone(),
+                    submitted: draft_ids,
+                    draft_ids: rest,
+                    message: "Posted 1 of 2 comments. Too many requests".to_owned(),
+                })
+            }
             ForgeRequest::SubmitSessionDrafts { session, .. } => {
                 let pr = session.target.clone();
                 let draft_ids = session.pending_drafts().map(|d| d.id).collect();
                 emit(if fail_submit {
                     ForgeResponse::DraftsSubmitFailed {
                         pr,
+                        submitted: Vec::new(),
                         draft_ids,
                         message: "review rejected".to_owned(),
                     }
@@ -1093,6 +1108,46 @@ fn submit_review_recovers_from_partial_failure() {
         .filter(|request| matches!(request, ForgeRequest::SubmitSessionDrafts { .. }))
         .count();
     assert_eq!(submits, 1, "only the failed reply is resent");
+}
+
+#[test]
+fn a_submission_that_stops_partway_keeps_only_the_unposted_drafts() {
+    let mut driver = Driver::signed_in_with_pr();
+    driver.fake.github.with(|s| s.partial_submit = true);
+    for (lines, body) in [(2..3, "First"), (4..5, "Second")] {
+        driver.act(ReviewAction::OpenComposerAt(target(lines)));
+        driver.type_text(body);
+        driver.act(ReviewAction::SubmitComment);
+    }
+    let fetches = driver
+        .fake
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, ForgeRequest::FetchReviewData { .. }))
+        .count();
+
+    driver.act(ReviewAction::SubmitReview {
+        decision: ReviewDecision::Approve,
+    });
+
+    let drafts: Vec<_> = driver.session().drafts.values().cloned().collect();
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].body, "Second");
+    assert_eq!(
+        drafts[0].state,
+        ReviewDraftState::Failed("Posted 1 of 2 comments. Too many requests".to_owned())
+    );
+    assert_eq!(
+        driver.errors(),
+        ["Posted 1 of 2 comments. Too many requests"]
+    );
+    let refetched = driver
+        .fake
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, ForgeRequest::FetchReviewData { .. }))
+        .count();
+    assert_eq!(refetched, fetches + 1, "the posted comment is fetched");
 }
 
 #[test]
