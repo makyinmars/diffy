@@ -9,6 +9,7 @@ use crate::contracts::review::{
 };
 use crate::core::compare::{LayoutMode, RendererKind};
 use crate::core::error::{DiffyError, Result};
+use crate::core::forge::bitbucket::{self, BitbucketApi, Credentials};
 use crate::core::forge::github::{
     CreatePullRequestReview, DeviceFlowState, GitHubApi, parse_pr_url, poll_for_token,
     start_device_flow,
@@ -19,7 +20,7 @@ use crate::core::http;
 use crate::core::repo_discovery;
 use crate::core::review::{ReviewForge, ReviewSession, ReviewSessionKey, ReviewTarget};
 use crate::core::vcs::discovery;
-use crate::core::vcs::git::{github_remotes, pr_ref_path};
+use crate::core::vcs::git::{PrRefSide, github_remotes, pr_ref_path};
 use crate::core::vcs::model::{VcsCompareRequest, VcsCompareSpec, VcsKind};
 use crate::platform::persistence::SettingsStore;
 use crate::platform::review_store::ReviewStore;
@@ -202,45 +203,88 @@ impl LiveForge {
         Self { review_store }
     }
 
+    /// Report cached refs first when an earlier session left them, then the
+    /// freshly fetched comparison.
+    fn load_and_report(
+        &self,
+        url: String,
+        repo_path: &Path,
+        target: Result<ReviewTarget>,
+        fetch_info: impl FnOnce(&ReviewTarget) -> Result<PullRequestInfo>,
+        emit: &mut dyn FnMut(ForgeResponse),
+    ) -> ForgeResponse {
+        let target = match target {
+            Ok(target) => target,
+            Err(error) => {
+                return ForgeResponse::PullRequestLoadFailed {
+                    url,
+                    message: error.user_message(),
+                };
+            }
+        };
+        if let Ok(Some(comparison)) = self.cached_pull_request_comparison(&target, repo_path) {
+            emit(ForgeResponse::PullRequestCached {
+                url: url.clone(),
+                comparison,
+            });
+        }
+        match self.load_pull_request(&target, repo_path, fetch_info) {
+            Ok(comparison) => ForgeResponse::PullRequestLoaded { url, comparison },
+            Err(error) => ForgeResponse::PullRequestLoadFailed {
+                url,
+                message: error.user_message(),
+            },
+        }
+    }
+
     fn load_pull_request(
         &self,
-        url: &str,
+        target: &ReviewTarget,
         repo_path: &Path,
-        token: Option<Secret>,
+        fetch_info: impl FnOnce(&ReviewTarget) -> Result<PullRequestInfo>,
     ) -> Result<PullRequestComparison> {
         let total_started = Instant::now();
-        let parsed = parse_pr_url(url)
-            .ok_or_else(|| DiffyError::Parse("not a valid GitHub pull request URL".to_owned()))?;
-        let token = token.map(Secret::into_inner).unwrap_or_default();
-
+        let forge = target.forge.key();
         let stage_started = Instant::now();
         let mut repo = discovery::open_repository(repo_path)?;
         tracing::info!(
-            owner = %parsed.owner,
-            repo = %parsed.repo,
-            number = parsed.number,
+            forge,
+            owner = %target.owner,
+            repo = %target.repo,
+            number = target.number,
             elapsed_ms = stage_started.elapsed().as_millis(),
-            "github-pr: opened repository"
+            "pull-request: opened repository"
         );
         if !repo.capabilities().forge_pull_requests {
-            return Err(DiffyError::General(
-                "this repository backend does not support GitHub pull request comparisons"
-                    .to_owned(),
-            ));
+            return Err(DiffyError::General(format!(
+                "this repository backend does not support {} pull request comparisons",
+                target.forge.name()
+            )));
         }
         if repo.location().kind != VcsKind::GIT {
             repo = discovery::open_git_repository(repo_path)?;
         }
         let stage_started = Instant::now();
-        let (info, left_ref, right_ref) = repo.resolve_pull_request_comparison(url, &token)?;
+        let info = fetch_info(target)?;
         tracing::info!(
-            owner = %parsed.owner,
-            repo = %parsed.repo,
-            number = parsed.number,
+            forge,
+            owner = %target.owner,
+            repo = %target.repo,
+            number = target.number,
+            elapsed_ms = stage_started.elapsed().as_millis(),
+            "pull-request: fetched metadata"
+        );
+        let stage_started = Instant::now();
+        let (info, left_ref, right_ref) = repo.resolve_pull_request_comparison(target, info)?;
+        tracing::info!(
+            forge,
+            owner = %target.owner,
+            repo = %target.repo,
+            number = target.number,
             changed_files = info.changed_files,
             elapsed_ms = stage_started.elapsed().as_millis(),
             total_elapsed_ms = total_started.elapsed().as_millis(),
-            "github-pr: resolved comparison refs"
+            "pull-request: resolved comparison refs"
         );
         Ok(PullRequestComparison {
             info,
@@ -251,13 +295,10 @@ impl LiveForge {
 
     fn cached_pull_request_comparison(
         &self,
-        url: &str,
+        target: &ReviewTarget,
         repo_path: &Path,
     ) -> Result<Option<PullRequestComparison>> {
-        let parsed = parse_pr_url(url)
-            .ok_or_else(|| DiffyError::Parse("not a valid GitHub pull request URL".to_owned()))?;
-        let target = ReviewTarget::github(parsed.owner, parsed.repo, parsed.number);
-        let sessions = self.review_store.load_sessions_for_target(&target)?;
+        let sessions = self.review_store.load_sessions_for_target(target)?;
         if sessions.is_empty() {
             return Ok(None);
         }
@@ -278,8 +319,10 @@ impl LiveForge {
             if info.base_branch.is_empty() || info.head_branch.is_empty() {
                 continue;
             }
-            let left_ref = pr_ref_path(info.number, &info.base_branch);
-            let right_ref = pr_ref_path(info.number, &info.head_branch);
+            let ref_path =
+                |side, branch: &str| pr_ref_path(target.forge, info.number, side, branch);
+            let left_ref = ref_path(PrRefSide::Base, &info.base_branch);
+            let right_ref = ref_path(PrRefSide::Head, &info.head_branch);
             let request = VcsCompareRequest {
                 spec: VcsCompareSpec::MergeBaseRange {
                     base: left_ref.clone(),
@@ -290,10 +333,11 @@ impl LiveForge {
             };
             if repo.resolve_compare_request(&request).is_ok() {
                 tracing::info!(
+                    forge = target.forge.key(),
                     owner = %target.owner,
                     repo = %target.repo,
                     number = target.number,
-                    "github-pr: using cached comparison refs"
+                    "pull-request: using cached comparison refs"
                 );
                 return Ok(Some(PullRequestComparison {
                     info,
@@ -322,11 +366,23 @@ impl ForgeBackend for LiveForge {
     fn execute(&self, request: ForgeRequest, emit: &mut dyn FnMut(ForgeResponse)) {
         match request.forge() {
             ReviewForge::GitHub => self.execute_github(request, emit),
-            ReviewForge::Bitbucket => {
-                emit(request.fail("Bitbucket pull requests aren't supported yet.".to_owned()))
-            }
+            ReviewForge::Bitbucket => self.execute_bitbucket(request, emit),
         }
     }
+}
+
+fn bitbucket_api(token: Option<Secret>) -> BitbucketApi {
+    let credentials = token
+        .filter(|token| !token.is_empty())
+        .and_then(|token| {
+            let credentials = Credentials::parse(token.expose());
+            if credentials.is_none() {
+                tracing::warn!("bitbucket: stored credentials are not email:token");
+            }
+            credentials
+        })
+        .unwrap_or_else(Credentials::anonymous);
+    BitbucketApi::new(credentials)
 }
 
 impl LiveForge {
@@ -337,20 +393,20 @@ impl LiveForge {
                 repo_path,
                 token,
             } => {
-                if let Ok(Some(comparison)) = self.cached_pull_request_comparison(&url, &repo_path)
-                {
-                    emit(ForgeResponse::PullRequestCached {
-                        url: url.clone(),
-                        comparison,
+                let target = parse_pr_url(&url)
+                    .map(|pr| ReviewTarget::github(pr.owner, pr.repo, pr.number))
+                    .ok_or_else(|| {
+                        DiffyError::Parse("not a valid GitHub pull request URL".to_owned())
                     });
-                }
-                match self.load_pull_request(&url, &repo_path, token) {
-                    Ok(comparison) => ForgeResponse::PullRequestLoaded { url, comparison },
-                    Err(error) => ForgeResponse::PullRequestLoadFailed {
-                        url,
-                        message: error.user_message(),
+                self.load_and_report(
+                    url,
+                    &repo_path,
+                    target,
+                    |target| {
+                        api(token).fetch_pull_request(&target.owner, &target.repo, target.number)
                     },
-                }
+                    emit,
+                )
             }
             ForgeRequest::FetchUser { token, .. } => {
                 if token.is_empty() {
@@ -510,6 +566,40 @@ impl LiveForge {
                     },
                 }
             }
+        };
+        emit(response);
+    }
+}
+
+impl LiveForge {
+    fn execute_bitbucket(&self, request: ForgeRequest, emit: &mut dyn FnMut(ForgeResponse)) {
+        let response = match request {
+            ForgeRequest::LoadPullRequest {
+                url,
+                repo_path,
+                token,
+            } => {
+                let target = bitbucket::parse_pr_url(&url).ok_or_else(|| {
+                    DiffyError::Parse("not a valid Bitbucket pull request URL".to_owned())
+                });
+                self.load_and_report(
+                    url,
+                    &repo_path,
+                    target,
+                    |target| bitbucket_api(token).fetch_pull_request(target),
+                    emit,
+                )
+            }
+            ForgeRequest::PeekPullRequest { pr, token } => {
+                match bitbucket_api(token).fetch_pull_request(&pr) {
+                    Ok(info) => ForgeResponse::PullRequestPeeked { pr, info },
+                    Err(error) => ForgeResponse::PullRequestPeekFailed {
+                        pr,
+                        message: error.user_message(),
+                    },
+                }
+            }
+            other => other.fail("This isn't available for Bitbucket pull requests yet.".to_owned()),
         };
         emit(response);
     }

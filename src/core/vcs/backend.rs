@@ -5,6 +5,7 @@ use crate::core::compare::output::{CompareEntry, CompareOutput};
 use crate::core::compare::{ProgressSink, RendererKind};
 use crate::core::error::{DiffyError, Result, VcsBackendKind};
 use crate::core::forge::model::PullRequestInfo;
+use crate::core::review::ReviewTarget;
 use crate::core::vcs::compare_port::entry_stats;
 use crate::core::vcs::model::{
     CommitRecord, FileChange, FileOperation, PublishAction, PublishOutcome, PublishPlan,
@@ -154,12 +155,12 @@ pub trait VcsRepository: Send {
     }
     fn resolve_pull_request_comparison(
         &mut self,
-        _pull_request_url: &str,
-        _token: &str,
+        _target: &ReviewTarget,
+        _info: PullRequestInfo,
     ) -> Result<(PullRequestInfo, String, String)> {
         Err(unsupported_operation(
             self.location(),
-            "GitHub pull request comparison",
+            "pull request comparison",
         ))
     }
     fn compare_working_file(&mut self, path: &str) -> Result<CompareOutput>;

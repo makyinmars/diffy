@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::ai::rank::RankCandidate;
 use crate::contracts::shared::{CompareGeneration, FileKey, JobId};
 use crate::core::compare::CompareMode;
+use crate::core::review::ReviewForge;
 use crate::core::vcs::model::{
     FileChange, PublishPlan, RepoCapabilities, RepoLocation, VcsChange, VcsOperationLogEntry,
     VcsRef, VcsSnapshot, Worktree,
@@ -84,6 +85,8 @@ pub struct RepositorySnapshot {
     /// refs update atomically. `None` when the backend has nothing
     /// publishable (no remotes, nothing described).
     pub publish_plan: Option<PublishPlan>,
+    /// The forge the repository's remotes point at, `origin` first.
+    pub forge: Option<ReviewForge>,
 }
 
 impl RepositorySnapshot {
@@ -101,6 +104,7 @@ impl RepositorySnapshot {
             file_changes: snapshot.file_changes,
             worktrees: snapshot.worktrees,
             publish_plan: None,
+            forge: snapshot.forge,
         }
     }
 }

@@ -11,5 +11,5 @@ pub use api::{
     GitHubPullRequestReviewEvent, GitHubReviewCommentUser, GitHubReviewSide, PullRequestReview,
 };
 pub use device_flow::{DeviceFlowState, poll_for_token, start_device_flow};
-pub use pull_request::{GitHubPullRequest, parse_pr_reference, parse_pr_url};
-pub use repository::{GitHubRepo, parse_remote, parse_repo_reference};
+pub use pull_request::{GitHubPullRequest, parse_pr_url};
+pub use repository::{parse_remote, parse_repo_reference};

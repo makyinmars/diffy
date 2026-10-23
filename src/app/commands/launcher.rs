@@ -7,10 +7,12 @@ use quark_ui::text_input::TextField;
 
 use super::picker::expand_path;
 use super::repo_picker::{short_parent, tilde};
-use crate::core::forge::github::{
-    GitHubRepo, parse_pr_reference, parse_remote, parse_repo_reference,
+use crate::core::forge::{
+    ForgeRepo, parse_pull_request_reference, parse_pull_request_url, parse_remote,
+    parse_repo_reference,
 };
 use crate::core::repo_discovery::{DiscoveredRepo, RepoScan};
+use crate::core::review::{ReviewForge, ReviewTarget};
 use crate::core::search::fuzzy::match_ranges;
 
 pub const MAX_REPO_ROWS: usize = 8;
@@ -40,7 +42,7 @@ impl Section {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloneSource {
-    pub repo: GitHubRepo,
+    pub repo: ForgeRepo,
     pub url: String,
 }
 
@@ -93,7 +95,7 @@ struct RepoEntry {
     alias: String,
     location: String,
     branch: Option<String>,
-    github: Option<GitHubRepo>,
+    remote: Option<ForgeRepo>,
     worktrees: Vec<RepoEntry>,
 }
 
@@ -107,7 +109,7 @@ impl RepoEntry {
             alias: tilde(&path, home),
             location: short_parent(&path, home),
             branch: found.and_then(|repo| repo.branch.clone()),
-            github: found
+            remote: found
                 .and_then(|repo| repo.remote.as_deref())
                 .and_then(parse_remote),
             worktrees: found
@@ -295,16 +297,34 @@ impl Launcher {
         self.moved = true;
     }
 
-    pub fn find_local(&self, owner: &str, repo: &str) -> Option<&Path> {
+    pub fn find_local(&self, pr: &ReviewTarget) -> Option<&Path> {
         self.entries
             .iter()
             .find(|entry| {
                 entry
-                    .github
+                    .remote
                     .as_ref()
-                    .is_some_and(|github| github.matches(owner, repo))
+                    .is_some_and(|remote| remote.matches(pr.forge, &pr.owner, &pr.repo))
             })
             .map(|entry| entry.path.as_path())
+    }
+
+    /// A typed pull request. With no repository open, a short `owner/repo#N`
+    /// is GitHub unless only a Bitbucket clone of that repository is known.
+    fn typed_pull_request(&self, query: &str) -> Option<ReviewTarget> {
+        let pr = parse_pull_request_reference(query, ReviewForge::GitHub)?;
+        if parse_pull_request_url(query).is_some() || self.find_local(&pr).is_some() {
+            return Some(pr);
+        }
+        let bitbucket = ReviewTarget {
+            forge: ReviewForge::Bitbucket,
+            ..pr.clone()
+        };
+        Some(if self.find_local(&bitbucket).is_some() {
+            bitbucket
+        } else {
+            pr
+        })
     }
 
     pub fn refilter(&mut self) {
@@ -377,9 +397,9 @@ impl Launcher {
 
     fn build(&mut self, query: &str) {
         self.rows.clear();
-        if let Some(pr) = parse_pr_reference(query) {
+        if let Some(pr) = self.typed_pull_request(query) {
             let reference = format!("{}/{}#{}", pr.owner, pr.repo, pr.number);
-            let local = self.find_local(&pr.owner, &pr.repo).map(Path::to_path_buf);
+            let local = self.find_local(&pr).map(Path::to_path_buf);
             let home = dirs::home_dir();
             self.rows.push(LauncherRow::item(
                 Section::Typed,
@@ -389,7 +409,7 @@ impl Launcher {
                 },
                 local.as_deref().map(|path| tilde(path, home.as_deref())),
                 LauncherChoice::PullRequest {
-                    url: pr.url(),
+                    url: pr.web_url(),
                     local,
                 },
             ));

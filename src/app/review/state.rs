@@ -745,7 +745,8 @@ impl ReviewController {
         };
         let Some(pr) = target else {
             self.pending_url = None;
-            return Reduction::changed().intent(error("Not a valid GitHub pull request URL."));
+            return Reduction::changed()
+                .intent(error("Not a GitHub or Bitbucket pull request URL."));
         };
         self.pending_url = None;
         let mut reduction = Reduction::changed();
@@ -2447,7 +2448,7 @@ impl CommandSource for ReviewController {
                 "Open pull request",
                 CommandsAction::OpenPullRequestPicker,
             )
-            .detail("Load a GitHub pull request by URL")
+            .detail("Load a GitHub or Bitbucket pull request by URL")
             .enabled(cx.repository.is_some()),
         );
         out.push(

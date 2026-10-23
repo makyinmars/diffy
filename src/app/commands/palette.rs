@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use quark_components::{PaletteItem, PaletteProvider};
 use quark_ui::element::Binding;
@@ -9,7 +11,8 @@ use crate::contracts::navigation::{NavigationAction, SelectedFile, SelectionOrig
 use crate::contracts::review::ReviewAction;
 use crate::contracts::shared::FileKey;
 use crate::contracts::shell::Action;
-use crate::core::forge::github::parse_pr_reference;
+use crate::core::forge::parse_pull_request_reference;
+use crate::core::review::ReviewForge;
 
 #[derive(Debug, Default)]
 pub struct PaletteSource {
@@ -109,7 +112,11 @@ impl PaletteProvider<PaletteSource> for Repositories {
     }
 }
 
-pub struct PullRequests;
+/// Typed pull request links. A short `owner/repo#N` names a pull request on
+/// the open repository's forge.
+pub struct PullRequests {
+    pub short_forge: Rc<Cell<ReviewForge>>,
+}
 
 impl PaletteProvider<PaletteSource> for PullRequests {
     fn title(&self) -> &str {
@@ -119,10 +126,10 @@ impl PaletteProvider<PaletteSource> for PullRequests {
     fn collect(&self, _: &PaletteSource, _: &mut Vec<PaletteItem>) {}
 
     fn typed(&self, query: &str, out: &mut Vec<PaletteItem>) {
-        let Some(pr) = parse_pr_reference(query) else {
+        let Some(pr) = parse_pull_request_reference(query, self.short_forge.get()) else {
             return;
         };
-        let url = pr.url();
+        let url = pr.web_url();
         out.push(
             PaletteItem::new(
                 quark::stable_hash(&url),

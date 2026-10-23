@@ -81,6 +81,7 @@ fn repository(
             file_changes: buckets.iter().map(|bucket| change(*bucket)).collect(),
             worktrees: Vec::new(),
             publish_plan: None,
+            forge: None,
         }),
     })
 }

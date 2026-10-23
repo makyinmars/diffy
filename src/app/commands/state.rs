@@ -43,6 +43,7 @@ use crate::core::frecency::{FrecencyStore, recent_repo_paths, repo_last_opened};
 use crate::core::keymap::{KeymapOverride, ShortcutCommand};
 use crate::core::ref_catalog::{RefCatalog, RefEntryKind, WORKING_TREE_LABEL};
 use crate::core::repo_discovery::RepoScan;
+use crate::core::review::ReviewForge;
 use crate::core::theme_types::ThemeMode;
 use crate::core::tips;
 use crate::core::vcs::git::{WORKDIR_REF, is_full_hex_oid};
@@ -113,6 +114,8 @@ pub struct CommandsController {
     view_focus: Option<FocusId>,
     palette: CommandPalette<PaletteSource>,
     palette_source: PaletteSource,
+    /// The open repository's forge, for short `owner/repo#N` links.
+    pull_request_forge: Rc<Cell<ReviewForge>>,
     picker: Option<PickerState>,
     ref_picker: Option<RefPicker>,
     ref_generation: u64,
@@ -161,7 +164,10 @@ impl Default for CommandsController {
     fn default() -> Self {
         let mut palette = CommandPalette::new()
             .placeholder("Search commands, files and repos, or paste a PR link");
-        palette.register(palette::PullRequests);
+        let pull_request_forge = Rc::new(Cell::new(ReviewForge::GitHub));
+        palette.register(palette::PullRequests {
+            short_forge: Rc::clone(&pull_request_forge),
+        });
         palette.register(palette::Commands);
         palette.register(palette::Files);
         palette.register(palette::Repositories);
@@ -171,6 +177,7 @@ impl Default for CommandsController {
             view_focus: None,
             palette,
             palette_source: PaletteSource::default(),
+            pull_request_forge,
             picker: None,
             ref_picker: None,
             ref_generation: 0,
@@ -401,7 +408,7 @@ impl CommandsController {
             ),
             LauncherChoice::Clone(None) => {
                 self.toasts.apply(ToastUpdate::info(
-                    "Type owner/repo or a GitHub URL, then choose Clone",
+                    "Type owner/repo or a GitHub or Bitbucket URL, then choose Clone",
                 ));
                 Reduction::changed()
             }
@@ -1687,7 +1694,7 @@ fn command_detail(id: &str) -> Option<&'static str> {
         "compare.swap" => "Exchange base and head",
         "compare.start" => "Run the compare with the chosen refs",
         "compare.menu" => "Mode, working tree and swap",
-        "review.open_pull_request" => "Load a GitHub pull request by URL",
+        "review.open_pull_request" => "Load a GitHub or Bitbucket pull request by URL",
         ids::TOGGLE_SIDEBAR => "Show or hide the file list",
         ids::TOGGLE_FILE_TREE => "Switch between a flat list and folders",
         "view.smart_sort" => "List the most important changed files first",
@@ -2493,6 +2500,8 @@ impl Controller for CommandsController {
                 )))
             }
             Intent::RepositoryChanged(repository) => {
+                self.pull_request_forge
+                    .set(repository.snapshot.forge.unwrap_or(ReviewForge::GitHub));
                 if repository.snapshot.reason == RepositorySyncReason::Open
                     && let Some(store) = &self.frecency
                 {

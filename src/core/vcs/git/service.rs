@@ -13,8 +13,9 @@ use crate::core::compare::output::CompareOutput;
 use crate::core::compare::spec::CompareMode;
 use crate::core::compare::stats::COMPARE_SUMMARY_FILE_LIMIT;
 use crate::core::error::{DiffyError, Result, VcsBackendKind};
-use crate::core::forge::github::{GitHubApi, parse_pr_url};
 use crate::core::forge::model::PullRequestInfo;
+use crate::core::forge::parse_remote;
+use crate::core::review::{ReviewForge, ReviewTarget};
 use crate::core::vcs::compare_port::output_from_patch;
 use crate::core::vcs::git::status::{StatusBits, StatusItem, StatusOperation, StatusScope};
 use crate::core::vcs::mutation::{ApplyTarget, PatchApplication};
@@ -102,23 +103,49 @@ const MENTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const MENTION_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 pub const PR_REF_PREFIX: &str = "refs/diffy/pr/";
 
-pub fn pr_ref_path(pr_number: i32, branch: &str) -> String {
-    format!("{PR_REF_PREFIX}{pr_number}/{branch}")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrRefSide {
+    Base,
+    Head,
+}
+
+/// Where Diffy keeps a fetched pull request branch. GitHub refs keep their
+/// original `refs/diffy/pr/{n}/{branch}` path. Bitbucket refs live under
+/// their own namespace and split base from head, so a fork's `main -> main`
+/// pull request gets two refs.
+pub fn pr_ref_path(forge: ReviewForge, pr_number: i32, side: PrRefSide, branch: &str) -> String {
+    match forge {
+        ReviewForge::GitHub => format!("{PR_REF_PREFIX}{pr_number}/{branch}"),
+        ReviewForge::Bitbucket => {
+            let side = match side {
+                PrRefSide::Base => "base",
+                PrRefSide::Head => "head",
+            };
+            format!("{PR_REF_PREFIX}bitbucket/{pr_number}/{side}/{branch}")
+        }
+    }
 }
 
 pub fn is_pr_ref(reference: &str) -> bool {
     reference.starts_with(PR_REF_PREFIX)
 }
 
+/// Ref prefixes that only ever hold this PR's refs, including the old
+/// `refs/diffy/pull/{N}/*` scheme GitHub refs used to use.
+fn pr_ref_prefixes(forge: ReviewForge, pr_number: i32) -> Vec<String> {
+    match forge {
+        ReviewForge::GitHub => vec![
+            format!("{PR_REF_PREFIX}{pr_number}/"),
+            format!("refs/diffy/pull/{pr_number}/"),
+        ],
+        ReviewForge::Bitbucket => vec![format!("{PR_REF_PREFIX}bitbucket/{pr_number}/")],
+    }
+}
+
 /// Remove stale refs from prior fetches for this PR. Keeps only the targets
-/// the latest fetch wrote, and also cleans up the old `refs/diffy/pull/{N}/*`
-/// scheme we used to use. Uses a prefix filter so branch names with slashes are
-/// handled exactly instead of relying on glob semantics.
-fn prune_stale_pr_refs(repo_path: &Path, pr_number: i32, keep_base: &str, keep_head: &str) {
-    let prefixes = [
-        format!("{PR_REF_PREFIX}{pr_number}/"),
-        format!("refs/diffy/pull/{pr_number}/"),
-    ];
+/// the latest fetch wrote. Uses a prefix filter so branch names with slashes
+/// are handled exactly instead of relying on glob semantics.
+fn prune_stale_pr_refs(repo_path: &Path, prefixes: &[String], keep_base: &str, keep_head: &str) {
     let Ok(output) = run_system_git_capture(
         repo_path,
         &[
@@ -623,22 +650,35 @@ fn gix_error(error: impl std::fmt::Display) -> DiffyError {
     git_error("repository read", error.to_string())
 }
 
-fn github_repo_key_from_remote_url(url: &str) -> Option<(String, String)> {
+const FORGE_HOSTS: [(&str, ReviewForge); 2] = [
+    ("github.com", ReviewForge::GitHub),
+    ("bitbucket.org", ReviewForge::Bitbucket),
+];
+
+fn forge_host(forge: ReviewForge) -> &'static str {
+    match forge {
+        ReviewForge::GitHub => "github.com",
+        ReviewForge::Bitbucket => "bitbucket.org",
+    }
+}
+
+/// The forge and lowercase `owner/repo` a remote URL points at.
+fn remote_repo_key(url: &str) -> Option<(ReviewForge, String, String)> {
     let trimmed = url.trim();
-    let path = if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("ssh://github.com/") {
-        rest
-    } else {
-        let (_, rest) = trimmed.split_once("://")?;
-        let (authority, path) = rest.split_once('/')?;
-        if !github_authority_matches(authority) {
-            return None;
-        }
-        path
-    };
+    let (forge, path) = FORGE_HOSTS
+        .iter()
+        .find_map(|(host, forge)| {
+            trimmed
+                .strip_prefix(&format!("git@{host}:"))
+                .or_else(|| trimmed.strip_prefix(&format!("ssh://git@{host}/")))
+                .or_else(|| trimmed.strip_prefix(&format!("ssh://{host}/")))
+                .map(|path| (*forge, path))
+        })
+        .or_else(|| {
+            let (_, rest) = trimmed.split_once("://")?;
+            let (authority, path) = rest.split_once('/')?;
+            Some((authority_forge(authority)?, path))
+        })?;
 
     let path = path.split(['?', '#']).next().unwrap_or(path);
     let path = path.trim_end_matches('/');
@@ -649,13 +689,16 @@ fn github_repo_key_from_remote_url(url: &str) -> Option<(String, String)> {
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
-    Some((owner.to_ascii_lowercase(), repo.to_ascii_lowercase()))
+    Some((forge, owner.to_ascii_lowercase(), repo.to_ascii_lowercase()))
 }
 
-fn github_authority_matches(authority: &str) -> bool {
+fn authority_forge(authority: &str) -> Option<ReviewForge> {
     let host = authority.rsplit('@').next().unwrap_or(authority);
     let host = host.split(':').next().unwrap_or(host);
-    host.eq_ignore_ascii_case("github.com")
+    FORGE_HOSTS
+        .iter()
+        .find(|(known, _)| host.eq_ignore_ascii_case(known))
+        .map(|(_, forge)| *forge)
 }
 
 /// The work tree containing `path` and the lowercase `owner/repo` of every
@@ -671,11 +714,20 @@ pub fn github_remotes(path: &Path) -> Result<(PathBuf, Vec<String>)> {
         .remote_names()
         .iter()
         .filter_map(|name| config.string(format!("remote.{name}.url").as_str()))
-        .filter_map(|url| github_repo_key_from_remote_url(&url.to_str_lossy()))
-        .map(|(owner, repo)| format!("{owner}/{repo}"))
+        .filter_map(|url| remote_repo_key(&url.to_str_lossy()))
+        .filter(|(forge, _, _)| *forge == ReviewForge::GitHub)
+        .map(|(_, owner, repo)| format!("{owner}/{repo}"))
         .collect();
     keys.dedup();
     Ok((root, keys))
+}
+
+fn remote_priority(name: &str) -> u8 {
+    match name {
+        "origin" => 0,
+        "upstream" => 1,
+        _ => 2,
+    }
 }
 
 fn local_remote_names_by_priority(repo_path: &Path) -> Option<Vec<String>> {
@@ -684,11 +736,7 @@ fn local_remote_names_by_priority(repo_path: &Path) -> Option<Vec<String>> {
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|name| match name.as_str() {
-        "origin" => 0,
-        "upstream" => 1,
-        _ => 2,
-    });
+    candidates.sort_by_key(|name| remote_priority(name));
     Some(candidates)
 }
 
@@ -705,12 +753,21 @@ fn remote_url(repo_path: &Path, name: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn local_remote_for_github_repo(repo_path: &Path, owner: &str, repo_name: &str) -> Option<String> {
-    let target = (owner.to_ascii_lowercase(), repo_name.to_ascii_lowercase());
+fn local_remote_for_repo(
+    repo_path: &Path,
+    forge: ReviewForge,
+    owner: &str,
+    repo_name: &str,
+) -> Option<String> {
+    let target = (
+        forge,
+        owner.to_ascii_lowercase(),
+        repo_name.to_ascii_lowercase(),
+    );
     let candidates = local_remote_names_by_priority(repo_path)?;
     for name in candidates {
         if let Some(url) = remote_url(repo_path, &name)
-            && github_repo_key_from_remote_url(&url).as_ref() == Some(&target)
+            && remote_repo_key(&url).as_ref() == Some(&target)
         {
             return Some(name);
         }
@@ -718,31 +775,46 @@ fn local_remote_for_github_repo(repo_path: &Path, owner: &str, repo_name: &str) 
     None
 }
 
-fn github_repo_url_from_remote_transport(url: &str, owner: &str, repo: &str) -> Option<String> {
+/// `owner/repo` on the same forge, reached the way `url` reaches its repo
+/// (scp-style ssh, ssh, or https). GitHub drops https credentials from the
+/// authority; Bitbucket keeps the user so git's credential helper still
+/// finds the saved login.
+fn repo_url_from_remote_transport(
+    url: &str,
+    forge: ReviewForge,
+    owner: &str,
+    repo: &str,
+) -> Option<String> {
     let trimmed = url.trim();
-    if trimmed.strip_prefix("git@github.com:").is_some() {
-        return Some(format!("git@github.com:{owner}/{repo}.git"));
+    let host = forge_host(forge);
+    if trimmed.strip_prefix(&format!("git@{host}:")).is_some() {
+        return Some(format!("git@{host}:{owner}/{repo}.git"));
     }
 
     let (scheme, rest) = trimmed.split_once("://")?;
     let (authority, _) = rest.split_once('/')?;
-    if !github_authority_matches(authority) {
+    if authority_forge(authority) != Some(forge) {
         return None;
     }
 
     let scheme = scheme.to_ascii_lowercase();
-    if scheme == "ssh" {
-        Some(format!("ssh://{authority}/{owner}/{repo}.git"))
-    } else {
-        Some(format!("{scheme}://github.com/{owner}/{repo}.git"))
+    match forge {
+        _ if scheme == "ssh" => Some(format!("ssh://{authority}/{owner}/{repo}.git")),
+        ReviewForge::GitHub => Some(format!("{scheme}://github.com/{owner}/{repo}.git")),
+        ReviewForge::Bitbucket => Some(format!("{scheme}://{authority}/{owner}/{repo}.git")),
     }
 }
 
-fn local_github_url_for_repo(repo_path: &Path, owner: &str, repo_name: &str) -> Option<String> {
+fn local_url_for_repo(
+    repo_path: &Path,
+    forge: ReviewForge,
+    owner: &str,
+    repo_name: &str,
+) -> Option<String> {
     let candidates = local_remote_names_by_priority(repo_path)?;
     for name in candidates {
         if let Some(url) = remote_url(repo_path, &name)
-            && let Some(fetch_url) = github_repo_url_from_remote_transport(&url, owner, repo_name)
+            && let Some(fetch_url) = repo_url_from_remote_transport(&url, forge, owner, repo_name)
         {
             return Some(fetch_url);
         }
@@ -750,23 +822,51 @@ fn local_github_url_for_repo(repo_path: &Path, owner: &str, repo_name: &str) -> 
     None
 }
 
-fn fallback_pull_request_repo_url(owner: &str, repo: &str, api_clone_url: &str) -> String {
+fn fallback_pull_request_repo_url(
+    forge: ReviewForge,
+    owner: &str,
+    repo: &str,
+    api_clone_url: &str,
+) -> String {
     if api_clone_url.is_empty() {
-        format!("https://github.com/{owner}/{repo}.git")
+        format!("https://{}/{owner}/{repo}.git", forge_host(forge))
     } else {
         api_clone_url.to_owned()
     }
 }
 
-fn github_fetch_source_for_repo(
+/// Where to fetch `owner/repo` from: a local remote that already names it,
+/// else its URL in the transport the local remotes use, else the forge's
+/// clone URL.
+fn fetch_source_for_repo(
     repo_path: &Path,
+    forge: ReviewForge,
     owner: &str,
     repo_name: &str,
     api_clone_url: &str,
 ) -> String {
-    local_remote_for_github_repo(repo_path, owner, repo_name)
-        .or_else(|| local_github_url_for_repo(repo_path, owner, repo_name))
-        .unwrap_or_else(|| fallback_pull_request_repo_url(owner, repo_name, api_clone_url))
+    local_remote_for_repo(repo_path, forge, owner, repo_name)
+        .or_else(|| local_url_for_repo(repo_path, forge, owner, repo_name))
+        .unwrap_or_else(|| fallback_pull_request_repo_url(forge, owner, repo_name, api_clone_url))
+}
+
+/// Whether `expected` names `resolved`: equal, or an abbreviated hash
+/// (Bitbucket returns 12 characters) that prefixes it.
+fn oid_matches(resolved: &str, expected: &str) -> bool {
+    let expected = expected.trim();
+    if expected.eq_ignore_ascii_case(resolved) {
+        return true;
+    }
+    expected.len() >= 7
+        && expected.len() < resolved.len()
+        && expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && resolved
+            .get(..expected.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+}
+
+fn is_abbreviated_oid(oid: &str) -> bool {
+    !oid.is_empty() && !is_full_hex_oid(oid)
 }
 
 #[derive(Default)]
@@ -1544,7 +1644,24 @@ impl GitService {
         !expected_oid.is_empty()
             && self
                 .resolve_commit_oid(reference)
-                .is_ok_and(|resolved| resolved == expected_oid)
+                .is_ok_and(|resolved| oid_matches(&resolved, expected_oid))
+    }
+
+    /// The forge the repository's remotes point at, `origin` first, read
+    /// from the loaded config without spawning git.
+    pub fn remote_forge(&self) -> Option<ReviewForge> {
+        let repo = self.repo().ok()?;
+        let config = repo.config_snapshot();
+        let mut names: Vec<String> = repo
+            .remote_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        names.sort_by_key(|name| remote_priority(name));
+        names.iter().find_map(|name| {
+            let url = config.string(format!("remote.{name}.url").as_str())?;
+            remote_repo_key(&url.to_str_lossy()).map(|(forge, _, _)| forge)
+        })
     }
 
     /// Fetch a named remote using the remote's configured refspecs.
@@ -1717,28 +1834,30 @@ impl GitService {
         Ok(PullOutcome::FastForwarded { behind })
     }
 
+    /// Fetch a pull request's base and head into Diffy's PR refs and return
+    /// `info` (abbreviated shas expanded) with the left and right refs.
     pub fn resolve_pull_request_comparison(
         &self,
-        pull_request_url: &str,
-        github_token: &str,
+        target: &ReviewTarget,
+        info: PullRequestInfo,
+    ) -> Result<(PullRequestInfo, String, String)> {
+        match target.forge {
+            ReviewForge::GitHub => self.resolve_github_comparison(target, info),
+            ReviewForge::Bitbucket => self.resolve_bitbucket_comparison(target, info),
+        }
+    }
+
+    fn resolve_github_comparison(
+        &self,
+        target: &ReviewTarget,
+        info: PullRequestInfo,
     ) -> Result<(PullRequestInfo, String, String)> {
         let total_started = Instant::now();
-        let parsed = parse_pr_url(pull_request_url)
-            .ok_or_else(|| DiffyError::Parse("not a valid GitHub pull request URL".to_owned()))?;
-        let api = GitHubApi::with_token(github_token.to_owned());
-        let stage_started = Instant::now();
-        let info = api.fetch_pull_request(&parsed.owner, &parsed.repo, parsed.number)?;
-        tracing::info!(
-            owner = %parsed.owner,
-            repo = %parsed.repo,
-            number = parsed.number,
-            elapsed_ms = stage_started.elapsed().as_millis(),
-            "github-pr: ref resolver fetched metadata"
-        );
-        let fetch_source = github_fetch_source_for_repo(
+        let fetch_source = fetch_source_for_repo(
             self.repo_path_ref()?,
-            &parsed.owner,
-            &parsed.repo,
+            ReviewForge::GitHub,
+            &target.owner,
+            &target.repo,
             &info.base_repo_url,
         );
         let base_source = if info.base_sha.is_empty() {
@@ -1746,9 +1865,19 @@ impl GitService {
         } else {
             info.base_sha.clone()
         };
-        let head_source = format!("refs/pull/{}/head", parsed.number);
-        let base_target = pr_ref_path(parsed.number, &info.base_branch);
-        let head_target = pr_ref_path(parsed.number, &info.head_branch);
+        let head_source = format!("refs/pull/{}/head", target.number);
+        let base_target = pr_ref_path(
+            ReviewForge::GitHub,
+            target.number,
+            PrRefSide::Base,
+            &info.base_branch,
+        );
+        let head_target = pr_ref_path(
+            ReviewForge::GitHub,
+            target.number,
+            PrRefSide::Head,
+            &info.head_branch,
+        );
         let mut refspecs = Vec::with_capacity(2);
         if !self.ref_matches_oid(&base_target, &info.base_sha) {
             refspecs.push(format!("+{base_source}:{base_target}"));
@@ -1758,28 +1887,121 @@ impl GitService {
         }
         if refspecs.is_empty() {
             tracing::info!(
-                owner = %parsed.owner,
-                repo = %parsed.repo,
-                number = parsed.number,
+                owner = %target.owner,
+                repo = %target.repo,
+                number = target.number,
                 "github-pr: cached refs are current"
             );
         } else {
             self.fetch_refspecs(&fetch_source, &refspecs)?;
         }
         tracing::info!(
-            owner = %parsed.owner,
-            repo = %parsed.repo,
-            number = parsed.number,
+            owner = %target.owner,
+            repo = %target.repo,
+            number = target.number,
             elapsed_ms = total_started.elapsed().as_millis(),
             "github-pr: git resolver complete"
         );
         prune_stale_pr_refs(
             self.repo_path_ref()?,
-            parsed.number,
+            &pr_ref_prefixes(ReviewForge::GitHub, target.number),
             &base_target,
             &head_target,
         );
         Ok((info, base_target, head_target))
+    }
+
+    /// Bitbucket Cloud has no pull request refs, so fetch the destination
+    /// branch from the destination repository and the source branch from the
+    /// source repository, which may be a fork.
+    fn resolve_bitbucket_comparison(
+        &self,
+        target: &ReviewTarget,
+        mut info: PullRequestInfo,
+    ) -> Result<(PullRequestInfo, String, String)> {
+        let total_started = Instant::now();
+        let repo_path = self.repo_path_ref()?;
+        let forge = ReviewForge::Bitbucket;
+        let head_repo = parse_remote(&info.head_repo_url)
+            .filter(|repo| repo.forge == forge)
+            .map_or_else(
+                || (target.owner.clone(), target.repo.clone()),
+                |repo| (repo.owner, repo.repo),
+            );
+        let base_source = fetch_source_for_repo(
+            repo_path,
+            forge,
+            &target.owner,
+            &target.repo,
+            &info.base_repo_url,
+        );
+        let head_source = fetch_source_for_repo(
+            repo_path,
+            forge,
+            &head_repo.0,
+            &head_repo.1,
+            &info.head_repo_url,
+        );
+        let base_target = pr_ref_path(forge, target.number, PrRefSide::Base, &info.base_branch);
+        let head_target = pr_ref_path(forge, target.number, PrRefSide::Head, &info.head_branch);
+        let base_refspec = (!self.ref_matches_oid(&base_target, &info.base_sha))
+            .then(|| format!("+refs/heads/{}:{base_target}", info.base_branch));
+        let head_refspec = (!self.ref_matches_oid(&head_target, &info.head_sha))
+            .then(|| format!("+refs/heads/{}:{head_target}", info.head_branch));
+        match (base_refspec, head_refspec) {
+            (None, None) => tracing::info!(
+                owner = %target.owner,
+                repo = %target.repo,
+                number = target.number,
+                "bitbucket-pr: cached refs are current"
+            ),
+            (Some(base), Some(head)) if base_source == head_source => {
+                self.fetch_refspecs(&base_source, &[base, head])?;
+            }
+            (base, head) => {
+                if let Some(base) = base {
+                    self.fetch_refspecs(&base_source, &[base])?;
+                }
+                if let Some(head) = head {
+                    self.fetch_refspecs(&head_source, &[head])?;
+                }
+            }
+        }
+        info.base_sha = self.full_oid(&base_target, &info.base_sha)?;
+        info.head_sha = self.full_oid(&head_target, &info.head_sha)?;
+        tracing::info!(
+            owner = %target.owner,
+            repo = %target.repo,
+            number = target.number,
+            elapsed_ms = total_started.elapsed().as_millis(),
+            "bitbucket-pr: git resolver complete"
+        );
+        prune_stale_pr_refs(
+            repo_path,
+            &pr_ref_prefixes(forge, target.number),
+            &base_target,
+            &head_target,
+        );
+        Ok((info, base_target, head_target))
+    }
+
+    /// The full oid behind `reference` when `api_oid` is abbreviated. A
+    /// branch that moved since the forge reported it is reviewed as fetched.
+    fn full_oid(&self, reference: &str, api_oid: &str) -> Result<String> {
+        if !is_abbreviated_oid(api_oid) {
+            return Ok(api_oid.to_owned());
+        }
+        // Ask git itself: the fetch just wrote this ref and its pack.
+        let resolved = resolve_commit_oid_at(self.repo_path_ref()?, reference)?;
+        if !oid_matches(&resolved, api_oid) {
+            tracing::warn!(
+                reference,
+                reported = api_oid,
+                fetched = %resolved,
+                "bitbucket-pr: branch moved since the pull request was read"
+            );
+        }
+        Ok(resolved)
     }
 
     fn diff_between_refs(&self, left: &str, right: &str) -> Result<String> {
@@ -2403,11 +2625,21 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        INDEX_REF, PR_REF_PREFIX, WORKDIR_REF, github_fetch_source_for_repo,
-        github_repo_key_from_remote_url, github_repo_url_from_remote_transport, is_pr_ref,
-        local_remote_for_github_repo, parse_objects_progress, parse_porcelain_status,
-        parse_shortstat, pr_ref_path,
+        INDEX_REF, PR_REF_PREFIX, PrRefSide, WORKDIR_REF, fetch_source_for_repo, is_pr_ref,
+        local_remote_for_repo, oid_matches, parse_objects_progress, parse_porcelain_status,
+        parse_shortstat, pr_ref_path, remote_repo_key, repo_url_from_remote_transport,
     };
+    use crate::core::forge::model::PullRequestInfo;
+    use crate::core::review::{ReviewForge, ReviewTarget};
+
+    const GITHUB: ReviewForge = ReviewForge::GitHub;
+    const BITBUCKET: ReviewForge = ReviewForge::Bitbucket;
+
+    fn github_repo_key_from_remote_url(url: &str) -> Option<(String, String)> {
+        remote_repo_key(url)
+            .filter(|(forge, _, _)| *forge == GITHUB)
+            .map(|(_, owner, repo)| (owner, repo))
+    }
     use crate::core::vcs::git::{GitService, StatusItem, StatusOperation, StatusScope};
     use crate::core::vcs::mutation::{ApplyTarget, PatchApplication};
 
@@ -2527,15 +2759,63 @@ mod tests {
 
     #[test]
     fn pr_ref_path_embeds_branch_with_slash() {
-        assert_eq!(pr_ref_path(12, "main"), "refs/diffy/pr/12/main");
+        let github = |number, branch| pr_ref_path(GITHUB, number, PrRefSide::Base, branch);
+        assert_eq!(github(12, "main"), "refs/diffy/pr/12/main");
         assert_eq!(
-            pr_ref_path(77, "feat/new-thing"),
+            github(77, "feat/new-thing"),
             "refs/diffy/pr/77/feat/new-thing"
         );
-        assert!(pr_ref_path(1, "x").starts_with(PR_REF_PREFIX));
-        assert!(is_pr_ref(&pr_ref_path(12, "main")));
+        assert!(github(1, "x").starts_with(PR_REF_PREFIX));
+        assert!(is_pr_ref(&github(12, "main")));
         assert!(!is_pr_ref("refs/heads/main"));
         assert!(!is_pr_ref("@workdir"));
+    }
+
+    #[test]
+    fn bitbucket_pr_refs_split_base_and_head_under_their_own_namespace() {
+        let base = pr_ref_path(BITBUCKET, 12, PrRefSide::Base, "main");
+        let head = pr_ref_path(BITBUCKET, 12, PrRefSide::Head, "main");
+        assert_eq!(base, "refs/diffy/pr/bitbucket/12/base/main");
+        assert_eq!(head, "refs/diffy/pr/bitbucket/12/head/main");
+        assert!(is_pr_ref(&base));
+        assert!(!base.starts_with("refs/diffy/pr/12/"));
+    }
+
+    #[test]
+    fn abbreviated_hashes_match_the_full_oid() {
+        let full = "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d";
+        assert!(oid_matches(full, full));
+        assert!(oid_matches(full, "1a2b3c4d5e6f"));
+        assert!(oid_matches(full, "1A2B3C4D5E6F"));
+        assert!(!oid_matches(full, "1a2b3c"));
+        assert!(!oid_matches(full, "1a2b3c4d5e6e"));
+        assert!(!oid_matches(full, "main"));
+        assert!(!oid_matches(full, ""));
+    }
+
+    #[test]
+    fn bitbucket_remote_urls_are_recognized() {
+        let key = |url| remote_repo_key(url);
+        let expected = Some((BITBUCKET, "ws".to_owned(), "repo".to_owned()));
+        assert_eq!(key("git@bitbucket.org:WS/Repo.git"), expected);
+        assert_eq!(key("ssh://git@bitbucket.org/ws/repo.git"), expected);
+        assert_eq!(key("https://me@bitbucket.org/ws/repo.git"), expected);
+        assert_eq!(key("https://bitbucket.org/ws/repo"), expected);
+        assert_eq!(key("https://bitbucket.example.com/ws/repo"), None);
+    }
+
+    #[test]
+    fn bitbucket_remote_transport_keeps_the_https_user() {
+        let rewrite = |url| repo_url_from_remote_transport(url, BITBUCKET, "acme", "widgets");
+        assert_eq!(
+            rewrite("git@bitbucket.org:me/fork.git"),
+            Some("git@bitbucket.org:acme/widgets.git".to_owned())
+        );
+        assert_eq!(
+            rewrite("https://me@bitbucket.org/me/fork.git"),
+            Some("https://me@bitbucket.org/acme/widgets.git".to_owned())
+        );
+        assert_eq!(rewrite("git@github.com:me/fork.git"), None);
     }
 
     #[test]
@@ -2561,20 +2841,22 @@ mod tests {
     #[test]
     fn github_remote_transport_rewrites_repo_without_forcing_https() {
         assert_eq!(
-            github_repo_url_from_remote_transport("git@github.com:me/fork.git", "owner", "repo"),
+            repo_url_from_remote_transport("git@github.com:me/fork.git", GITHUB, "owner", "repo"),
             Some("git@github.com:owner/repo.git".to_owned())
         );
         assert_eq!(
-            github_repo_url_from_remote_transport(
+            repo_url_from_remote_transport(
                 "ssh://git@github.com:22/me/fork.git",
+                GITHUB,
                 "owner",
                 "repo",
             ),
             Some("ssh://git@github.com:22/owner/repo.git".to_owned())
         );
         assert_eq!(
-            github_repo_url_from_remote_transport(
+            repo_url_from_remote_transport(
                 "https://token@github.com/me/fork.git",
+                GITHUB,
                 "owner",
                 "repo",
             ),
@@ -2590,7 +2872,7 @@ mod tests {
         repo.remote("upstream", "git@github.com:Owner/Repo.git")
             .unwrap();
 
-        let remote = local_remote_for_github_repo(repo.path(), "owner", "repo").unwrap();
+        let remote = local_remote_for_repo(repo.path(), GITHUB, "owner", "repo").unwrap();
 
         assert_eq!(remote, "upstream");
     }
@@ -2601,8 +2883,9 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         repo.remote("origin", "git@github.com:me/fork.git").unwrap();
 
-        let source = github_fetch_source_for_repo(
+        let source = fetch_source_for_repo(
             repo.path(),
+            GITHUB,
             "owner",
             "repo",
             "https://github.com/owner/repo.git",
@@ -2881,6 +3164,73 @@ mod tests {
 
     /// Build two repos: a bare "remote" and a local clone with a tracking
     /// branch. Used to exercise fetch/push/pull-ff end-to-end.
+    /// A bare repository holding one commit on `branch`.
+    fn bare_with_branch(branch: &str, file: &str) -> (TempDir, String) {
+        let bare_dir = TempDir::new().unwrap();
+        Repository::init_bare(bare_dir.path()).unwrap();
+        let seed_dir = TempDir::new().unwrap();
+        let seed = Repository::init(seed_dir.path()).unwrap();
+        let oid = commit_file(&seed, file, "content\n", file);
+        seed.remote("origin", bare_dir.path().to_str().unwrap())
+            .unwrap()
+            .push::<&str>(&[&format!("+HEAD:refs/heads/{branch}")], None)
+            .unwrap();
+        (bare_dir, oid)
+    }
+
+    #[test]
+    fn bitbucket_fork_pull_requests_fetch_both_branches_and_expand_short_hashes() {
+        let (upstream, base_oid) = bare_with_branch("main", "base.txt");
+        let (fork, head_oid) = bare_with_branch("main", "head.txt");
+        let local_dir = TempDir::new().unwrap();
+        let local = Repository::init(local_dir.path()).unwrap();
+        commit_file(&local, "README.md", "local\n", "local");
+        let mut config = local.config().unwrap();
+        for (repo, dir) in [("acme/widgets", &upstream), ("forker/widgets", &fork)] {
+            config
+                .set_str(
+                    &format!("url.{}.insteadOf", dir.path().display()),
+                    &format!("https://bitbucket.org/{repo}.git"),
+                )
+                .unwrap();
+        }
+        let mut git = GitService::new();
+        git.open(local_dir.path().to_str().unwrap()).unwrap();
+        let target = ReviewTarget {
+            forge: BITBUCKET,
+            owner: "acme".to_owned(),
+            repo: "widgets".to_owned(),
+            number: 5,
+        };
+        let info = PullRequestInfo {
+            number: 5,
+            base_branch: "main".to_owned(),
+            head_branch: "main".to_owned(),
+            base_sha: base_oid[..12].to_owned(),
+            head_sha: head_oid[..12].to_owned(),
+            base_repo_url: "https://bitbucket.org/acme/widgets.git".to_owned(),
+            head_repo_url: "https://bitbucket.org/forker/widgets.git".to_owned(),
+            ..PullRequestInfo::default()
+        };
+
+        let (resolved, left, right) = git
+            .resolve_pull_request_comparison(&target, info.clone())
+            .unwrap();
+
+        assert_eq!(left, "refs/diffy/pr/bitbucket/5/base/main");
+        assert_eq!(right, "refs/diffy/pr/bitbucket/5/head/main");
+        assert_eq!(resolved.base_sha, base_oid);
+        assert_eq!(resolved.head_sha, head_oid);
+        assert_eq!(git.resolve_commit_oid(&left).unwrap(), base_oid);
+        assert_eq!(git.resolve_commit_oid(&right).unwrap(), head_oid);
+
+        // Cached refs that match the short hashes are reused without a fetch.
+        drop(upstream);
+        drop(fork);
+        let (again, _, _) = git.resolve_pull_request_comparison(&target, info).unwrap();
+        assert_eq!(again.head_sha, head_oid);
+    }
+
     fn make_remote_and_clone() -> (TempDir, TempDir) {
         let remote_dir = TempDir::new().unwrap();
         let remote = Repository::init_bare(remote_dir.path()).unwrap();

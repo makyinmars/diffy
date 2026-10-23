@@ -1,24 +1,7 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitHubRepo {
-    pub owner: String,
-    pub repo: String,
-}
+use crate::core::forge::{ForgeRepo, valid_slug_part};
+use crate::core::review::ReviewForge;
 
-impl GitHubRepo {
-    pub fn slug(&self) -> String {
-        format!("{}/{}", self.owner, self.repo)
-    }
-
-    pub fn clone_url(&self) -> String {
-        format!("https://github.com/{}/{}.git", self.owner, self.repo)
-    }
-
-    pub fn matches(&self, owner: &str, repo: &str) -> bool {
-        self.owner.eq_ignore_ascii_case(owner) && self.repo.eq_ignore_ascii_case(repo)
-    }
-}
-
-pub fn parse_remote(url: &str) -> Option<GitHubRepo> {
+pub fn parse_remote(url: &str) -> Option<ForgeRepo> {
     let url = url.trim();
     let (scheme, rest) = match url.split_once("://") {
         Some((_, rest)) => (true, rest),
@@ -35,7 +18,7 @@ pub fn parse_remote(url: &str) -> Option<GitHubRepo> {
     slug(path.strip_prefix('/')?)
 }
 
-pub fn parse_repo_reference(input: &str) -> Option<GitHubRepo> {
+pub fn parse_repo_reference(input: &str) -> Option<ForgeRepo> {
     let input = input.trim();
     if input.contains("github.com") {
         return parse_remote(input);
@@ -43,17 +26,12 @@ pub fn parse_repo_reference(input: &str) -> Option<GitHubRepo> {
     slug(input)
 }
 
-fn slug(path: &str) -> Option<GitHubRepo> {
+fn slug(path: &str) -> Option<ForgeRepo> {
     let path = path.trim_end_matches('/');
     let (owner, repo) = path.split_once('/')?;
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    let valid = |part: &str| {
-        !part.is_empty()
-            && part
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    (valid(owner) && valid(repo)).then(|| GitHubRepo {
+    (valid_slug_part(owner) && valid_slug_part(repo)).then(|| ForgeRepo {
+        forge: ReviewForge::GitHub,
         owner: owner.to_owned(),
         repo: repo.to_owned(),
     })
@@ -63,7 +41,7 @@ fn slug(path: &str) -> Option<GitHubRepo> {
 mod tests {
     use super::*;
 
-    fn pair(repo: Option<GitHubRepo>) -> Option<(String, String)> {
+    fn pair(repo: Option<ForgeRepo>) -> Option<(String, String)> {
         repo.map(|repo| (repo.owner, repo.repo))
     }
 
@@ -96,10 +74,10 @@ mod tests {
         assert_eq!(parse_repo_reference("owner/repo#4"), None);
         assert_eq!(parse_repo_reference("/abs/path"), None);
         assert_eq!(parse_repo_reference("owner/repo/extra"), None);
-        assert!(
-            parse_repo_reference("Owner/Repo")
-                .unwrap()
-                .matches("owner", "repo")
-        );
+        assert!(parse_repo_reference("Owner/Repo").unwrap().matches(
+            ReviewForge::GitHub,
+            "owner",
+            "repo"
+        ));
     }
 }

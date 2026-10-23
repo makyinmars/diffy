@@ -630,6 +630,7 @@ impl VcsRepository for JjRepository {
             operation_log: parse_operation_log(&operation_log),
             file_changes,
             worktrees: Vec::new(),
+            forge: parse_remote_forge(&remotes),
         };
         self.last_snapshot = Some(snapshot.clone());
         Ok(snapshot)
@@ -1402,6 +1403,23 @@ pub fn jj_capabilities(colocated: bool) -> RepoCapabilities {
         // .git store, so they are only available in colocated workspaces.
         forge_pull_requests: colocated,
     }
+}
+
+/// The forge `jj git remote list` remotes point at, `origin` first.
+fn parse_remote_forge(output: &str) -> Option<crate::core::review::ReviewForge> {
+    let mut remotes: Vec<(&str, &str)> = output
+        .lines()
+        .filter_map(|line| line.trim().split_once(char::is_whitespace))
+        .collect();
+    remotes.sort_by_key(|(name, _)| match *name {
+        "origin" => 0,
+        "upstream" => 1,
+        _ => 2,
+    });
+    remotes
+        .into_iter()
+        .find_map(|(_, url)| crate::core::forge::parse_remote(url.trim()))
+        .map(|repo| repo.forge)
 }
 
 fn parse_remote_names(output: &str) -> std::collections::BTreeSet<String> {

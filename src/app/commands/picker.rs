@@ -55,7 +55,7 @@ impl PickerKind {
             Self::Theme => "Search themes",
             Self::Font(_) => "Search fonts",
             Self::CompareMenu => "Search compare options",
-            Self::PullRequest => "Paste a GitHub pull request URL",
+            Self::PullRequest => "Paste a GitHub or Bitbucket pull request URL",
             Self::File => "Search files, @ symbols here, # all symbols",
             Self::Definition => "Filter definitions",
         }

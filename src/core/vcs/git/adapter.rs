@@ -187,7 +187,7 @@ impl VcsRepository for GitRepository {
         }
         let commits = self.service.commits("HEAD", 200).unwrap_or_default();
         let status_items = git_status_items(&self.service)?;
-        Ok(git_snapshot_from_parts(
+        let mut snapshot = git_snapshot_from_parts(
             self.location.workspace_root.clone(),
             reason,
             None,
@@ -195,7 +195,9 @@ impl VcsRepository for GitRepository {
             &tags,
             &commits,
             &status_items,
-        ))
+        );
+        snapshot.forge = self.service.remote_forge();
+        Ok(snapshot)
     }
 
     fn resolve_compare_request(&mut self, request: &VcsCompareRequest) -> Result<(String, String)> {
@@ -515,11 +517,10 @@ impl VcsRepository for GitRepository {
 
     fn resolve_pull_request_comparison(
         &mut self,
-        pull_request_url: &str,
-        token: &str,
+        target: &crate::core::review::ReviewTarget,
+        info: crate::core::forge::model::PullRequestInfo,
     ) -> Result<(crate::core::forge::model::PullRequestInfo, String, String)> {
-        self.service
-            .resolve_pull_request_comparison(pull_request_url, token)
+        self.service.resolve_pull_request_comparison(target, info)
     }
 
     fn compare_working_file(&mut self, path: &str) -> Result<CompareOutput> {
@@ -689,6 +690,7 @@ pub fn git_snapshot_from_parts(
         operation_log: Vec::new(),
         file_changes: git_file_changes(status_items),
         worktrees,
+        forge: None,
     }
 }
 

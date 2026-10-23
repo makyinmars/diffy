@@ -762,6 +762,7 @@ fn repository_snapshot(path: PathBuf) -> RepositorySnapshot {
         file_changes: Vec::new(),
         worktrees: Vec::new(),
         publish_plan: None,
+        forge: None,
     }
 }
 

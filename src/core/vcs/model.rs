@@ -5,6 +5,7 @@ use serde::{Serialize, Serializer};
 
 use crate::contracts::navigation::{RepositoryChangeKind, RepositorySyncReason};
 use crate::core::compare::{LayoutMode, RendererKind};
+use crate::core::review::ReviewForge;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VcsKind(&'static str);
@@ -510,6 +511,8 @@ pub struct VcsSnapshot {
     pub operation_log: Vec<VcsOperationLogEntry>,
     pub file_changes: Vec<FileChange>,
     pub worktrees: Vec<Worktree>,
+    /// The forge the repository's remotes point at, `origin` first.
+    pub forge: Option<ReviewForge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
