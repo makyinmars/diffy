@@ -14,7 +14,7 @@ use crate::core::compare::spec::CompareMode;
 use crate::core::compare::stats::COMPARE_SUMMARY_FILE_LIMIT;
 use crate::core::error::{DiffyError, Result, VcsBackendKind};
 use crate::core::forge::model::PullRequestInfo;
-use crate::core::forge::parse_remote;
+use crate::core::forge::{clone_key, parse_remote};
 use crate::core::review::{ReviewForge, ReviewTarget};
 use crate::core::vcs::compare_port::output_from_patch;
 use crate::core::vcs::git::status::{StatusBits, StatusItem, StatusOperation, StatusScope};
@@ -701,9 +701,10 @@ fn authority_forge(authority: &str) -> Option<ReviewForge> {
         .map(|(_, forge)| *forge)
 }
 
-/// The work tree containing `path` and the lowercase `owner/repo` of every
-/// GitHub remote it has, read from the config without spawning git.
-pub fn github_remotes(path: &Path) -> Result<(PathBuf, Vec<String>)> {
+/// The work tree containing `path` and the clone key (see
+/// [`crate::core::forge::clone_key`]) of every forge remote it has, read
+/// from the config without spawning git.
+pub fn forge_remotes(path: &Path) -> Result<(PathBuf, Vec<String>)> {
     let repo = gix::discover(path).map_err(gix_error)?;
     let root = repo
         .workdir()
@@ -715,8 +716,7 @@ pub fn github_remotes(path: &Path) -> Result<(PathBuf, Vec<String>)> {
         .iter()
         .filter_map(|name| config.string(format!("remote.{name}.url").as_str()))
         .filter_map(|url| remote_repo_key(&url.to_str_lossy()))
-        .filter(|(forge, _, _)| *forge == ReviewForge::GitHub)
-        .map(|(_, owner, repo)| format!("{owner}/{repo}"))
+        .map(|(forge, owner, repo)| clone_key(forge, &format!("{owner}/{repo}")))
         .collect();
     keys.dedup();
     Ok((root, keys))

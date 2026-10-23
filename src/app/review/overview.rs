@@ -203,7 +203,7 @@ impl Page<'_> {
         .disabled(self.review.overview.loading);
         let browser = controls::icon_button(
             lucide::EXTERNAL_LINK,
-            "Open on GitHub",
+            &self.on_forge("Open on"),
             action(ReviewAction::OpenPullRequestInBrowser),
             self.theme,
         );
@@ -465,7 +465,12 @@ impl Page<'_> {
         }
     }
 
-    fn merge_status(&self, overview: &PullRequestOverview) -> AnyElement {
+    /// `verb` followed by the open pull request's forge, e.g. "Open on GitHub".
+    fn on_forge(&self, verb: &str) -> String {
+        format!("{verb} {}", self.review.active_forge().name())
+    }
+
+    fn merge_status(&self, overview: &PullRequestOverview) -> Option<AnyElement> {
         let scale = self.scale;
         let tc = &self.theme.colors;
         let decision = overview.review_decision.as_deref();
@@ -504,6 +509,8 @@ impl Page<'_> {
                 "Mergeable with failing checks",
             ),
             (_, "MERGEABLE", _) => (icons::CIRCLE_CHECK, tc.line_add_text, "Ready to merge"),
+            // Bitbucket reports mergeability only through merge checks.
+            _ if self.review.active_forge() != ReviewForge::GitHub => return None,
             _ => (icons::CLOCK, tc.text_muted, "Checking mergeability"),
         };
         let content = vec![view! { scale,
@@ -512,7 +519,7 @@ impl Page<'_> {
                 <text size={Px(self.small())} color={tc.text}>{label}</text>
             </div>
         }];
-        self.row(lucide::GIT_PULL_REQUEST, "Merge", content)
+        Some(self.row(lucide::GIT_PULL_REQUEST, "Merge", content))
     }
 
     fn changes(&self, overview: &PullRequestOverview) -> AnyElement {
@@ -538,7 +545,7 @@ impl Page<'_> {
             children.push(self.labels(overview));
         }
         children.extend(self.checks(overview));
-        children.push(self.merge_status(overview));
+        children.extend(self.merge_status(overview));
         children.push(self.changes(overview));
         self.card(
             "Details".to_owned(),
@@ -603,7 +610,7 @@ impl Page<'_> {
         (!url.is_empty()).then(|| {
             let button = controls::icon_button(
                 lucide::EXTERNAL_LINK,
-                "Open on GitHub",
+                &self.on_forge("Open on"),
                 action(ReviewAction::OpenLink(url.to_owned())),
                 self.theme,
             );
@@ -753,7 +760,7 @@ impl Page<'_> {
             .saturating_sub(overview.timeline.len());
         if hidden > 0 {
             let open = controls::button(
-                "View on GitHub",
+                self.on_forge("View on"),
                 action(ReviewAction::OpenPullRequestInBrowser),
                 Tone::Ghost,
             )

@@ -10,6 +10,7 @@ use crate::core::error::{DiffyError, Result};
 use crate::core::forge::model::{
     MyPullRequest, PullRequestCheckSummary, PullRequestReviewer, PullRequestStats,
 };
+use crate::core::review::ReviewForge;
 
 const SEARCH: &str = "is:pr is:open author:@me archived:false sort:updated-desc";
 const EXCERPT_CHARS: usize = 280;
@@ -173,6 +174,7 @@ fn parse_pull(node: &Value, viewer: &str) -> MyPullRequest {
         reviewers.push(PullRequestReviewer { actor, state });
     }
     MyPullRequest {
+        forge: ReviewForge::GitHub,
         id: string_field(node, "id"),
         number: int_field(node, "number") as i32,
         title: string_field(node, "title"),
@@ -244,7 +246,7 @@ fn parse_rollup(rollup: &Value) -> PullRequestCheckSummary {
     summary
 }
 
-fn excerpt(body: &str) -> String {
+pub(crate) fn excerpt(body: &str) -> String {
     let mut out = String::new();
     for (index, word) in body.split_whitespace().enumerate() {
         if index > 0 {

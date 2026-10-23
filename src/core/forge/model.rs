@@ -8,7 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::review::ReviewSide;
+use crate::core::forge::clone_key;
+use crate::core::review::{ReviewForge, ReviewSide};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ForgeUser {
@@ -267,6 +268,7 @@ pub struct PullRequestStats {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MyPullRequest {
+    pub forge: ReviewForge,
     pub id: String,
     pub number: i32,
     pub title: String,
@@ -286,7 +288,18 @@ pub struct MyPullRequest {
 }
 
 impl MyPullRequest {
+    /// How Diffy names this pull request's repository when asking for its
+    /// local clone: GitHub's `owner/repo`, `bitbucket.org/ws/repo` otherwise.
+    pub fn clone_label(&self) -> String {
+        match self.forge {
+            ReviewForge::GitHub => self.repository.clone(),
+            ReviewForge::Bitbucket => format!("bitbucket.org/{}", self.repository),
+        }
+    }
+
+    /// The key a local clone of this pull request's repository is saved
+    /// under.
     pub fn repo_key(&self) -> String {
-        self.repository.to_ascii_lowercase()
+        clone_key(self.forge, &self.repository)
     }
 }

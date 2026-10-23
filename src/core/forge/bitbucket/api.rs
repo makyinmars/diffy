@@ -87,24 +87,37 @@ impl BitbucketApi {
     }
 
     pub fn fetch_pull_request(&self, pr: &ReviewTarget) -> Result<PullRequestInfo> {
-        let value = transport::get_json(
+        let value = self.pull_request_value(pr)?;
+        let mut info = parse_pull_request(&value)?;
+        self.add_diffstat(pr, &value, &mut info);
+        Ok(info)
+    }
+
+    pub(super) fn pull_request_value(&self, pr: &ReviewTarget) -> Result<Value> {
+        transport::get_json(
             &self.credentials,
             &pull_request_url(pr, ""),
             "Bitbucket pull request fetch",
-        )?;
-        let mut info = parse_pull_request(&value)?;
-        // The changed-file counts are a summary; a diffstat that times out
-        // (Bitbucket answers 555) must not block loading the diff itself.
+        )
+    }
+
+    /// Fill the changed-file counts. They are a summary, so a diffstat that
+    /// times out (Bitbucket answers 555) does not block the pull request.
+    pub(super) fn add_diffstat(
+        &self,
+        pr: &ReviewTarget,
+        value: &Value,
+        info: &mut PullRequestInfo,
+    ) {
         let diffstat = value
             .pointer("/links/diffstat/href")
             .and_then(Value::as_str)
             .map(|href| with_query(href, "pagelen=500"))
             .unwrap_or_else(|| pull_request_url(pr, "/diffstat?pagelen=500"));
         match transport::get_pages(&self.credentials, &diffstat, "Bitbucket diffstat fetch") {
-            Ok(files) => apply_diffstat(&mut info, &files),
+            Ok(files) => apply_diffstat(info, &files),
             Err(error) => tracing::warn!("bitbucket: diffstat unavailable: {error}"),
         }
-        Ok(info)
     }
 }
 

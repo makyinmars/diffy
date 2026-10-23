@@ -5,7 +5,7 @@ pub mod status;
 pub use adapter::GitBackend;
 pub use service::{
     BranchInfo, CommitInfo, GitService, INDEX_REF, PrRefSide, PullError, PullOutcome, RefMetadata,
-    TagInfo, TreeBlob, WORKDIR_REF, all_ignored, clone_repository, github_remotes,
+    TagInfo, TreeBlob, WORKDIR_REF, all_ignored, clone_repository, forge_remotes,
     has_uncommitted_changes, is_full_hex_oid, is_pr_ref, mentions, pr_ref_path, ref_metadata,
     uncommitted_count,
 };

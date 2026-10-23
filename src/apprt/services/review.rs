@@ -20,7 +20,7 @@ use crate::core::http;
 use crate::core::repo_discovery;
 use crate::core::review::{ReviewForge, ReviewSession, ReviewSessionKey, ReviewTarget};
 use crate::core::vcs::discovery;
-use crate::core::vcs::git::{PrRefSide, github_remotes, pr_ref_path};
+use crate::core::vcs::git::{PrRefSide, forge_remotes, pr_ref_path};
 use crate::core::vcs::model::{VcsCompareRequest, VcsCompareSpec, VcsKind};
 use crate::platform::persistence::SettingsStore;
 use crate::platform::review_store::ReviewStore;
@@ -143,7 +143,7 @@ impl ReviewServices {
             .filter(|path| seen.insert(path.clone()))
             .take(CLONE_CANDIDATES)
         {
-            let Ok((root, keys)) = github_remotes(&path) else {
+            let Ok((root, keys)) = forge_remotes(&path) else {
                 continue;
             };
             for key in keys {
@@ -156,7 +156,7 @@ impl ReviewServices {
     }
 
     pub fn validate_clone(&self, repo: &str, path: &Path) -> Result<PathBuf> {
-        let (root, keys) = github_remotes(path).map_err(|_| {
+        let (root, keys) = forge_remotes(path).map_err(|_| {
             DiffyError::General(format!("{} is not a Git repository.", path.display()))
         })?;
         if keys.iter().any(|key| key.eq_ignore_ascii_case(repo)) {
@@ -700,6 +700,26 @@ impl LiveForge {
                     Err(error) => ForgeResponse::PullRequestCommentAddFailed {
                         pr,
                         body,
+                        message: error.user_message(),
+                    },
+                }
+            }
+            ForgeRequest::FetchPullRequestOverview { pr, token } => {
+                match bitbucket_api(token).fetch_overview(&pr) {
+                    Ok(overview) => ForgeResponse::PullRequestOverviewLoaded {
+                        pr,
+                        overview: Box::new(overview),
+                    },
+                    Err(error) => ForgeResponse::PullRequestOverviewLoadFailed {
+                        pr,
+                        message: error.user_message(),
+                    },
+                }
+            }
+            ForgeRequest::FetchMyPullRequests { token, .. } => {
+                match bitbucket_api(Some(token)).fetch_my_pull_requests() {
+                    Ok(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
+                    Err(error) => ForgeResponse::MyPullRequestsLoadFailed {
                         message: error.user_message(),
                     },
                 }

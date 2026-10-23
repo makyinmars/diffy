@@ -12,8 +12,11 @@ use crate::core::forge::model::{
     PullRequestReviewSummary, PullRequestReviewThread, PullRequestReviewThreadComment,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize,
+)]
 pub enum ReviewForge {
+    #[default]
     GitHub,
     Bitbucket,
 }

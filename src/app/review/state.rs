@@ -176,7 +176,7 @@ pub(super) enum Pending {
     Peek,
     Overview,
     Comment,
-    Pulls,
+    Pulls(ReviewForge),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -653,6 +653,12 @@ impl ReviewController {
         }
         self.overview.scroll.set_offset(0.0, f64::MAX);
         self.open_composer(ComposerTarget::Conversation, "")
+    }
+
+    pub fn signed_in_anywhere(&self) -> bool {
+        [ReviewForge::GitHub, ReviewForge::Bitbucket]
+            .into_iter()
+            .any(|forge| self.signed_in(forge))
     }
 
     pub fn signed_in(&self, forge: ReviewForge) -> bool {
@@ -1819,7 +1825,10 @@ impl ReviewController {
             }
             ForgeResponse::MyPullRequestsLoaded(pulls) => self.pulls_loaded(scope.request, pulls),
             ForgeResponse::MyPullRequestsLoadFailed { message } => {
-                self.pulls_failed(scope.request, message)
+                let Pending::Pulls(forge) = kind else {
+                    return Reduction::default();
+                };
+                self.pulls_failed(scope.request, forge, message)
             }
             ForgeResponse::PullRequestCommentAdded { .. } => {
                 let mut reduction = Reduction::changed().intent(info("Comment posted."));
@@ -2708,7 +2717,7 @@ impl CommandSource for ReviewController {
         out.push(
             CommandDescriptor::new(
                 "review.open_in_browser",
-                "Open pull request on GitHub",
+                format!("Open pull request on {}", self.active_forge().name()),
                 ReviewAction::OpenPullRequestInBrowser,
             )
             .enabled(self.pr.is_some()),

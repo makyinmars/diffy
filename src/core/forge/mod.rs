@@ -33,6 +33,16 @@ impl ForgeRepo {
     }
 }
 
+/// The lowercase key Diffy saves a repository's local clone under: GitHub
+/// keeps its `owner/repo`; other forges prefix their host.
+pub fn clone_key(forge: ReviewForge, slug: &str) -> String {
+    let slug = slug.to_ascii_lowercase();
+    match forge {
+        ReviewForge::GitHub => slug,
+        ReviewForge::Bitbucket => format!("bitbucket.org/{slug}"),
+    }
+}
+
 /// The forge repository a git remote URL points at.
 pub fn parse_remote(url: &str) -> Option<ForgeRepo> {
     github::parse_remote(url).or_else(|| bitbucket::parse_remote(url))

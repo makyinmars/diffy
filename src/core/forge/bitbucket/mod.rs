@@ -1,5 +1,7 @@
 pub mod api;
 mod comments;
+mod my_pulls;
+mod overview;
 pub mod pull_request;
 pub mod repository;
 mod transport;

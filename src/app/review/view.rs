@@ -179,7 +179,7 @@ pub fn pull_request_bar(
     });
     let open = controls::icon_button(
         lucide::EXTERNAL_LINK,
-        "Open on GitHub",
+        &format!("Open on {}", review.active_forge().name()),
         action(ReviewAction::OpenPullRequestInBrowser),
         theme,
     );

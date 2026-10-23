@@ -45,11 +45,36 @@ const KEYS: [(&str, PullsAction); 10] = [
 const HINTS: [(&str, &str); 6] = [
     ("j k", "move"),
     ("\u{21b5}", "review"),
-    ("o", "GitHub"),
+    ("o", ""),
     ("y", "copy link"),
     ("r", "refresh"),
     ("esc", "close"),
 ];
+
+/// Where `o` opens the selected pull request: its forge, or the browser
+/// when the list mixes forges.
+fn open_hint(review: &ReviewController) -> &'static str {
+    match (
+        review.signed_in(ReviewForge::GitHub),
+        review.signed_in(ReviewForge::Bitbucket),
+    ) {
+        (true, true) => "browser",
+        (false, true) => "Bitbucket",
+        _ => "GitHub",
+    }
+}
+
+/// The forges whose pull requests the page lists, e.g. "GitHub or Bitbucket".
+fn listed_forges(review: &ReviewController) -> &'static str {
+    match (
+        review.signed_in(ReviewForge::GitHub),
+        review.signed_in(ReviewForge::Bitbucket),
+    ) {
+        (true, true) => "GitHub or Bitbucket",
+        (false, true) => "Bitbucket",
+        _ => "GitHub",
+    }
+}
 
 struct Page<'a> {
     review: &'a ReviewController,
@@ -93,7 +118,10 @@ fn reference(pull: &MyPullRequest) -> String {
         .rsplit('/')
         .next()
         .unwrap_or(&pull.repository);
-    format!("{name}#{}", pull.number)
+    match pull.forge {
+        ReviewForge::GitHub => format!("{name}#{}", pull.number),
+        ReviewForge::Bitbucket => format!("{name}#{} \u{b7} Bitbucket", pull.number),
+    }
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {
@@ -154,7 +182,7 @@ impl Page<'_> {
             pulls(PullsAction::Refresh),
             self.theme,
         )
-        .disabled(page.loading || !self.review.signed_in(ReviewForge::GitHub));
+        .disabled(page.loading || !self.review.signed_in_anywhere());
         let close = controls::button("Close", pulls(PullsAction::Close), Tone::Ghost)
             .icon(lucide::X)
             .tooltip("Esc");
@@ -384,8 +412,10 @@ impl Page<'_> {
     fn footer(&self) -> AnyElement {
         let scale = self.scale;
         let tc = &self.theme.colors;
+        let open = open_hint(self.review);
         let hints: Vec<AnyElement> = HINTS
             .iter()
+            .map(|(keys, label)| (*keys, if label.is_empty() { open } else { label }))
             .map(|(keys, label)| {
                 let caps: Vec<AnyElement> = keys
                     .split(' ')
@@ -428,7 +458,10 @@ impl Page<'_> {
             }),
             (Some(data), _) if data.is_empty() => Some(self.notice(
                 "No open pull requests",
-                "Pull requests you open on GitHub show up here.",
+                &format!(
+                    "Pull requests you open on {} show up here.",
+                    listed_forges(self.review)
+                ),
                 "review.pulls.empty",
             )),
             (Some(_), _) if page.sections.is_empty() => Some(self.notice(
@@ -631,7 +664,7 @@ impl Page<'_> {
             .icon(lucide::GIT_PULL_REQUEST)
             .tooltip("Enter");
         let github = controls::button(
-            "Open on GitHub",
+            format!("Open on {}", pull.forge.name()),
             pulls(PullsAction::OpenOnGitHub),
             Tone::Secondary,
         )
@@ -643,7 +676,7 @@ impl Page<'_> {
                     <div class="shrink-0" accessibility_role={AccessibilityRole::Label} aria-label={format!("State: {state}")}>
                         {badge(state).icon(icon).variant(variant)}
                     </div>
-                    <text size={Px(mono)} class="truncate font-mono" color={tc.text_muted}>{format!("{}#{}", pull.repository, pull.number)}</text>
+                    <text size={Px(mono)} class="truncate font-mono" color={tc.text_muted}>{format!("{}#{}", pull.clone_label(), pull.number)}</text>
                 </div>
                 {self.location(pull)}
                 <div class="flex-row w-full" accessibility_role={AccessibilityRole::Heading} aria-label={pull.title.clone()}>
@@ -675,16 +708,26 @@ impl Page<'_> {
     fn sign_in(&self) -> AnyElement {
         let scale = self.scale;
         let tc = &self.theme.colors;
-        let button = controls::button("Sign in", ReviewAction::OpenAuthModal, Tone::Primary)
-            .icon(lucide::GITHUB_MARK);
+        let button = controls::button(
+            "Sign in",
+            ReviewAction::OpenSignIn(ReviewForge::GitHub),
+            Tone::Primary,
+        )
+        .icon(lucide::GITHUB_MARK);
+        let bitbucket = controls::button(
+            "Sign in to Bitbucket",
+            ReviewAction::OpenSignIn(ReviewForge::Bitbucket),
+            Tone::Secondary,
+        )
+        .icon(lucide::KEY);
         view! { scale,
             <div class="flex-col items-center justify-center w-full flex-1" gap={Sp::SM} p={Sp::LG}
                  accessibility_role={AccessibilityRole::Group} aria-label="Sign in to see your pull requests"
                  test_id="review.pulls.sign_in">
                 <icon svg={lucide::GITHUB_MARK} size={Ico::XL} color={tc.text_muted} />
                 <text size={Px(TextStyle::Body.font_size(self.theme))} class="font-medium" color={tc.text}>"Sign in to see your pull requests"</text>
-                <text size={Px(self.small())} color={tc.text_muted}>"Diffy lists the open pull requests you authored on GitHub."</text>
-                {button}
+                <text size={Px(self.small())} color={tc.text_muted}>"Diffy lists the open pull requests you authored on GitHub and Bitbucket."</text>
+                <div class="flex-row items-center" gap={Sp::SM}>{button}{bitbucket}</div>
             </div>
         }
     }
@@ -704,7 +747,7 @@ pub fn pulls_page(review: &ReviewController, slot: &Slot, cx: &mut ViewContext) 
     };
     let state = review.pulls();
     let header = page.header(state);
-    let body = if review.signed_in(ReviewForge::GitHub) {
+    let body = if review.signed_in_anywhere() {
         let preview_w = tokens::scaled(Layout::PULLS_PREVIEW_W, scale);
         let wide = slot.width >= tokens::scaled(Bp::NARROW, scale);
         let list_w = if wide {

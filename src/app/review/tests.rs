@@ -213,6 +213,7 @@ struct Script {
     rejected_tokens: Vec<String>,
     /// Post only the first draft, the way Bitbucket stops partway.
     partial_submit: bool,
+    bitbucket_pulls: Option<Vec<MyPullRequest>>,
     requests: Vec<ForgeRequest>,
 }
 
@@ -359,6 +360,15 @@ impl ForgeBackend for FakeGitHub {
             ForgeRequest::AddPullRequestComment { pr, .. } => {
                 emit(ForgeResponse::PullRequestCommentAdded { pr })
             }
+            ForgeRequest::FetchMyPullRequests {
+                forge: ReviewForge::Bitbucket,
+                ..
+            } => emit(match self.with(|s| s.bitbucket_pulls.clone()) {
+                Some(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
+                None => ForgeResponse::MyPullRequestsLoadFailed {
+                    message: "workspaces unavailable".to_owned(),
+                },
+            }),
             ForgeRequest::FetchMyPullRequests { .. } => emit(if fail_pulls {
                 ForgeResponse::MyPullRequestsLoadFailed {
                     message: "search unavailable".to_owned(),
@@ -3073,6 +3083,40 @@ fn pull_request_lists_from_a_previous_account_are_dropped() {
     assert!(driver.review.pulls().data.is_none());
     assert!(!driver.review.pulls().loading);
     assert_eq!(pulls_requests(&driver), 1);
+}
+
+#[test]
+fn your_pull_requests_merge_both_forges_and_survive_one_failing() {
+    let mut driver = pulls_driver();
+    driver.deliver(ReviewEvent::TokenLoaded {
+        forge: ReviewForge::Bitbucket,
+        token: Some(Secret::new("me@example.com:token")),
+    });
+    let bitbucket = my_pull(7, "acme/widgets", "Bitbucket change", |p| {
+        p.forge = ReviewForge::Bitbucket;
+        p.url = "https://bitbucket.org/acme/widgets/pull-requests/7".to_owned();
+        p.updated_at = "2026-02-01T00:00:00+00:00".to_owned();
+    });
+    driver
+        .fake
+        .github
+        .with(|s| s.bitbucket_pulls = Some(vec![bitbucket.clone()]));
+
+    driver.act(ReviewAction::Pulls(PullsAction::Open));
+
+    let data = driver.review.pulls().data.clone().unwrap();
+    assert_eq!(data.len(), my_pulls().len() + 1);
+    assert_eq!(data[0], bitbucket, "the newest pull request comes first");
+    assert_eq!(pulls_requests(&driver), 2);
+    assert!(driver.errors().is_empty());
+
+    driver.fake.github.with(|s| s.bitbucket_pulls = None);
+    driver.act(ReviewAction::Pulls(PullsAction::Refresh));
+
+    let data = driver.review.pulls().data.clone().unwrap();
+    assert_eq!(data.len(), my_pulls().len());
+    assert!(driver.review.pulls().error.is_none());
+    assert_eq!(driver.errors(), ["Bitbucket: workspaces unavailable"]);
 }
 
 #[test]

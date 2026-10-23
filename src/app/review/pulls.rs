@@ -9,7 +9,7 @@ use quark_ui::text_input::{TextEditCommand, TextEditOutcome, TextField};
 use super::state::{Pending, ReviewController, ReviewOverlay, error, info};
 use crate::app::text_targets::workspace_focus;
 use crate::contracts::commands::SettingsSnapshot;
-use crate::contracts::review::{ForgeRequest, PullsAction, ReviewEffect};
+use crate::contracts::review::{ForgeRequest, PullsAction, ReviewEffect, Secret};
 use crate::contracts::shared::{JobId, SharedContext};
 use crate::contracts::shell::{Intent, LogicalFocus, Reduction, ShellEffect};
 use crate::core::forge::model::MyPullRequest;
@@ -104,7 +104,8 @@ pub fn pull_status(pull: &MyPullRequest) -> PullStatus {
         PullStatus::ReviewRequired
     } else if matches!(checks, Some("PENDING" | "EXPECTED")) {
         PullStatus::ChecksRunning
-    } else if mergeable != Some("MERGEABLE") {
+    } else if pull.forge == ReviewForge::GitHub && mergeable != Some("MERGEABLE") {
+        // Only GitHub's listing reports mergeability.
         PullStatus::CheckingMergeability
     } else if decision == Some("APPROVED") {
         PullStatus::Approved
@@ -178,7 +179,12 @@ pub struct PullsPage {
     pub list: ScrollHandle,
     pub preview: ScrollHandle,
     clones: HashMap<String, PathBuf>,
-    request: Option<JobId>,
+    /// One listing per signed-in forge; the page fills once all answer.
+    requests: Vec<JobId>,
+    requested: usize,
+    gathered: Vec<MyPullRequest>,
+    forges_answered: usize,
+    failures: Vec<String>,
     clones_job: Option<JobId>,
     last_focus: Option<LogicalFocus>,
     return_focus: Option<LogicalFocus>,
@@ -250,7 +256,10 @@ impl PullsPage {
 
     pub(super) fn reset(&mut self) {
         self.loading = false;
-        self.request = None;
+        self.requests.clear();
+        self.gathered.clear();
+        self.forges_answered = 0;
+        self.failures.clear();
         self.data = None;
         self.sections = Rc::from([]);
         self.error = None;
@@ -290,7 +299,7 @@ impl ReviewController {
             PullsAction::Open => self.open_pulls(),
             PullsAction::Close => self.close_pulls(),
             PullsAction::Refresh => {
-                if !self.signed_in(ReviewForge::GitHub) {
+                if !self.signed_in_anywhere() {
                     self.open_overlay(ReviewOverlay::Auth);
                     return Reduction::changed();
                 }
@@ -384,7 +393,7 @@ impl ReviewController {
         }
         self.focus_request = Some(LogicalFocus::ReviewPulls);
         let mut reduction = Reduction::changed().effect(self.resolve_clones());
-        if self.signed_in(ReviewForge::GitHub) && !self.pulls.loading && self.pulls.stale() {
+        if self.signed_in_anywhere() && !self.pulls.loading && self.pulls.stale() {
             reduction.merge(self.fetch_pulls());
         }
         reduction
@@ -405,17 +414,72 @@ impl ReviewController {
     }
 
     pub(super) fn fetch_pulls(&mut self) -> Reduction {
-        let forge = ReviewForge::GitHub;
-        let Some(token) = self.token(forge) else {
+        let accounts: Vec<(ReviewForge, Secret)> = [ReviewForge::GitHub, ReviewForge::Bitbucket]
+            .into_iter()
+            .filter_map(|forge| Some((forge, self.token(forge)?)))
+            .collect();
+        if accounts.is_empty() {
             return Reduction::default();
-        };
-        let scope = self.job(None, Pending::Pulls);
+        }
         self.pulls.loading = true;
-        self.pulls.request = Some(scope.request);
-        Reduction::changed().effect(ReviewEffect::Forge {
-            scope,
-            request: Box::new(ForgeRequest::FetchMyPullRequests { forge, token }),
-        })
+        self.pulls.requests.clear();
+        self.pulls.requested = accounts.len();
+        self.pulls.gathered.clear();
+        self.pulls.forges_answered = 0;
+        self.pulls.failures.clear();
+        let mut reduction = Reduction::changed();
+        for (forge, token) in accounts {
+            let scope = self.job(None, Pending::Pulls(forge));
+            self.pulls.requests.push(scope.request);
+            reduction = reduction.effect(ReviewEffect::Forge {
+                scope,
+                request: Box::new(ForgeRequest::FetchMyPullRequests { forge, token }),
+            });
+        }
+        reduction
+    }
+
+    fn take_pulls_request(&mut self, request: JobId) -> bool {
+        let Some(index) = self
+            .pulls
+            .requests
+            .iter()
+            .position(|known| *known == request)
+        else {
+            return false;
+        };
+        self.pulls.requests.remove(index);
+        true
+    }
+
+    /// Publish the merged listing once every forge has answered. A forge
+    /// that failed while another listed pull requests shows as a toast.
+    fn finish_pulls(&mut self) -> Reduction {
+        if !self.pulls.requests.is_empty() {
+            return Reduction::default();
+        }
+        self.pulls.loading = false;
+        let answered = std::mem::take(&mut self.pulls.forges_answered);
+        let failures = std::mem::take(&mut self.pulls.failures);
+        let mut pulls = std::mem::take(&mut self.pulls.gathered);
+        if answered == 0 {
+            let message = failures.join("\n");
+            tracing::warn!("failed to list your pull requests: {message}");
+            self.pulls.error = Some(message);
+            return Reduction::changed();
+        }
+        if answered > 1 {
+            pulls.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        }
+        self.pulls.error = None;
+        self.pulls.fetched_at = Some(now_secs());
+        self.pulls.data = Some(pulls.into());
+        self.pulls.regroup();
+        let mut reduction = Reduction::changed();
+        for failure in failures {
+            reduction = reduction.intent(error(failure));
+        }
+        reduction
     }
 
     fn resolve_clones(&mut self) -> ReviewEffect {
@@ -428,27 +492,29 @@ impl ReviewController {
     }
 
     pub(super) fn pulls_loaded(&mut self, request: JobId, pulls: Vec<MyPullRequest>) -> Reduction {
-        if self.pulls.request != Some(request) {
+        if !self.take_pulls_request(request) {
             return Reduction::default();
         }
-        self.pulls.request = None;
-        self.pulls.loading = false;
-        self.pulls.error = None;
-        self.pulls.fetched_at = Some(now_secs());
-        self.pulls.data = Some(pulls.into());
-        self.pulls.regroup();
-        Reduction::changed()
+        self.pulls.forges_answered += 1;
+        self.pulls.gathered.extend(pulls);
+        self.finish_pulls()
     }
 
-    pub(super) fn pulls_failed(&mut self, request: JobId, message: String) -> Reduction {
-        if self.pulls.request != Some(request) {
+    pub(super) fn pulls_failed(
+        &mut self,
+        request: JobId,
+        forge: ReviewForge,
+        message: String,
+    ) -> Reduction {
+        if !self.take_pulls_request(request) {
             return Reduction::default();
         }
-        tracing::warn!("failed to list your pull requests: {message}");
-        self.pulls.request = None;
-        self.pulls.loading = false;
-        self.pulls.error = Some(message);
-        Reduction::changed()
+        self.pulls.failures.push(if self.pulls.requested == 1 {
+            message
+        } else {
+            format!("{}: {message}", forge.name())
+        });
+        self.finish_pulls()
     }
 
     pub(super) fn clones_resolved(
@@ -492,7 +558,7 @@ impl ReviewController {
                 && self
                     .pulls
                     .selected_pull()
-                    .is_some_and(|pull| pull.url == url && pull.repository == repo)
+                    .is_some_and(|pull| pull.url == url && pull.clone_label() == repo)
         });
         if resume {
             reduction.merge(self.review_selected(cx));
@@ -504,7 +570,7 @@ impl ReviewController {
         let Some((url, repo)) = self
             .pulls
             .selected_pull()
-            .map(|pull| (pull.url.clone(), pull.repository.clone()))
+            .map(|pull| (pull.url.clone(), pull.clone_label()))
         else {
             return Reduction::default();
         };
@@ -516,7 +582,7 @@ impl ReviewController {
         let Some((url, repo)) = self
             .pulls
             .selected_pull()
-            .map(|pull| (pull.url.clone(), pull.repository.clone()))
+            .map(|pull| (pull.url.clone(), pull.clone_label()))
         else {
             return Reduction::default();
         };
