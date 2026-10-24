@@ -3088,10 +3088,6 @@ fn pull_request_lists_from_a_previous_account_are_dropped() {
 #[test]
 fn your_pull_requests_merge_both_forges_and_survive_one_failing() {
     let mut driver = pulls_driver();
-    driver.deliver(ReviewEvent::TokenLoaded {
-        forge: ReviewForge::Bitbucket,
-        token: Some(Secret::new("me@example.com:token")),
-    });
     let bitbucket = my_pull(7, "acme/widgets", "Bitbucket change", |p| {
         p.forge = ReviewForge::Bitbucket;
         p.url = "https://bitbucket.org/acme/widgets/pull-requests/7".to_owned();
@@ -3101,13 +3097,19 @@ fn your_pull_requests_merge_both_forges_and_survive_one_failing() {
         .fake
         .github
         .with(|s| s.bitbucket_pulls = Some(vec![bitbucket.clone()]));
-
     driver.act(ReviewAction::Pulls(PullsAction::Open));
+    assert_eq!(pulls_requests(&driver), 1);
+
+    // Signing in to Bitbucket with the page open lists both forges.
+    driver.act(ReviewAction::OpenSignIn(ReviewForge::Bitbucket));
+    type_into(&mut driver, REVIEW_BITBUCKET_EMAIL, "me@example.com");
+    type_into(&mut driver, REVIEW_BITBUCKET_TOKEN, "token");
+    driver.act(ReviewAction::SignInBitbucket);
 
     let data = driver.review.pulls().data.clone().unwrap();
     assert_eq!(data.len(), my_pulls().len() + 1);
     assert_eq!(data[0], bitbucket, "the newest pull request comes first");
-    assert_eq!(pulls_requests(&driver), 2);
+    assert_eq!(pulls_requests(&driver), 3);
     assert!(driver.errors().is_empty());
 
     driver.fake.github.with(|s| s.bitbucket_pulls = None);
@@ -3117,6 +3119,19 @@ fn your_pull_requests_merge_both_forges_and_survive_one_failing() {
     assert_eq!(data.len(), my_pulls().len());
     assert!(driver.review.pulls().error.is_none());
     assert_eq!(driver.errors(), ["Bitbucket: workspaces unavailable"]);
+
+    // Signing out of Bitbucket relists GitHub alone.
+    driver
+        .fake
+        .github
+        .with(|s| s.bitbucket_pulls = Some(vec![bitbucket]));
+    driver.act(ReviewAction::SignOut(ReviewForge::Bitbucket));
+
+    let data = driver.review.pulls().data.clone().unwrap();
+    assert_eq!(data.len(), my_pulls().len());
+    assert!(data.iter().all(|pull| pull.forge == ReviewForge::GitHub));
+    assert!(!driver.review.pulls().loading);
+    assert_eq!(pulls_requests(&driver), 6);
 }
 
 #[test]

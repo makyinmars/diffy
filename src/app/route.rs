@@ -180,6 +180,9 @@ ui_action!(
 fn opens_review_modal(action: &ReviewAction) -> bool {
     matches!(
         action,
-        ReviewAction::OpenAuthModal | ReviewAction::OpenAccountMenu | ReviewAction::OpenSubmitMenu
+        ReviewAction::OpenAuthModal
+            | ReviewAction::OpenSignIn(_)
+            | ReviewAction::OpenAccountMenu
+            | ReviewAction::OpenSubmitMenu
     )
 }

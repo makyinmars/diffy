@@ -40,7 +40,8 @@ impl BitbucketApi {
             if index > 0 {
                 thread::sleep(WRITE_SPACING);
             }
-            let result = draft_comment(draft).and_then(|body| self.post_comment(pr, &body));
+            let result =
+                draft_comment(session, draft).and_then(|body| self.post_comment(pr, &body));
             if let Err(error) = result {
                 let unposted = drafts[index..].iter().map(|draft| draft.id).collect();
                 let message = if posted.is_empty() {
@@ -181,11 +182,21 @@ impl BitbucketApi {
 
 /// The comment a pending draft posts. Inline drafts anchor to `to` on the
 /// new side or `from` on the old side; a multi-line draft names its first
-/// line in `start_to` / `start_from`. Only `content.raw` is sent: Bitbucket
-/// rejects `content.markup`.
-pub(super) fn draft_comment(draft: &ReviewDraft) -> Result<Value> {
+/// line in `start_to` / `start_from`. A reply names the thread's root
+/// comment as its parent. Only `content.raw` is sent: Bitbucket rejects
+/// `content.markup`.
+pub(super) fn draft_comment(session: &ReviewSession, draft: &ReviewDraft) -> Result<Value> {
     match &draft.kind {
         ReviewDraftKind::General => Ok(json!({ "content": { "raw": draft.body } })),
+        ReviewDraftKind::Reply { thread_id } => {
+            let parent = session.thread_remote_id(thread_id).ok_or_else(|| {
+                DiffyError::General("This review thread cannot be replied to.".to_owned())
+            })?;
+            Ok(json!({
+                "content": { "raw": draft.body },
+                "parent": { "id": comment_id(&parent)? },
+            }))
+        }
         ReviewDraftKind::InlineComment => {
             let anchor = draft.anchor.as_ref().ok_or_else(|| {
                 DiffyError::General("inline review draft is missing an anchor".to_owned())
@@ -203,9 +214,6 @@ pub(super) fn draft_comment(draft: &ReviewDraft) -> Result<Value> {
             }
             Ok(json!({ "content": { "raw": draft.body }, "inline": inline }))
         }
-        ReviewDraftKind::Reply { .. } => Err(DiffyError::General(
-            "reply drafts must be submitted through the review thread reply operation".to_owned(),
-        )),
     }
 }
 
@@ -238,7 +246,9 @@ fn posted_comment(value: &Value) -> PullRequestReviewThreadComment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::forge::model::PullRequestInfo;
+    use crate::core::forge::model::{
+        PullRequestInfo, PullRequestReviewData, PullRequestReviewThread,
+    };
     use crate::core::review::{ReviewAnchor, ReviewForge, ReviewLineRange, ReviewThreadId};
 
     fn session() -> ReviewSession {
@@ -254,7 +264,7 @@ mod tests {
     }
 
     fn body(session: &ReviewSession, id: ReviewDraftId) -> Value {
-        draft_comment(&session.drafts[&id]).unwrap()
+        draft_comment(session, &session.drafts[&id]).unwrap()
     }
 
     #[test]
@@ -285,11 +295,28 @@ mod tests {
     }
 
     #[test]
-    fn reply_drafts_are_not_posted_as_comments() {
+    fn replies_name_their_thread_root_as_parent() {
         let mut session = session();
-        let reply =
-            session.create_reply_draft(ReviewThreadId::remote(ReviewForge::Bitbucket, "7"), "Hi");
-        assert!(draft_comment(&session.drafts[&reply]).is_err());
+        session.apply_review_data(PullRequestReviewData {
+            threads: vec![PullRequestReviewThread {
+                id: "7".to_owned(),
+                path: "src/lib.rs".to_owned(),
+                line: Some(3),
+                side: Some(ReviewSide::New),
+                subject_type: "LINE".to_owned(),
+                ..PullRequestReviewThread::default()
+            }],
+            ..PullRequestReviewData::default()
+        });
+        let thread = |id: &str| ReviewThreadId::remote(ReviewForge::Bitbucket, id);
+        let reply = session.create_reply_draft(thread("7"), "Hi");
+        let orphan = session.create_reply_draft(thread("8"), "Lost");
+
+        assert_eq!(
+            body(&session, reply),
+            json!({ "content": { "raw": "Hi" }, "parent": { "id": 7 } })
+        );
+        assert!(draft_comment(&session, &session.drafts[&orphan]).is_err());
     }
 
     #[test]

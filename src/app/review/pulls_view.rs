@@ -572,7 +572,10 @@ impl Page<'_> {
         let scale = self.scale;
         let tc = &self.theme.colors;
         let home = dirs::home_dir();
-        match self.review.clone_path(self.slot.shared, &pull.repository) {
+        match self
+            .review
+            .clone_path(self.slot.shared, &pull.clone_label())
+        {
             Some(path) => {
                 let shown = match home
                     .as_deref()

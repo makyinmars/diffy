@@ -173,7 +173,7 @@ pub(super) enum Pending {
     Mutation,
     SubmitDrafts,
     Session,
-    Peek,
+    Peek(ReviewForge),
     Overview,
     Comment,
     Pulls(ReviewForge),
@@ -183,6 +183,19 @@ pub(super) enum Pending {
 struct InFlight {
     pr: Option<ReviewTarget>,
     kind: Pending,
+}
+
+impl InFlight {
+    /// The forge whose account the job runs under.
+    fn forge(&self) -> Option<ReviewForge> {
+        match (&self.pr, &self.kind) {
+            (Some(pr), _) => Some(pr.forge),
+            (None, Pending::User(forge) | Pending::Pulls(forge) | Pending::Peek(forge)) => {
+                Some(*forge)
+            }
+            (None, _) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -236,6 +249,7 @@ pub struct ReviewController {
     epoch: AccountEpoch,
     client_id: String,
     accounts: Accounts,
+    keyring_warned: bool,
     pub(super) overlay: Option<ReviewOverlay>,
     pending_url: Option<String>,
     pub(super) repo_path: Option<PathBuf>,
@@ -266,6 +280,7 @@ impl Default for ReviewController {
             epoch: AccountEpoch::default(),
             client_id: String::new(),
             accounts: Accounts::default(),
+            keyring_warned: false,
             overlay: None,
             pending_url: None,
             repo_path: None,
@@ -698,11 +713,9 @@ impl ReviewController {
         }
     }
 
+    /// In-flight membership guards responses: an account change drops only
+    /// its own forge's jobs, so a job from an older epoch can still land.
     fn accept(&mut self, scope: ReviewScope, keep: bool) -> Option<Pending> {
-        if scope.account != self.epoch {
-            self.in_flight.remove(&scope.request);
-            return None;
-        }
         let entry = if keep {
             self.in_flight.get(&scope.request).cloned()
         } else {
@@ -726,13 +739,36 @@ impl ReviewController {
         }
     }
 
-    fn bump_account(&mut self) -> Intent {
+    /// The account for `forge` changed: drop that forge's in-flight work and
+    /// listed pull requests. The other forge's work keeps running, and so
+    /// does a pasted token still being checked. Callers reload the pull
+    /// request list when it is showing.
+    fn account_changed(&mut self, forge: ReviewForge) -> Intent {
         self.epoch = AccountEpoch(self.epoch.0 + 1);
-        self.in_flight.clear();
-        self.overview.loading = false;
-        self.overview.request = None;
-        self.pulls.reset();
+        let flow = self.account(forge).flow;
+        self.in_flight.retain(|request, entry| {
+            Some(*request) == flow || entry.forge().is_some_and(|other| other != forge)
+        });
+        self.peeks
+            .retain(|pr, peek| pr.forge != forge || !matches!(peek, PeekState::Loading));
+        if self
+            .pr
+            .as_ref()
+            .is_some_and(|active| active.pr.forge == forge)
+        {
+            self.overview.loading = false;
+            self.overview.request = None;
+        }
+        self.pulls.forget(forge);
         Intent::AccountChanged
+    }
+
+    fn reload_pulls(&mut self) -> Reduction {
+        if self.pulls.open {
+            self.fetch_pulls()
+        } else {
+            Reduction::default()
+        }
     }
 
     fn save_session(&mut self) -> Option<ReviewEffect> {
@@ -1008,9 +1044,10 @@ impl ReviewController {
         self.close_overlay();
         reduction = reduction
             .effect(ReviewEffect::ClearToken(forge))
-            .intent(self.bump_account())
+            .intent(self.account_changed(forge))
             .intent(info(format!("Signed out of {}.", forge.name())));
         reduction.merge(self.publish_user(cx, forge, None));
+        reduction.merge(self.reload_pulls());
         reduction
     }
 
@@ -1327,20 +1364,20 @@ impl ReviewController {
             .filter(|draft| !draft.body.trim().is_empty() && Some(draft.id) != composing)
             .map(|draft| (draft.id, draft.kind.clone(), draft.body.clone()))
             .collect();
-        let batch: Vec<ReviewDraftId> = pending
-            .iter()
-            .filter(|(_, kind, _)| !matches!(kind, ReviewDraftKind::Reply { .. }))
-            .map(|(id, _, _)| *id)
-            .collect();
-        let replies: Vec<(ReviewDraftId, ReviewThreadId, String)> = pending
-            .iter()
-            .filter_map(|(id, kind, body)| match kind {
-                ReviewDraftKind::Reply { thread_id } => {
-                    Some((*id, thread_id.clone(), body.clone()))
+        // Bitbucket posts replies in the same paced loop as the other drafts.
+        let replies_apart = pr.forge != ReviewForge::Bitbucket;
+        let mut batch: Vec<ReviewDraftId> = Vec::new();
+        let mut replies: Vec<(ReviewDraftId, ReviewThreadId, String)> = Vec::new();
+        for (id, kind, body) in &pending {
+            match kind {
+                ReviewDraftKind::Reply { thread_id }
+                    if replies_apart || session.thread_remote_id(thread_id).is_none() =>
+                {
+                    replies.push((*id, thread_id.clone(), body.clone()));
                 }
-                _ => None,
-            })
-            .collect();
+                _ => batch.push(*id),
+            }
+        }
         if batch.is_empty() && replies.is_empty() && decision == ReviewDecision::Comment {
             return Reduction::changed().intent(info("There are no pending comments to submit."));
         }
@@ -1564,7 +1601,7 @@ impl ReviewController {
         }
         let mut reduction = Reduction::changed()
             .effect(ReviewEffect::SaveToken { forge, token })
-            .intent(self.bump_account())
+            .intent(self.account_changed(forge))
             .intent(info(format!("Signed in to {}.", forge.name())));
         reduction.merge(self.load_pending());
         if self
@@ -1579,6 +1616,7 @@ impl ReviewController {
                 reduction = reduction.effect(effect);
             }
         }
+        reduction.merge(self.reload_pulls());
         reduction
     }
 
@@ -1615,13 +1653,23 @@ impl ReviewController {
                     return Reduction::default();
                 };
                 let mut reduction = Reduction::changed();
-                if self.account(forge).flow == Some(scope.request) {
+                let verified = self.account(forge).flow == Some(scope.request);
+                if verified {
                     reduction.merge(self.token_verified(forge));
                 }
                 let previous = self.account(forge).user.as_ref().map(|u| u.login.clone());
-                if previous.is_some_and(|login| login != user.login) && self.pr.is_some() {
+                if previous.is_some_and(|login| login != user.login)
+                    && self
+                        .pr
+                        .as_ref()
+                        .is_some_and(|active| active.pr.forge == forge)
+                {
                     reduction.merge(self.close_pull_request());
-                    reduction = reduction.intent(self.bump_account());
+                    // A verified sign-in already reset the account.
+                    if !verified {
+                        reduction = reduction.intent(self.account_changed(forge));
+                        reduction.merge(self.reload_pulls());
+                    }
                 }
                 let account = self.accounts.get_mut(forge);
                 if let Some(url) = avatar_url_sized(&user.avatar_url, ACCOUNT_AVATAR_PX)
@@ -1791,9 +1839,19 @@ impl ReviewController {
                 self.after_mutation(true)
             }
             ForgeResponse::CommentUpdateFailed { message, .. }
-            | ForgeResponse::CommentDeleteFailed { message, .. }
-            | ForgeResponse::ThreadResolutionChangeFailed { message, .. } => {
+            | ForgeResponse::CommentDeleteFailed { message, .. } => {
                 Reduction::changed().intent(error(message))
+            }
+            // Bitbucket refuses to reopen a thread someone already reopened
+            // (and to resolve a deleted one); reload what the thread is now.
+            ForgeResponse::ThreadResolutionChangeFailed { pr, message, .. } => {
+                let mut reduction = Reduction::changed().intent(error(message));
+                if pr.forge == ReviewForge::Bitbucket
+                    && let Some(effect) = self.fetch_review()
+                {
+                    reduction = reduction.effect(effect);
+                }
+                reduction
             }
             ForgeResponse::PullRequestPeeked { pr, info } => {
                 self.peeks.insert(pr, PeekState::Ready(Box::new(info)));
@@ -2105,7 +2163,7 @@ impl ReviewController {
                 }
                 let mut reduction = Reduction::changed()
                     .effect(ReviewEffect::SaveToken { forge, token })
-                    .intent(self.bump_account())
+                    .intent(self.account_changed(forge))
                     .intent(info("GitHub authentication completed."));
                 reduction.merge(self.fetch_user(forge));
                 reduction.merge(self.load_pending());
@@ -2119,29 +2177,40 @@ impl ReviewController {
                 {
                     reduction = reduction.effect(effect);
                 }
-                if self.pulls.open {
-                    reduction.merge(self.fetch_pulls());
-                }
+                reduction.merge(self.reload_pulls());
                 reduction
             }
+            // A sign-in or sign-out that settled the account first wins over
+            // the startup keyring read.
             ReviewEvent::TokenLoaded { forge, token } => {
                 let account = self.accounts.get_mut(forge);
+                if account.token_loaded {
+                    return Reduction::default();
+                }
                 account.token_loaded = true;
                 account.token = token.filter(|token| !token.is_empty());
+                let loaded = account.token.is_some();
                 let mut reduction = Reduction::changed();
                 reduction.merge(self.fetch_user(forge));
                 reduction.merge(self.load_pending());
-                if self.pulls.open && self.pulls.data.is_none() && !self.pulls.loading {
+                if self.pulls.open && (loaded || (self.pulls.data.is_none() && !self.pulls.loading))
+                {
                     reduction.merge(self.fetch_pulls());
                 }
                 reduction
             }
             ReviewEvent::TokenLoadFailed { forge, message } => {
                 let account = self.accounts.get_mut(forge);
+                if account.token_loaded {
+                    return Reduction::default();
+                }
                 account.token_loaded = true;
                 account.token = None;
-                let mut reduction =
-                    Reduction::changed().intent(error(format!("Keyring unavailable: {message}")));
+                let mut reduction = Reduction::changed();
+                // Every forge reads the same keyring; one warning covers them.
+                if !std::mem::replace(&mut self.keyring_warned, true) {
+                    reduction = reduction.intent(error(format!("Keyring unavailable: {message}")));
+                }
                 reduction.merge(self.load_pending());
                 reduction
             }
@@ -2377,7 +2446,7 @@ impl ReviewController {
             return Reduction::default();
         }
         self.peeks.insert(pr.clone(), PeekState::Loading);
-        let scope = self.job(None, Pending::Peek);
+        let scope = self.job(None, Pending::Peek(pr.forge));
         let token = self.token(pr.forge);
         Reduction::changed().effect(ReviewEffect::Forge {
             scope,
@@ -2732,7 +2801,7 @@ impl CommandSource for ReviewController {
             CommandDescriptor::new(
                 "review.sign_in",
                 "Sign in to GitHub",
-                ReviewAction::OpenAuthModal,
+                ReviewAction::OpenSignIn(ReviewForge::GitHub),
             )
         });
         out.push(if self.signed_in(ReviewForge::Bitbucket) {

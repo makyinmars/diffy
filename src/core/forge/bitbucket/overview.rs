@@ -31,7 +31,7 @@ impl BitbucketApi {
         )?;
         let commits = transport::get_pages(
             credentials,
-            &pull_request_url(pr, "/commits"),
+            &pull_request_url(pr, "/commits?pagelen=100"),
             "Bitbucket commits fetch",
         )
         .unwrap_or_else(|error| {
@@ -64,7 +64,7 @@ pub(super) fn parse_overview(value: &Value) -> PullRequestOverview {
         _ => "CLOSED",
     };
     let author = actor(value.get("author"));
-    let reviewers = reviewers(value, &author.login);
+    let reviewers = reviewers(value);
     let decision = if reviewers.iter().any(|r| r.state == "CHANGES_REQUESTED") {
         Some("CHANGES_REQUESTED")
     } else if reviewers.iter().any(|r| r.state == "APPROVED") {
@@ -103,57 +103,57 @@ pub(super) fn parse_overview(value: &Value) -> PullRequestOverview {
 }
 
 /// Requested reviewers and anyone who approved, requested changes or
-/// commented, without the author and without repeats.
-pub(super) fn reviewers(value: &Value, author: &str) -> Vec<PullRequestReviewer> {
+/// commented, without the author and without repeats. People are matched by
+/// account uuid: nicknames are display names and need not be unique.
+pub(super) fn reviewers(value: &Value) -> Vec<PullRequestReviewer> {
+    let author = identity(value.get("author"));
+    let mut seen: Vec<String> = Vec::new();
     let mut reviewers: Vec<PullRequestReviewer> = Vec::new();
     let participants = value
         .get("participants")
         .and_then(Value::as_array)
         .into_iter()
-        .flatten();
-    for participant in participants {
-        let actor = actor(participant.get("user"));
-        let reviewer = str_at(participant, "/role") == "REVIEWER";
-        let state = match participant.get("state").and_then(Value::as_str) {
-            Some("approved") => "APPROVED",
-            Some("changes_requested") => "CHANGES_REQUESTED",
-            _ if reviewer => "REQUESTED",
-            _ => "COMMENTED",
-        };
-        if actor.login.is_empty()
-            || actor.login == author
-            || reviewers
-                .iter()
-                .any(|known| known.actor.login == actor.login)
-        {
+        .flatten()
+        .map(|participant| {
+            let state = match participant.get("state").and_then(Value::as_str) {
+                Some("approved") => "APPROVED",
+                Some("changes_requested") => "CHANGES_REQUESTED",
+                _ if str_at(participant, "/role") == "REVIEWER" => "REQUESTED",
+                _ => "COMMENTED",
+            };
+            (participant.get("user"), state)
+        });
+    let requested = value
+        .get("reviewers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|account| (Some(account), "REQUESTED"));
+    for (account, state) in participants.chain(requested) {
+        let actor = actor(account);
+        let id = identity(account);
+        if actor.login.is_empty() || id.is_empty() || id == author || seen.contains(&id) {
             continue;
         }
+        seen.push(id);
         reviewers.push(PullRequestReviewer {
             actor,
             state: state.to_owned(),
         });
     }
-    let requested = value
-        .get("reviewers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten();
-    for account in requested {
-        let actor = actor(Some(account));
-        if actor.login.is_empty()
-            || actor.login == author
-            || reviewers
-                .iter()
-                .any(|known| known.actor.login == actor.login)
-        {
-            continue;
-        }
-        reviewers.push(PullRequestReviewer {
-            actor,
-            state: "REQUESTED".to_owned(),
-        });
-    }
     reviewers
+}
+
+/// Who an account is: its uuid, else its account id, else its name.
+fn identity(account: Option<&Value>) -> String {
+    let Some(account) = account.filter(|account| !account.is_null()) else {
+        return String::new();
+    };
+    ["/uuid", "/account_id"]
+        .into_iter()
+        .map(|pointer| str_at(account, pointer))
+        .find(|value| !value.is_empty() && value != "{}")
+        .unwrap_or_else(|| login(Some(account)))
 }
 
 /// Build statuses on the pull request's head commit, newest per key.
@@ -233,8 +233,17 @@ pub(super) fn timeline(
     commits: &[Value],
     url: &str,
 ) -> Vec<PullRequestTimelineItem> {
+    let comments: Vec<&Value> = activity
+        .iter()
+        .filter_map(|entry| entry.get("comment"))
+        .collect();
     let mut items: Vec<PullRequestTimelineItem> = activity
         .iter()
+        .filter(|entry| {
+            entry
+                .get("comment")
+                .is_none_or(|comment| in_conversation(comment, &comments))
+        })
         .filter_map(|entry| activity_item(entry, url))
         .chain(commits.iter().filter_map(commit_item))
         .collect();
@@ -242,15 +251,36 @@ pub(super) fn timeline(
     items
 }
 
+/// Whether a comment belongs to the conversation: published, not deleted,
+/// and not part of an inline thread. Replies may omit `inline`, so the
+/// thread root decides. Pending comments are an unfinished web review.
+fn in_conversation(comment: &Value, comments: &[&Value]) -> bool {
+    let flag =
+        |comment: &Value, key: &str| comment.get(key).and_then(Value::as_bool).unwrap_or(false);
+    if flag(comment, "deleted") || flag(comment, "pending") {
+        return false;
+    }
+    let mut current = comment;
+    for _ in 0..64 {
+        if current.get("inline").is_some_and(Value::is_object) {
+            return false;
+        }
+        let Some(parent) = current.pointer("/parent/id").and_then(Value::as_i64) else {
+            return true;
+        };
+        match comments
+            .iter()
+            .find(|known| known.get("id").and_then(Value::as_i64) == Some(parent))
+        {
+            Some(known) => current = known,
+            None => return true,
+        }
+    }
+    true
+}
+
 fn activity_item(entry: &Value, url: &str) -> Option<PullRequestTimelineItem> {
     if let Some(comment) = entry.get("comment") {
-        let deleted = comment
-            .get("deleted")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if deleted || comment.get("inline").is_some_and(Value::is_object) {
-            return None;
-        }
         return Some(PullRequestTimelineItem {
             id: comment.get("id").map(Value::to_string).unwrap_or_default(),
             kind: PullRequestTimelineKind::Comment,
@@ -336,11 +366,15 @@ mod tests {
     use super::*;
 
     fn user(nickname: &str) -> Value {
+        user_with_uuid(nickname, &format!("{{{nickname}}}"))
+    }
+
+    fn user_with_uuid(nickname: &str, uuid: &str) -> Value {
         json!({
             "type": "user",
             "display_name": nickname.to_uppercase(),
             "nickname": nickname,
-            "uuid": format!("{{{nickname}}}"),
+            "uuid": uuid,
             "links": { "avatar": { "href": format!("https://avatar.example/{nickname}") } }
         })
     }
@@ -363,7 +397,9 @@ mod tests {
                 { "user": user("bob"), "role": "REVIEWER", "approved": false, "state": "changes_requested" },
                 { "user": user("dee"), "role": "PARTICIPANT", "approved": true, "state": "approved" },
                 { "user": user("eve"), "role": "PARTICIPANT", "approved": false, "state": null },
-                { "user": user("ada"), "role": "PARTICIPANT", "approved": false, "state": null }
+                { "user": user("ada"), "role": "PARTICIPANT", "approved": false, "state": null },
+                { "user": user_with_uuid("ada", "{other-ada}"), "role": "REVIEWER", "approved": true, "state": "approved" },
+                { "user": user("bob"), "role": "REVIEWER", "approved": false, "state": null }
             ]
         });
 
@@ -388,6 +424,7 @@ mod tests {
                 ("bob", "CHANGES_REQUESTED"),
                 ("dee", "APPROVED"),
                 ("eve", "COMMENTED"),
+                ("ada", "APPROVED"),
                 ("cy", "REQUESTED")
             ]
         );
@@ -463,6 +500,12 @@ mod tests {
                     "inline": { "path": "a.rs", "to": 1 }, "created_on": "2026-10-03T00:00:01+00:00" } }),
             json!({ "comment": { "id": 11, "deleted": true, "content": { "raw": "" }, "user": user("cy"),
                     "created_on": "2026-10-03T00:00:02+00:00" } }),
+            json!({ "comment": { "id": 12, "parent": { "id": 10 }, "content": { "raw": "Inline reply" },
+                    "user": user("dee"), "created_on": "2026-10-03T00:00:03+00:00" } }),
+            json!({ "comment": { "id": 13, "pending": true, "content": { "raw": "Draft" },
+                    "user": user("dee"), "created_on": "2026-10-03T00:00:04+00:00" } }),
+            json!({ "comment": { "id": 14, "parent": { "id": 9 }, "content": { "raw": "Agreed" },
+                    "user": user("dee"), "created_on": "2026-10-03T00:00:05+00:00" } }),
             json!({ "approval": { "date": "2026-10-04T00:00:00+00:00", "user": user("dee") } }),
             json!({ "changes_requested": { "date": "2026-10-05T00:00:00+00:00", "user": user("bob") } }),
             json!({ "update": { "state": "OPEN", "date": "2026-10-01T00:00:00+00:00", "author": user("ada") } }),
@@ -495,6 +538,7 @@ mod tests {
                     "Ada Lovelace"
                 ),
                 (&PullRequestTimelineKind::Comment, "cy"),
+                (&PullRequestTimelineKind::Comment, "dee"),
                 (
                     &PullRequestTimelineKind::Review {
                         state: "APPROVED".to_owned(),
@@ -514,7 +558,7 @@ mod tests {
         assert_eq!(items[0].body, "Add widget");
         assert_eq!(items[1].body, "Looks fine");
         assert_eq!(
-            items[2].url,
+            items[3].url,
             "https://bitbucket.org/acme/widgets/pull-requests/5"
         );
     }

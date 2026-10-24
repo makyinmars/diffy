@@ -254,16 +254,25 @@ impl PullsPage {
             .is_none_or(|at| now_secs().saturating_sub(at) > STALE_SECS)
     }
 
-    pub(super) fn reset(&mut self) {
+    /// Drop what `forge`'s account listed and cancel the listing in flight;
+    /// the other forge's rows stay until the next listing replaces them.
+    pub(super) fn forget(&mut self, forge: ReviewForge) {
         self.loading = false;
         self.requests.clear();
         self.gathered.clear();
         self.forges_answered = 0;
         self.failures.clear();
-        self.data = None;
-        self.sections = Rc::from([]);
         self.error = None;
         self.fetched_at = None;
+        self.data = self.data.take().and_then(|data| {
+            let kept: Vec<MyPullRequest> = data
+                .iter()
+                .filter(|pull| pull.forge != forge)
+                .cloned()
+                .collect();
+            (!kept.is_empty()).then(|| kept.into())
+        });
+        self.regroup();
     }
 }
 

@@ -43,14 +43,29 @@ impl BitbucketApi {
         }
         let selected = user.uuid.replace('{', "%7B").replace('}', "%7D");
         let mut pulls = Vec::new();
-        for slug in slugs {
+        let mut listed = 0;
+        let mut first_error = None;
+        for slug in &slugs {
             let url = format!(
                 "{API_ROOT}/workspaces/{slug}/pullrequests/{selected}?state=OPEN&pagelen=50&fields=%2Bvalues.participants,%2Bvalues.reviewers"
             );
             match transport::get_pages(credentials, &url, "Bitbucket pull requests fetch") {
-                Ok(values) => pulls.extend(values.iter().map(parse_pull)),
-                Err(error) => tracing::warn!(workspace = slug, "bitbucket: {error}"),
+                Ok(values) => {
+                    listed += 1;
+                    pulls.extend(values.iter().map(parse_pull));
+                }
+                Err(error) => {
+                    tracing::warn!(workspace = slug, "bitbucket: {error}");
+                    first_error.get_or_insert(error);
+                }
             }
+        }
+        // A workspace that fails while others list is skipped; when none
+        // list (a token without read:pullrequest, a rate limit) say why.
+        if listed == 0
+            && let Some(error) = first_error
+        {
+            return Err(error);
         }
         pulls.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(pulls)
@@ -58,8 +73,7 @@ impl BitbucketApi {
 }
 
 pub(super) fn parse_pull(value: &Value) -> MyPullRequest {
-    let author = super::api::login(value.get("author"));
-    let reviewers = reviewers(value, &author);
+    let reviewers = reviewers(value);
     let decision = if reviewers.iter().any(|r| r.state == "CHANGES_REQUESTED") {
         Some("CHANGES_REQUESTED")
     } else if reviewers.iter().any(|r| r.state == "APPROVED") {

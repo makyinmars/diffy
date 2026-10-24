@@ -1648,9 +1648,10 @@ impl GitService {
     }
 
     /// The forge the repository's remotes point at, `origin` first, read
-    /// from the loaded config without spawning git.
+    /// without spawning git. The config is re-read because remotes change
+    /// while the repository stays open; the open repository caches it.
     pub fn remote_forge(&self) -> Option<ReviewForge> {
-        let repo = self.repo().ok()?;
+        let repo = gix::open(self.repo_path_ref().ok()?).ok()?;
         let config = repo.config_snapshot();
         let mut names: Vec<String> = repo
             .remote_names()
@@ -1913,7 +1914,10 @@ impl GitService {
 
     /// Bitbucket Cloud has no pull request refs, so fetch the destination
     /// branch from the destination repository and the source branch from the
-    /// source repository, which may be a fork.
+    /// source repository, which may be a fork. The refs are then pinned to
+    /// the commits the pull request names when git has them: a merged pull
+    /// request's destination branch already contains its source, and a
+    /// deleted source branch or fork leaves only those commits.
     fn resolve_bitbucket_comparison(
         &self,
         target: &ReviewTarget,
@@ -1922,12 +1926,16 @@ impl GitService {
         let total_started = Instant::now();
         let repo_path = self.repo_path_ref()?;
         let forge = ReviewForge::Bitbucket;
-        let head_repo = parse_remote(&info.head_repo_url)
-            .filter(|repo| repo.forge == forge)
-            .map_or_else(
-                || (target.owner.clone(), target.repo.clone()),
-                |repo| (repo.owner, repo.repo),
-            );
+        // No source repository means the fork was deleted.
+        let head_source = (!info.head_repo_url.is_empty()).then(|| {
+            let (owner, repo) = parse_remote(&info.head_repo_url)
+                .filter(|repo| repo.forge == forge)
+                .map_or_else(
+                    || (target.owner.clone(), target.repo.clone()),
+                    |repo| (repo.owner, repo.repo),
+                );
+            fetch_source_for_repo(repo_path, forge, &owner, &repo, &info.head_repo_url)
+        });
         let base_source = fetch_source_for_repo(
             repo_path,
             forge,
@@ -1935,37 +1943,57 @@ impl GitService {
             &target.repo,
             &info.base_repo_url,
         );
-        let head_source = fetch_source_for_repo(
-            repo_path,
-            forge,
-            &head_repo.0,
-            &head_repo.1,
-            &info.head_repo_url,
-        );
         let base_target = pr_ref_path(forge, target.number, PrRefSide::Base, &info.base_branch);
         let head_target = pr_ref_path(forge, target.number, PrRefSide::Head, &info.head_branch);
-        let base_refspec = (!self.ref_matches_oid(&base_target, &info.base_sha))
-            .then(|| format!("+refs/heads/{}:{base_target}", info.base_branch));
-        let head_refspec = (!self.ref_matches_oid(&head_target, &info.head_sha))
-            .then(|| format!("+refs/heads/{}:{head_target}", info.head_branch));
-        match (base_refspec, head_refspec) {
-            (None, None) => tracing::info!(
+        let base_refspec = format!("+refs/heads/{}:{base_target}", info.base_branch);
+        let head_refspec = format!("+refs/heads/{}:{head_target}", info.head_branch);
+        let need_base = !self.ref_matches_oid(&base_target, &info.base_sha);
+        let need_head = !self.ref_matches_oid(&head_target, &info.head_sha);
+        if !need_base && !need_head {
+            tracing::info!(
                 owner = %target.owner,
                 repo = %target.repo,
                 number = target.number,
                 "bitbucket-pr: cached refs are current"
-            ),
-            (Some(base), Some(head)) if base_source == head_source => {
-                self.fetch_refspecs(&base_source, &[base, head])?;
+            );
+        }
+        let mut head_fetched = !need_head;
+        if need_base && need_head && head_source.as_deref() == Some(base_source.as_str()) {
+            head_fetched = self
+                .fetch_refspecs(&base_source, &[base_refspec.clone(), head_refspec.clone()])
+                .is_ok();
+            if !head_fetched {
+                self.fetch_refspecs(&base_source, &[base_refspec])?;
             }
-            (base, head) => {
-                if let Some(base) = base {
-                    self.fetch_refspecs(&base_source, &[base])?;
-                }
-                if let Some(head) = head {
-                    self.fetch_refspecs(&head_source, &[head])?;
-                }
+        } else {
+            if need_base {
+                self.fetch_refspecs(&base_source, &[base_refspec])?;
             }
+            if need_head && let Some(source) = &head_source {
+                head_fetched = match self.fetch_refspecs(source, &[head_refspec]) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!("bitbucket-pr: source branch fetch failed: {error}");
+                        false
+                    }
+                };
+            }
+        }
+        self.pin_ref(&base_target, &info.base_sha);
+        if !head_fetched && !self.pin_ref(&head_target, &info.head_sha) {
+            return Err(git_error(
+                "pull request fetch",
+                match head_source {
+                    None => format!(
+                        "the source repository of pull request #{} was deleted, and its commits are not in this clone",
+                        target.number
+                    ),
+                    Some(_) => format!(
+                        "the source branch {} could not be fetched, and commit {} is not in this clone",
+                        info.head_branch, info.head_sha
+                    ),
+                },
+            ));
         }
         info.base_sha = self.full_oid(&base_target, &info.base_sha)?;
         info.head_sha = self.full_oid(&head_target, &info.head_sha)?;
@@ -1983,6 +2011,33 @@ impl GitService {
             &head_target,
         );
         Ok((info, base_target, head_target))
+    }
+
+    /// Point `reference` at the commit an abbreviated hash names, when that
+    /// commit is in the repository. Returns whether the ref now names it.
+    fn pin_ref(&self, reference: &str, oid: &str) -> bool {
+        let oid = oid.trim();
+        if oid.len() < 7 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+        let Ok(repo_path) = self.repo_path_ref() else {
+            return false;
+        };
+        let Ok(commit) = resolve_commit_oid_at(repo_path, oid) else {
+            return false;
+        };
+        if resolve_commit_oid_at(repo_path, reference).is_ok_and(|current| current == commit) {
+            return true;
+        }
+        run_system_git(
+            repo_path,
+            &[
+                OsString::from("update-ref"),
+                OsString::from(reference),
+                OsString::from(&commit),
+            ],
+        )
+        .is_ok()
     }
 
     /// The full oid behind `reference` when `api_oid` is abbreviated. A
@@ -3229,6 +3284,80 @@ mod tests {
         drop(fork);
         let (again, _, _) = git.resolve_pull_request_comparison(&target, info).unwrap();
         assert_eq!(again.head_sha, head_oid);
+    }
+
+    #[test]
+    fn merged_bitbucket_pull_requests_diff_the_recorded_commits_after_the_branch_is_gone() {
+        let upstream = TempDir::new().unwrap();
+        Repository::init_bare(upstream.path()).unwrap();
+        let seed_dir = TempDir::new().unwrap();
+        let seed = Repository::init(seed_dir.path()).unwrap();
+        let base_oid = commit_file(&seed, "a.txt", "base\n", "base");
+        let head_oid = commit_file(&seed, "a.txt", "head\n", "head");
+        // Fast-forward merged: main now holds the source commit, and the
+        // source branch was closed on merge.
+        seed.remote("origin", upstream.path().to_str().unwrap())
+            .unwrap()
+            .push::<&str>(&["+HEAD:refs/heads/main"], None)
+            .unwrap();
+        let local_dir = TempDir::new().unwrap();
+        let local = Repository::init(local_dir.path()).unwrap();
+        commit_file(&local, "README.md", "local\n", "local");
+        local
+            .config()
+            .unwrap()
+            .set_str(
+                &format!("url.{}.insteadOf", upstream.path().display()),
+                "https://bitbucket.org/acme/widgets.git",
+            )
+            .unwrap();
+        let mut git = GitService::new();
+        git.open(local_dir.path().to_str().unwrap()).unwrap();
+        let target = ReviewTarget {
+            forge: BITBUCKET,
+            owner: "acme".to_owned(),
+            repo: "widgets".to_owned(),
+            number: 9,
+        };
+        let info = PullRequestInfo {
+            number: 9,
+            merged: true,
+            base_branch: "main".to_owned(),
+            head_branch: "feature".to_owned(),
+            base_sha: base_oid[..12].to_owned(),
+            head_sha: head_oid[..12].to_owned(),
+            base_repo_url: "https://bitbucket.org/acme/widgets.git".to_owned(),
+            head_repo_url: "https://bitbucket.org/acme/widgets.git".to_owned(),
+            ..PullRequestInfo::default()
+        };
+
+        let (resolved, left, right) = git
+            .resolve_pull_request_comparison(&target, info.clone())
+            .unwrap();
+
+        assert_eq!(git.resolve_commit_oid(&left).unwrap(), base_oid);
+        assert_eq!(git.resolve_commit_oid(&right).unwrap(), head_oid);
+        assert_eq!(
+            (resolved.base_sha, resolved.head_sha),
+            (base_oid, head_oid.clone())
+        );
+
+        let gone = PullRequestInfo {
+            number: 10,
+            head_repo_url: String::new(),
+            head_sha: "0123456789ab".to_owned(),
+            ..info
+        };
+        let error = git
+            .resolve_pull_request_comparison(
+                &ReviewTarget {
+                    number: 10,
+                    ..target
+                },
+                gone,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("source repository"), "{error}");
     }
 
     fn make_remote_and_clone() -> (TempDir, TempDir) {

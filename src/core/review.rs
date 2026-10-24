@@ -377,12 +377,13 @@ pub struct ReviewReactionGroup {
 pub struct ReviewComment {
     pub id: ReviewCommentId,
     pub backend_id: Option<i64>,
-    /// The forge's id for edits and deletes, when it can be changed.
-    #[serde(alias = "backend_node_id")]
+    /// The forge's id for edits and deletes, when it can be changed. Saved
+    /// under its original name so older builds still read sessions.
+    #[serde(rename = "backend_node_id")]
     pub remote_id: Option<String>,
     pub thread_id: ReviewThreadId,
     pub in_reply_to: Option<ReviewCommentId>,
-    #[serde(alias = "in_reply_to_node_id")]
+    #[serde(rename = "in_reply_to_node_id")]
     pub in_reply_to_remote_id: Option<String>,
     pub author_login: Option<String>,
     #[serde(default)]
@@ -517,7 +518,7 @@ pub struct ReviewThreadPermissions {
 pub struct ReviewThread {
     pub id: ReviewThreadId,
     /// The forge's id for replies and resolution, when it tracks threads.
-    #[serde(alias = "backend_node_id")]
+    #[serde(rename = "backend_node_id")]
     pub remote_id: Option<String>,
     pub anchor: Option<ReviewAnchor>,
     pub comments: Vec<ReviewComment>,

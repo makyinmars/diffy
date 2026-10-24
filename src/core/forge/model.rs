@@ -76,7 +76,9 @@ pub struct PullRequestReviewComment {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullRequestReviewMetadata {
-    #[serde(alias = "node_id")]
+    // Saved sessions keep GitHub's original field names so older builds
+    // still read them.
+    #[serde(rename = "node_id")]
     pub id: String,
     pub url: String,
     pub review_decision: Option<String>,
@@ -135,9 +137,9 @@ pub struct PullRequestCheckContext {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullRequestReviewSummary {
-    #[serde(alias = "node_id")]
+    #[serde(rename = "node_id")]
     pub id: String,
-    #[serde(alias = "database_id")]
+    #[serde(rename = "database_id")]
     pub numeric_id: Option<i64>,
     pub state: String,
     pub body: String,

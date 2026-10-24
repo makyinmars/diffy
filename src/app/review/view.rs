@@ -25,7 +25,7 @@ use crate::core::review::{ReviewDecision, ReviewForge};
 const CARD_MAX_WIDTH: f32 = 600.0;
 const ATLASSIAN_API_TOKENS_URL: &str =
     "https://id.atlassian.com/manage-profile/security/api-tokens";
-const BITBUCKET_SCOPES: &str = "read:user:bitbucket, read:repository:bitbucket, read:pullrequest:bitbucket, write:pullrequest:bitbucket";
+const BITBUCKET_SCOPES: &str = "read:user:bitbucket, read:workspace:bitbucket, read:repository:bitbucket, read:pullrequest:bitbucket, write:pullrequest:bitbucket";
 const ACCOUNT_MENU_WIDTH: f32 = 260.0;
 const REVIEWER_STACK_MAX: usize = 4;
 
