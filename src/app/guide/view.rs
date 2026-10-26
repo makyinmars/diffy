@@ -7,7 +7,7 @@ use quark_ui::icons::lucide;
 use quark_ui::style::Styled;
 use quark_ui::theme::Theme;
 
-use super::state::{Blocked, GuideController, Status};
+use super::state::{Blocked, GuideController, Status, step_key};
 use crate::app::shell::Slot;
 use crate::app::tokens::{self, Ico, Rad, Sp, TextStyle};
 use crate::contracts::commands::{CommandsAction, SettingsSection};
@@ -145,11 +145,7 @@ impl Panel<'_> {
             });
         }
         let position = selected.map(|hunk| {
-            let label = if step.anchors.len() == 1 {
-                "1 place".to_owned()
-            } else {
-                format!("{} of {}", hunk + 1, step.anchors.len())
-            };
+            let label = format!("{} of {}", hunk + 1, step.anchors.len());
             view! { scale,
                 <div class="shrink-0" test_id="guide.position">
                     <text size={Px(small)} class="whitespace-nowrap" color={tc.text_accent}>{label}</text>
@@ -187,7 +183,8 @@ impl Panel<'_> {
                  aria-label={label}
                  aria-description={description}
                  aria-selected={is_selected}
-                 test_id={format!("guide.step.{index}")}
+                 key={step_key(index)}
+                 test_id={step_key(index)}
                  on:click={GuideAction::SelectStep(index)}>
                 <div class="flex-row items-center w-full" gap={Sp::SM}>
                     <div class="shrink-0">{badge(number).variant(variant)}</div>

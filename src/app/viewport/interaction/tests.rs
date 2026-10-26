@@ -986,7 +986,7 @@ fn guide_reveals_reach_a_line_and_wait_for_files_that_are_not_loaded() {
             intent,
             Intent::SelectFile(Some(SelectedFile {
                 key: FileKey(2),
-                origin: SelectionOrigin::Command
+                origin: SelectionOrigin::Viewport
             }))
         )
     });

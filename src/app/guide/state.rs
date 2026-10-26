@@ -1,14 +1,13 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use quark_ui::element::ScrollHandle;
+use quark_ui::element::{ScrollAlign, ScrollHandle};
 
 use crate::contracts::commands::{CommandDescriptor, CommandSource, ToastUpdate};
 use crate::contracts::guide::{
     ChangedFile, Guide, GuideAction, GuideAnchor, GuideEffect, GuideEvent, GuideRequest,
-    GuideSubject, HunkSide,
+    GuideSubject, HunkSide, HunkSpot,
 };
-use crate::contracts::navigation::{SelectedFile, SelectionOrigin};
 use crate::contracts::shared::{JobId, SharedContext, Side, SourceTarget};
 use crate::contracts::shell::{Controller, Intent, Reduction};
 use crate::contracts::viewport::pipeline::ManifestFile;
@@ -224,6 +223,8 @@ impl GuideController {
         };
         self.step = step;
         self.hunk = hunk;
+        self.scroll
+            .scroll_to_item(&step_key(step), ScrollAlign::Nearest);
         let reduction = Reduction::changed();
         match reveal(&anchor, cx) {
             Some(intent) => reduction.intent(intent),
@@ -272,6 +273,11 @@ impl GuideController {
     fn finish(&mut self, job: JobId) -> bool {
         matches!(self.status, Status::Generating { job: current, .. } if current == job)
     }
+}
+
+/// The sibling key of a step's card, so the panel can scroll it into view.
+pub fn step_key(step: usize) -> String {
+    format!("guide.step.{step}")
 }
 
 fn derive(cx: &SharedContext) -> Result<Target, Blocked> {
@@ -343,21 +349,19 @@ fn reveal(anchor: &GuideAnchor, cx: &SharedContext) -> Option<Intent> {
         file.paths.display_path() == anchor.path
             || file.paths.old_path().is_some_and(|old| old == anchor.path)
     })?;
-    Some(match anchor.hunk {
-        Some(spot) => Intent::RevealSource(SourceTarget {
-            file: file.key,
-            revision: file.revision,
-            side: match spot.side {
-                HunkSide::Old => Side::Old,
-                HunkSide::New => Side::New,
-            },
-            lines: spot.line..spot.line + 1,
-        }),
-        None => Intent::SelectFile(Some(SelectedFile {
-            key: file.key,
-            origin: SelectionOrigin::Command,
-        })),
-    })
+    let (side, lines) = match anchor.hunk {
+        Some(HunkSpot { side, line }) => (side, line..line + 1),
+        None => (HunkSide::New, 0..0),
+    };
+    Some(Intent::RevealSource(SourceTarget {
+        file: file.key,
+        revision: file.revision,
+        side: match side {
+            HunkSide::Old => Side::Old,
+            HunkSide::New => Side::New,
+        },
+        lines,
+    }))
 }
 
 impl Controller for GuideController {

@@ -983,8 +983,9 @@ impl InteractionController {
         reduction
     }
 
-    /// Reveals a line for the guide. A file that isn't loaded yet is shown
-    /// and selected so the pipeline loads it; the line follows on install.
+    /// Reveals a line for the guide, or the file itself for an empty range.
+    /// A file that isn't loaded yet is shown and selected so the pipeline
+    /// loads it; the line follows on install.
     fn reveal_guided(&mut self, target: &SourceTarget) -> Reduction {
         let point = SourcePoint {
             file: target.file,
@@ -992,11 +993,12 @@ impl InteractionController {
             line: target.lines.start,
             byte: 0,
         };
-        if let Some(reduction) = self.reveal_source(point) {
+        let line = !target.lines.is_empty();
+        if line && let Some(reduction) = self.reveal_source(point) {
             self.guided = None;
             return self.follow(reduction, false);
         }
-        self.guided = Some(point);
+        self.guided = line.then_some(point);
         let solo = self.sync_solo(Some(point.file));
         let revealed = self.reveal_file(point.file);
         Reduction {
@@ -1005,7 +1007,7 @@ impl InteractionController {
         }
         .intent(Intent::SelectFile(Some(SelectedFile {
             key: point.file,
-            origin: SelectionOrigin::Command,
+            origin: SelectionOrigin::Viewport,
         })))
     }
 
