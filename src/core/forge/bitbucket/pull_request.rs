@@ -5,13 +5,21 @@ use crate::core::review::{ReviewForge, ReviewTarget};
 /// trailing tab path (`/diff`, `/overview`), query or fragment.
 pub fn parse_pr_url(url: &str) -> Option<ReviewTarget> {
     let trimmed = url.trim();
-    let path = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .unwrap_or(trimmed);
-    let path = path
-        .strip_prefix("www.bitbucket.org/")
-        .or_else(|| path.strip_prefix("bitbucket.org/"))?;
+    let rest = match trimmed.split_once("://") {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") =>
+        {
+            rest
+        }
+        Some(_) => return None,
+        None => trimmed,
+    };
+    let (host, path) = rest.split_once('/')?;
+    if !host.eq_ignore_ascii_case("bitbucket.org")
+        && !host.eq_ignore_ascii_case("www.bitbucket.org")
+    {
+        return None;
+    }
     let path = path.split(['?', '#']).next()?;
     let mut parts = path.split('/');
     let workspace = parts.next()?;
@@ -53,6 +61,8 @@ mod tests {
             "https://bitbucket.org/atlassian/python-bitbucket/pull-requests/42?w=1",
             "https://bitbucket.org/atlassian/python-bitbucket/pull-requests/42#comment-7",
             "http://www.bitbucket.org/atlassian/python-bitbucket/pull-requests/42",
+            "HTTPS://Bitbucket.org/atlassian/python-bitbucket/pull-requests/42/commits",
+            "https://bitbucket.org/atlassian/python-bitbucket/pull-requests/42/overview",
             "  bitbucket.org/atlassian/python-bitbucket/pull-requests/42  ",
         ] {
             assert_eq!(parse_pr_url(url), target(42), "{url}");
@@ -70,6 +80,8 @@ mod tests {
             "https://github.com/atlassian/python-bitbucket/pull/42",
             "https://bitbucket.example.com/projects/A/repos/b/pull-requests/42",
             "git@bitbucket.org:atlassian/python-bitbucket.git",
+            "https://bitbucket.org.evil.example/atlassian/python-bitbucket/pull-requests/42",
+            "ftp://bitbucket.org/atlassian/python-bitbucket/pull-requests/42",
         ] {
             assert_eq!(parse_pr_url(url), None, "{url}");
         }
