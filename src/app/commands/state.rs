@@ -367,7 +367,6 @@ impl CommandsController {
         let Some(choice) = launcher.selected_choice().cloned() else {
             return Reduction::default();
         };
-        let signed_in = launcher.signed_in;
         match choice {
             LauncherChoice::Repository(path) | LauncherChoice::Path(path) => {
                 self.request(PlatformRequest::Dispatch(
@@ -385,15 +384,10 @@ impl CommandsController {
             LauncherChoice::PullRequest { url, local: None } => Reduction::changed().effect(
                 ShellEffect::OpenLauncherDialog(LauncherFolder::LocateClone { url }),
             ),
-            LauncherChoice::PullRequests if signed_in => {
-                self.request(PlatformRequest::Dispatch(
-                    ReviewAction::Pulls(PullsAction::Open).into(),
-                ));
-                Reduction::changed()
-            }
+            // Signed out, the page offers every forge's sign-in.
             LauncherChoice::PullRequests => {
                 self.request(PlatformRequest::Dispatch(
-                    ReviewAction::OpenAuthModal.into(),
+                    ReviewAction::Pulls(PullsAction::Open).into(),
                 ));
                 Reduction::changed()
             }
@@ -2071,7 +2065,11 @@ impl Controller for CommandsController {
                     picker::compare_menu_candidates(mode),
                 )
             }
-            A::OpenPullRequestPicker => self.open_picker(PickerKind::PullRequest, Vec::new()),
+            A::OpenPullRequestPicker => {
+                let mut picker = PickerState::new(PickerKind::PullRequest, Vec::new());
+                picker.short_forge = self.pull_request_forge.get();
+                self.show_picker(picker)
+            }
             A::OpenThemePicker => self.open_theme_picker(),
             A::OpenUiFontPicker => self.open_font_picker(FontRole::Ui),
             A::OpenMonoFontPicker => self.open_font_picker(FontRole::Mono),

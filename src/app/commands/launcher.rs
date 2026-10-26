@@ -498,10 +498,7 @@ pub fn pull_request_row(signed_in: bool) -> (&'static str, &'static str) {
     if signed_in {
         ("Your pull requests", "Open PRs you authored")
     } else {
-        (
-            "Sign in to GitHub to see your PRs",
-            "One-time code in your browser",
-        )
+        ("Sign in to see your PRs", "GitHub or Bitbucket")
     }
 }
 

@@ -289,8 +289,13 @@ impl Page<'_> {
     }
 
     fn sign_in_hint(&self, label: &str) -> Vec<AnyElement> {
-        let button = controls::button("Sign in", action(ReviewAction::OpenAuthModal), Tone::Ghost)
-            .icon(lucide::GITHUB_MARK);
+        let forge = self.review.active_forge();
+        let button = controls::button(
+            self.on_forge("Sign in to"),
+            action(ReviewAction::OpenAuthModal),
+            Tone::Ghost,
+        )
+        .icon(controls::forge_icon(forge));
         vec![
             self.muted(label),
             view! { <div class="shrink-0">{button}</div> },

@@ -377,7 +377,7 @@ fn bitbucket_api(token: Option<Secret>) -> BitbucketApi {
         .and_then(|token| {
             let credentials = Credentials::parse(token.expose());
             if credentials.is_none() {
-                tracing::warn!("bitbucket: stored credentials are not email:token");
+                tracing::warn!("bitbucket: stored credentials are not a token or email:token");
             }
             credentials
         })
@@ -598,6 +598,11 @@ impl LiveForge {
                         pr,
                         message: error.user_message(),
                     },
+                }
+            }
+            ForgeRequest::FetchUser { token, .. } if Credentials::parse(token.expose()).is_none() => {
+                ForgeResponse::UserFetchFailed {
+                    message: "Enter your Atlassian account email. Bitbucket usernames do not work with API tokens.".to_owned(),
                 }
             }
             ForgeRequest::FetchUser { token, .. } => {

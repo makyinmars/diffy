@@ -3,10 +3,13 @@ use quark_components::{Button, ButtonSize, ButtonStyle};
 use quark_ui::FocusId;
 use quark_ui::accessibility::AccessibilityRole;
 use quark_ui::element::*;
+use quark_ui::icons::lucide;
 use quark_ui::style::Styled;
 use quark_ui::theme::{ControlMetrics, Theme};
 
+use crate::app::icons;
 use crate::app::tokens::{Ico, Rad, Sp, TextStyle};
+use crate::core::review::ReviewForge;
 
 const TEXT_LINE_HEIGHT: f32 = 1.5;
 
@@ -26,6 +29,13 @@ impl Tone {
             Self::Ghost => ButtonStyle::Ghost,
             Self::Destructive => ButtonStyle::Danger,
         }
+    }
+}
+
+pub fn forge_icon(forge: ReviewForge) -> &'static str {
+    match forge {
+        ReviewForge::GitHub => lucide::GITHUB_MARK,
+        ReviewForge::Bitbucket => icons::BITBUCKET,
     }
 }
 

@@ -2914,7 +2914,7 @@ fn your_pull_requests_group_by_need_and_move_with_the_keyboard() {
     ));
     ui.find(By::role_name(
         Role::ListBoxOption,
-        "Tidy the widget, repo#42, Changes requested",
+        "Tidy the widget, repo#42 on GitHub, Changes requested",
     ));
     ui.find(By::role_name(Role::Label, "@alpha: Changes requested"));
     ui.find(By::test_id("review.pulls.preview.path"));
@@ -3156,4 +3156,117 @@ fn pull_request_list_errors_offer_retry_and_empty_lists_say_so() {
     assert!(ui.try_find(By::test_id("review.pulls.error")).is_none());
     ui.find(By::role_name(Role::Status, "No open pull requests"));
     assert_eq!(pulls_requests(&ui.app().driver), 2);
+}
+
+const BITBUCKET_URL: &str = "https://bitbucket.org/acme/widgets/pull-requests/42";
+
+fn sign_in_to_bitbucket(driver: &mut Driver) {
+    driver.act(ReviewAction::OpenSignIn(ReviewForge::Bitbucket));
+    type_into(driver, REVIEW_BITBUCKET_EMAIL, "me@example.com");
+    type_into(driver, REVIEW_BITBUCKET_TOKEN, "token");
+    driver.act(ReviewAction::SignInBitbucket);
+}
+
+fn bitbucket_driver(signed_in: bool) -> Driver {
+    let mut driver = Driver::new(Fake::new());
+    driver.startup(Some(BITBUCKET_URL));
+    driver.open_repository();
+    if signed_in {
+        sign_in_to_bitbucket(&mut driver);
+    }
+    driver
+}
+
+#[test]
+fn bitbucket_pull_requests_name_bitbucket_wherever_they_ask_to_sign_in() {
+    let mut ui = harness(bitbucket_driver(false));
+
+    ui.find(By::role_name(Role::Toolbar, "Bitbucket pull request"));
+    ui.find(By::role_name(Role::Button, "#42 Tidy the widget"));
+    ui.click_node(By::test_id("review.pull_request.title"));
+
+    assert!(
+        !ui.find_all(By::role_name(Role::Button, "Sign in to Bitbucket"))
+            .is_empty()
+    );
+    assert!(
+        ui.try_find(By::role_name(Role::Button, "Sign in to GitHub"))
+            .is_none()
+    );
+}
+
+#[test]
+fn bitbucket_submit_menu_says_comments_post_one_by_one() {
+    let mut driver = bitbucket_driver(true);
+    driver.act(ReviewAction::OpenComposerAt(target(2..3)));
+    driver.type_text("Inline note");
+    driver.act(ReviewAction::SubmitComment);
+    let mut ui = harness(driver);
+
+    ui.click_node(By::role_name(Role::Button, "Submit review"));
+
+    assert!(ui.painted_text().contains("1 comment will be posted"));
+    ui.find(By::test_id("review.submit_menu.note"));
+}
+
+#[test]
+fn account_menu_and_settings_name_the_forge_of_each_account() {
+    let mut driver = bitbucket_driver(true);
+    driver.act(ReviewAction::OpenAccountMenu);
+    let ui = harness(driver);
+    assert!(ui.painted_text().contains("@reviewer on Bitbucket"));
+
+    let mut app = App::new(bitbucket_driver(true));
+    app.accounts = true;
+    let ui = UiTestHarness::new(app, (1100.0, 900.0), 2.0);
+    for forge in ["GitHub", "Bitbucket"] {
+        let card = ui
+            .find(By::role_name(Role::Group, format!("{forge} account")))
+            .bounds;
+        let title = ui
+            .painted_texts()
+            .into_iter()
+            .find(|text| text.text == forge)
+            .unwrap_or_else(|| panic!("{forge} card has no title"));
+        assert!(contains(card, title.bounds), "{forge}");
+    }
+    assert!(
+        ui.painted_text()
+            .contains("Signed in as Rae Viewer (@reviewer)")
+    );
+}
+
+#[test]
+fn your_pull_requests_mark_each_forge_and_skip_what_bitbucket_does_not_list() {
+    let mut driver = pulls_driver();
+    let bitbucket = my_pull(7, "acme/widgets", "Bitbucket change", |p| {
+        p.forge = ReviewForge::Bitbucket;
+        p.url = "https://bitbucket.org/acme/widgets/pull-requests/7".to_owned();
+        p.updated_at = "2026-02-01T00:00:00+00:00".to_owned();
+        p.stats = None;
+        p.checks = None;
+    });
+    driver
+        .fake
+        .github
+        .with(|s| s.bitbucket_pulls = Some(vec![bitbucket]));
+    sign_in_to_bitbucket(&mut driver);
+    let mut ui = harness(driver);
+    ui.click_node(By::role_name(Role::Button, "Review PR"));
+
+    ui.find(By::role_name(
+        Role::ListBoxOption,
+        "Polish the gadget, gadget#9 on GitHub, Review required",
+    ));
+    ui.click_node(By::role_name(
+        Role::ListBoxOption,
+        "Bitbucket change, widgets#7 on Bitbucket, Ready",
+    ));
+
+    ui.find(By::role_name(Role::Label, "acme/widgets#7 on Bitbucket"));
+    for field in ["checks", "threads", "merge"] {
+        let id = format!("review.pulls.preview.{field}");
+        assert!(ui.try_find(By::test_id(id.as_str())).is_none(), "{field}");
+    }
+    ui.find(By::role_name(Role::Button, "Open on Bitbucket"));
 }

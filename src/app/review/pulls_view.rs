@@ -51,19 +51,6 @@ const HINTS: [(&str, &str); 6] = [
     ("esc", "close"),
 ];
 
-/// Where `o` opens the selected pull request: its forge, or the browser
-/// when the list mixes forges.
-fn open_hint(review: &ReviewController) -> &'static str {
-    match (
-        review.signed_in(ReviewForge::GitHub),
-        review.signed_in(ReviewForge::Bitbucket),
-    ) {
-        (true, true) => "browser",
-        (false, true) => "Bitbucket",
-        _ => "GitHub",
-    }
-}
-
 /// The forges whose pull requests the page lists, e.g. "GitHub or Bitbucket".
 fn listed_forges(review: &ReviewController) -> &'static str {
     match (
@@ -118,10 +105,7 @@ fn reference(pull: &MyPullRequest) -> String {
         .rsplit('/')
         .next()
         .unwrap_or(&pull.repository);
-    match pull.forge {
-        ReviewForge::GitHub => format!("{name}#{}", pull.number),
-        ReviewForge::Bitbucket => format!("{name}#{} \u{b7} Bitbucket", pull.number),
-    }
+    format!("{name}#{}", pull.number)
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {
@@ -155,6 +139,21 @@ impl Page<'_> {
         view! { scale,
             <div class="flex-row items-center overflow-hidden" min_w={0.0} px={Sp::XS} rounded={Rad::SM} bg={tc.element_background}>
                 <text size={Px(size)} class="truncate font-mono" color={tc.text}>{label}</text>
+            </div>
+        }
+    }
+
+    /// `repo#N` with the mark of the forge it lives on.
+    fn reference_chip(&self, pull: &MyPullRequest, color: Color) -> AnyElement {
+        let scale = self.scale;
+        let tc = &self.theme.colors;
+        let size = TextStyle::Mono.font_size(self.theme);
+        view! { scale,
+            <div class="flex-row items-center overflow-hidden" min_w={0.0} px={Sp::XS} gap={Sp::XS}
+                 rounded={Rad::SM} bg={tc.element_background}
+                 tooltip={format!("{} pull request", pull.forge.name())}>
+                <icon svg={controls::forge_icon(pull.forge)} size={Ico::XS} color={color} />
+                <text size={Px(size)} class="truncate font-mono" color={tc.text}>{reference(pull)}</text>
             </div>
         }
     }
@@ -301,7 +300,7 @@ impl Page<'_> {
         let age = parse_rfc3339_utc_seconds(&pull.updated_at)
             .map(|then| relative_age(self.now, then as i64))
             .unwrap_or_default();
-        let mut meta = vec![self.chip(reference(pull))];
+        let mut meta = vec![self.reference_chip(pull, paint.muted)];
         if let Some(checks) = pull.checks.as_ref().and_then(|c| self.checks_summary(c)) {
             meta.push(checks);
         }
@@ -311,7 +310,13 @@ impl Page<'_> {
         if !pull.reviewers.is_empty() {
             meta.push(self.faces(&pull.reviewers));
         }
-        let label = format!("{}, {}, {}", pull.title, reference(pull), status.label());
+        let label = format!(
+            "{}, {} on {}, {}",
+            pull.title,
+            reference(pull),
+            pull.forge.name(),
+            status.label()
+        );
         view! { scale,
             <div class="flex-row items-center w-full shrink-0" px={Sp::MD} py={Sp::SM} gap={Sp::SM}
                  bg={paint.bg}
@@ -412,7 +417,11 @@ impl Page<'_> {
     fn footer(&self) -> AnyElement {
         let scale = self.scale;
         let tc = &self.theme.colors;
-        let open = open_hint(self.review);
+        let open = self
+            .review
+            .pulls()
+            .selected_pull()
+            .map_or("browser", |pull| pull.forge.name());
         let hints: Vec<AnyElement> = HINTS
             .iter()
             .map(|(keys, label)| (*keys, if label.is_empty() { open } else { label }))
@@ -547,10 +556,19 @@ impl Page<'_> {
         let mut seen = HashSet::new();
         sorted.retain(|check| seen.insert(check.name.as_str()));
         let shown = sorted.len() as i32;
-        let mut content = vec![self.muted(format!(
-            "{} passed \u{b7} {} failed \u{b7} {} pending",
-            checks.success_count, checks.failure_count, checks.pending_count
-        ))];
+        let counts: Vec<String> = [
+            (checks.success_count, "passed"),
+            (checks.failure_count, "failed"),
+            (checks.pending_count, "pending"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, word)| format!("{count} {word}"))
+        .collect();
+        let mut content = Vec::new();
+        if !counts.is_empty() {
+            content.push(self.muted(counts.join(" \u{b7} ")));
+        }
         content.extend(sorted.into_iter().map(|check| {
             let (icon, color) = check_icon(check_tone(&check.state), self.theme);
             view! { scale,
@@ -564,6 +582,9 @@ impl Page<'_> {
         }));
         if checks.total_count > shown {
             content.push(self.muted(format!("+{} more", checks.total_count - shown)));
+        }
+        if content.is_empty() {
+            content.push(self.muted("No checks reported"));
         }
         content
     }
@@ -647,17 +668,29 @@ impl Page<'_> {
         if reviewers.is_empty() {
             reviewers.push(self.muted("No reviewers"));
         }
-        let threads = if pull.unresolved_threads == 0 {
-            "None unresolved".to_owned()
-        } else {
-            format!("{} unresolved", pull.unresolved_threads)
-        };
-        let merge = view! { scale,
-            <div class="flex-row items-center" gap={Sp::XS}>
-                {self.dot(status_color(status, self.theme))}
-                <text size={Px(small)} color={tc.text}>{merge_label(status)}</text>
-            </div>
-        };
+        // Bitbucket's listing reports no checks, thread counts or
+        // mergeability, so those fields show only what a forge reported.
+        let github = pull.forge == ReviewForge::GitHub;
+        let checks =
+            (github || pull.checks.is_some()).then(|| self.field("Checks", self.checks(pull)));
+        let threads = github.then(|| {
+            let threads = if pull.unresolved_threads == 0 {
+                "None unresolved".to_owned()
+            } else {
+                format!("{} unresolved", pull.unresolved_threads)
+            };
+            self.field("Threads", vec![self.muted(threads)])
+        });
+        let merge = (github || pull.stats.is_some()).then(|| {
+            let merge = view! { scale,
+                <div class="flex-row items-center" gap={Sp::XS}>
+                    {self.dot(status_color(status, self.theme))}
+                    <text size={Px(small)} color={tc.text}>{merge_label(status)}</text>
+                </div>
+            };
+            self.field("Merge", vec![merge])
+        });
+        let slug = format!("{}#{}", pull.repository, pull.number);
         let description = if pull.excerpt.is_empty() {
             "No description provided.".to_owned()
         } else {
@@ -679,7 +712,13 @@ impl Page<'_> {
                     <div class="shrink-0" accessibility_role={AccessibilityRole::Label} aria-label={format!("State: {state}")}>
                         {badge(state).icon(icon).variant(variant)}
                     </div>
-                    <text size={Px(mono)} class="truncate font-mono" color={tc.text_muted}>{format!("{}#{}", pull.clone_label(), pull.number)}</text>
+                    <div class="flex-row items-center overflow-hidden" min_w={0.0} gap={Sp::XS}
+                         accessibility_role={AccessibilityRole::Label}
+                         aria-label={format!("{slug} on {}", pull.forge.name())}
+                         test_id="review.pulls.preview.forge">
+                        <icon svg={controls::forge_icon(pull.forge)} size={Ico::SM} color={tc.text_muted} />
+                        <text size={Px(mono)} class="truncate font-mono" color={tc.text_muted}>{slug}</text>
+                    </div>
                 </div>
                 {self.location(pull)}
                 <div class="flex-row w-full" accessibility_role={AccessibilityRole::Heading} aria-label={pull.title.clone()}>
@@ -692,9 +731,9 @@ impl Page<'_> {
                     {...change}
                 </div>
                 {self.field("Reviewers", reviewers)}
-                {self.field("Checks", self.checks(pull))}
-                {self.field("Threads", vec![self.muted(threads)])}
-                {self.field("Merge", vec![merge])}
+                {?checks}
+                {?threads}
+                {?merge}
                 <div class="flex-col w-full" p={Sp::SM} rounded={Rad::LG} bg={tc.elevated_surface} border={tc.border_variant}
                      accessibility_role={AccessibilityRole::Group} aria-label="Description"
                      test_id="review.pulls.preview.description">
@@ -711,26 +750,26 @@ impl Page<'_> {
     fn sign_in(&self) -> AnyElement {
         let scale = self.scale;
         let tc = &self.theme.colors;
-        let button = controls::button(
-            "Sign in",
-            ReviewAction::OpenSignIn(ReviewForge::GitHub),
-            Tone::Primary,
-        )
-        .icon(lucide::GITHUB_MARK);
-        let bitbucket = controls::button(
-            "Sign in to Bitbucket",
-            ReviewAction::OpenSignIn(ReviewForge::Bitbucket),
-            Tone::Secondary,
-        )
-        .icon(lucide::KEY);
+        let sign_in = |forge: ReviewForge| {
+            let button = controls::button(
+                format!("Sign in to {}", forge.name()),
+                ReviewAction::OpenSignIn(forge),
+                Tone::Secondary,
+            )
+            .icon(controls::forge_icon(forge));
+            view! { <div test_id={format!("review.pulls.sign_in.{}", forge.key())}>{button}</div> }
+        };
         view! { scale,
             <div class="flex-col items-center justify-center w-full flex-1" gap={Sp::SM} p={Sp::LG}
                  accessibility_role={AccessibilityRole::Group} aria-label="Sign in to see your pull requests"
                  test_id="review.pulls.sign_in">
-                <icon svg={lucide::GITHUB_MARK} size={Ico::XL} color={tc.text_muted} />
+                <icon svg={lucide::GIT_PULL_REQUEST} size={Ico::XL} color={tc.text_muted} />
                 <text size={Px(TextStyle::Body.font_size(self.theme))} class="font-medium" color={tc.text}>"Sign in to see your pull requests"</text>
                 <text size={Px(self.small())} color={tc.text_muted}>"Diffy lists the open pull requests you authored on GitHub and Bitbucket."</text>
-                <div class="flex-row items-center" gap={Sp::SM}>{button}{bitbucket}</div>
+                <div class="flex-row flex-wrap items-center justify-center" gap={Sp::SM}>
+                    {sign_in(ReviewForge::GitHub)}
+                    {sign_in(ReviewForge::Bitbucket)}
+                </div>
             </div>
         }
     }
