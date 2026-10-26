@@ -1656,10 +1656,16 @@ impl ReviewController {
         response: ForgeResponse,
         cx: &SharedContext,
     ) -> Reduction {
-        let keep = matches!(
-            response,
-            ForgeResponse::PullRequestCached { .. } | ForgeResponse::TokenRejected { .. }
-        );
+        // A refusal concerns the account, not the job: it counts while the
+        // job is in flight or no account changed since it started, even
+        // after its pull request closed.
+        if let ForgeResponse::TokenRejected { forge } = response {
+            if self.in_flight.contains_key(&scope.request) || scope.account == self.epoch {
+                return self.token_rejected(forge, scope.request);
+            }
+            return Reduction::default();
+        }
+        let keep = matches!(response, ForgeResponse::PullRequestCached { .. });
         let Some(kind) = self.accept(scope, keep) else {
             return Reduction::default();
         };
@@ -1914,7 +1920,7 @@ impl ReviewController {
                 self.overview.error = Some(message);
                 Reduction::changed()
             }
-            ForgeResponse::TokenRejected { forge } => self.token_rejected(forge, scope.request),
+            ForgeResponse::TokenRejected { .. } => Reduction::default(),
             ForgeResponse::MyPullRequestsLoaded(pulls) => self.pulls_loaded(scope.request, pulls),
             ForgeResponse::MyPullRequestsLoadFailed { message } => {
                 let Pending::Pulls(forge) = kind else {

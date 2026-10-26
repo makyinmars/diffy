@@ -239,7 +239,7 @@ impl ForgeBackend for FakeGitHub {
                 s.fail_overview,
             )
         });
-        let rejected = request_token(&request).is_some_and(|token| {
+        let rejected = request.token().is_some_and(|token| {
             self.with(|s| s.rejected_tokens.iter().any(|t| t == token.expose()))
         });
         if rejected {
@@ -379,25 +379,6 @@ impl ForgeBackend for FakeGitHub {
                 ForgeResponse::MyPullRequestsLoaded(pulls)
             }),
         }
-    }
-}
-
-fn request_token(request: &ForgeRequest) -> Option<&Secret> {
-    match request {
-        ForgeRequest::FetchUser { token, .. } | ForgeRequest::FetchMyPullRequests { token, .. } => {
-            Some(token)
-        }
-        ForgeRequest::LoadPullRequest { token, .. }
-        | ForgeRequest::PeekPullRequest { token, .. }
-        | ForgeRequest::FetchReviewComments { token, .. }
-        | ForgeRequest::FetchReviewData { token, .. }
-        | ForgeRequest::SubmitSessionDrafts { token, .. }
-        | ForgeRequest::AddThreadReply { token, .. }
-        | ForgeRequest::UpdateComment { token, .. }
-        | ForgeRequest::DeleteComment { token, .. }
-        | ForgeRequest::SetThreadResolution { token, .. }
-        | ForgeRequest::FetchPullRequestOverview { token, .. }
-        | ForgeRequest::AddPullRequestComment { token, .. } => token.as_ref(),
     }
 }
 
@@ -3454,4 +3435,47 @@ fn a_stopped_sign_in_wraps_beside_the_card_actions_in_narrow_settings() {
         detail.x + detail.width <= sign_out.x,
         "{detail:?} under {sign_out:?}"
     );
+}
+
+fn held_overview_refresh(driver: &mut Driver) -> ReviewEffect {
+    driver.fake.hold = true;
+    driver.act(ReviewAction::RefreshOverview);
+    driver.fake.hold = false;
+    let effect = driver.fake.held.pop().unwrap();
+    assert!(driver.fake.held.is_empty());
+    effect
+}
+
+fn land(driver: &mut Driver, effect: ReviewEffect) {
+    for event in driver.fake.run(effect) {
+        driver.deliver(event);
+    }
+}
+
+#[test]
+fn a_refusal_counts_after_its_pull_request_closed_but_not_after_a_new_sign_in() {
+    let mut driver = Driver::signed_in_with_pr();
+    let refresh = held_overview_refresh(&mut driver);
+    driver.act(ReviewAction::LoadPullRequest {
+        url: OTHER_URL.to_owned(),
+    });
+    driver
+        .fake
+        .github
+        .with(|s| s.rejected_tokens.push("stored-token".to_owned()));
+    land(&mut driver, refresh);
+    assert!(driver.review.needs_sign_in(ReviewForge::GitHub));
+
+    let mut driver = Driver::signed_in_with_pr();
+    let refresh = held_overview_refresh(&mut driver);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
+    driver.act(ReviewAction::StartDeviceFlow);
+    assert!(driver.review.signed_in(ReviewForge::GitHub));
+    driver
+        .fake
+        .github
+        .with(|s| s.rejected_tokens.push("stored-token".to_owned()));
+    land(&mut driver, refresh);
+    assert!(driver.review.signed_in(ReviewForge::GitHub));
+    assert!(!driver.review.needs_sign_in(ReviewForge::GitHub));
 }

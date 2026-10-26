@@ -364,9 +364,16 @@ fn public_api(token: Option<Secret>) -> GitHubApi {
 
 impl ForgeBackend for LiveForge {
     fn execute(&self, request: ForgeRequest, emit: &mut dyn FnMut(ForgeResponse)) {
+        // Only a token that was sent can be refused; a missing one is not.
+        let sent = request.token().is_some_and(|token| !token.is_empty());
+        let mut emit = |response: ForgeResponse| {
+            if sent || !matches!(response, ForgeResponse::TokenRejected { .. }) {
+                emit(response);
+            }
+        };
         match request.forge() {
-            ReviewForge::GitHub => self.execute_github(request, emit),
-            ReviewForge::Bitbucket => self.execute_bitbucket(request, emit),
+            ReviewForge::GitHub => self.execute_github(request, &mut emit),
+            ReviewForge::Bitbucket => self.execute_bitbucket(request, &mut emit),
         }
     }
 }
