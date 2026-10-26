@@ -350,7 +350,7 @@ fn launcher_row(
         LauncherChoice::Repository(_) => lucide::FOLDER_GIT,
         LauncherChoice::PullRequest { .. } => lucide::GIT_PULL_REQUEST,
         LauncherChoice::Path(_) => lucide::ARROW_RIGHT,
-        LauncherChoice::PullRequests => lucide::GITHUB_MARK,
+        LauncherChoice::PullRequests => lucide::GIT_PULL_REQUEST,
         LauncherChoice::OpenFolder => lucide::FOLDER_OPEN,
         LauncherChoice::Clone(_) => icons::DOWNLOAD,
     };

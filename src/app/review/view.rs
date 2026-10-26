@@ -177,13 +177,22 @@ pub fn pull_request_bar(
         }
         parts.join(" \u{b7} ")
     });
+    let forge = review.active_forge();
     let open = controls::icon_button(
         lucide::EXTERNAL_LINK,
-        &format!("Open on {}", review.active_forge().name()),
+        &format!("Open on {}", forge.name()),
         action(ReviewAction::OpenPullRequestInBrowser),
         theme,
     );
     let overview = review.overview_open();
+    let title_label = format!("{number} {title}");
+    let forge_mark = fits.then(|| {
+        view! {
+            <div class="shrink-0" tooltip={format!("{} pull request", forge.name())} test_id="review.pull_request.forge">
+                <icon svg={controls::forge_icon(forge)} size={Ico::SM} color={tc.text_muted} />
+            </div>
+        }
+    });
     let tab = |label: &str, active: bool, on_click: ReviewAction| {
         controls::button(label, action(on_click), Tone::Ghost).active(active)
     };
@@ -194,15 +203,16 @@ pub fn pull_request_bar(
              px={Sp::MD} gap={Sp::SM}
              bg={tc.title_bar_background} border_b={tc.border_variant}
              accessibility_role={AccessibilityRole::Toolbar}
-             aria-label="Pull request"
+             aria-label={format!("{} pull request", forge.name())}
              test_id="review.pull_request">
+            {?forge_mark}
             {?state}
             <div class="flex-row items-center overflow-hidden" min_w={0.0} gap={Sp::SM}
                  px={Sp::XS} py={Sp::XXS} rounded={Rad::MD}
                  hover_bg={tc.ghost_element_hover}
                  cursor={CursorHint::Pointer}
                  accessibility_role={AccessibilityRole::Button}
-                 aria-label="Pull request overview"
+                 aria-label={title_label}
                  tooltip={if overview { "Back to changed files" } else { "Open the overview" }}
                  test_id="review.pull_request.title"
                  on:click={action(ReviewAction::ToggleOverview)}>
@@ -321,13 +331,6 @@ fn checks_status(checks: &PullRequestCheckSummary, theme: &Theme) -> Option<AnyE
     })
 }
 
-fn forge_icon(forge: ReviewForge) -> &'static str {
-    match forge {
-        ReviewForge::GitHub => lucide::GITHUB_MARK,
-        ReviewForge::Bitbucket => lucide::KEY,
-    }
-}
-
 fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
     let scale = tokens::ui_scale(theme);
     let forge = review.active_forge();
@@ -335,7 +338,7 @@ fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
         let accessible = format!("Sign in to {}", forge.name());
         return controls::ghost_chip(
             GhostChip {
-                icon: forge_icon(forge),
+                icon: controls::forge_icon(forge),
                 label: "Sign in",
                 accessible: &accessible,
                 focus: REVIEW_ACCOUNT,
@@ -346,11 +349,16 @@ fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
         );
     }
     let account = review.account(forge);
-    let login = account
-        .user
-        .as_ref()
-        .map(|user| user.login.clone())
-        .unwrap_or_else(|| forge.name().to_owned());
+    let (login, tooltip) = match account.user.as_ref() {
+        Some(user) => (
+            user.login.clone(),
+            format!("Signed in to {} as @{}", forge.name(), user.login),
+        ),
+        None => (
+            forge.name().to_owned(),
+            format!("Signed in to {}", forge.name()),
+        ),
+    };
     let picture = avatar(login).size(Ico::XL).image(account.avatar.clone());
     view! { scale,
         <div
@@ -360,6 +368,7 @@ fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
             p={Sp::XXS}
             accessibility_role={AccessibilityRole::Button}
             aria-label={format!("{} account", forge.name())}
+            tooltip={tooltip}
             focus_ring={REVIEW_ACCOUNT}
             test_id="review.account"
             on:click={action(ReviewAction::OpenAccountMenu)}
@@ -587,7 +596,7 @@ fn bitbucket_auth_modal(review: &ReviewController, slot: &Slot, cx: &ViewContext
     let modal = Modal::new(
         "Sign in to Bitbucket",
         "Load private pull requests and post reviews with an Atlassian API token.",
-        lucide::KEY,
+        controls::forge_icon(ReviewForge::Bitbucket),
         tokens::scaled(Sz::MODAL_SM, scale),
         slot.width,
         slot.height,
@@ -614,12 +623,13 @@ fn account_menu(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyEle
     let top = theme.metrics.title_bar_height + tokens::scaled(Sp::XS, scale);
     let forge = review.active_forge();
     let account = review.account(forge);
-    let (title, login) = match account.user.as_ref() {
-        Some(user) if !user.name.is_empty() && user.name != user.login => {
-            (user.name.clone(), format!("@{}", user.login))
-        }
-        Some(user) => (format!("@{}", user.login), String::new()),
-        None => (forge.name().to_owned(), String::new()),
+    let (title, detail) = match account.user.as_ref() {
+        Some(user) if !user.name.is_empty() && user.name != user.login => (
+            user.name.clone(),
+            format!("@{} on {}", user.login, forge.name()),
+        ),
+        Some(user) => (format!("@{}", user.login), forge.name().to_owned()),
+        None => (forge.name().to_owned(), "Signed in".to_owned()),
     };
     let picture = avatar(title.clone())
         .size(Ico::HERO)
@@ -646,9 +656,10 @@ fn account_menu(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyEle
                     {picture}
                     <div class="flex-col flex-1" min_w={0.0}>
                         <text size={Px(small)} class="font-medium truncate" color={tc.text_strong}>{title}</text>
-                        if !login.is_empty() {
-                            <text size={Px(small)} class="truncate" color={tc.text_muted}>{login}</text>
-                        }
+                        <div class="flex-row items-center" min_w={0.0} gap={Sp::XS} test_id="review.account_menu.forge">
+                            <icon svg={controls::forge_icon(forge)} size={Ico::XS} color={tc.text_muted} />
+                            <text size={Px(small)} class="truncate" color={tc.text_muted}>{detail}</text>
+                        </div>
                     </div>
                 </div>
                 <div class="w-full" h={Px(Sz::SEPARATOR_W)} bg={tc.border_variant} />
@@ -671,13 +682,18 @@ fn submit_menu(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyElem
     let staged = review.summary_staged();
     let comments = pending.saturating_sub(usize::from(staged));
     let noun = if comments == 1 { "comment" } else { "comments" };
+    // Bitbucket has no review to batch drafts into; each one posts alone.
+    let bitbucket = review.active_forge() == ReviewForge::Bitbucket;
+    let verb = if bitbucket { "posted" } else { "submitted" };
     let summary = match (comments, staged, failed) {
         (_, _, 1..) => format!("{pending} pending, {failed} to retry"),
         (0, false, _) => "No pending comments".to_owned(),
-        (0, true, _) => "The summary will be submitted".to_owned(),
-        (n, false, _) => format!("{n} {noun} will be submitted"),
-        (n, true, _) => format!("{n} {noun} and the summary will be submitted"),
+        (0, true, _) => format!("The summary will be {verb}"),
+        (n, false, _) => format!("{n} {noun} will be {verb}"),
+        (n, true, _) => format!("{n} {noun} and the summary will be {verb}"),
     };
+    let note =
+        (bitbucket && pending + failed > 0).then_some("Bitbucket posts each comment separately.");
     let own = review.viewer_is_author();
     let presentation = review.presentation();
     let summary_card = presentation.general_composer().and_then(|card| {
@@ -715,6 +731,11 @@ fn submit_menu(review: &ReviewController, slot: &Slot, theme: &Theme) -> AnyElem
                  on:click={quark_ui::element::NoopAction}>
                 <text size={Px(small)} class="font-medium" color={tc.text_strong}>"Submit review"</text>
                 <text size={Px(small)} color={tc.text_muted}>{summary}</text>
+                if let Some(note) = note {
+                    <div test_id="review.submit_menu.note">
+                        <text size={Px(small)} color={tc.text_muted}>{note}</text>
+                    </div>
+                }
                 {?summary_card}
                 {?add_summary}
                 <div class="flex-row items-center" gap={Sp::XS}>
@@ -759,28 +780,36 @@ fn account_card(review: &ReviewController, forge: ReviewForge, cx: &ViewContext)
     let signed_in = review.signed_in(forge);
     let account = review.account(forge);
     let user = account.user.as_ref().filter(|_| signed_in);
-    let (title, detail) = match (user, &account.auth, forge) {
+    let detail = match (user, &account.auth, forge) {
         (Some(user), _, _) if !user.name.is_empty() && user.name != user.login => {
-            (user.name.clone(), format!("Signed in as @{}", user.login))
+            format!("Signed in as {} (@{})", user.name, user.login)
         }
-        (Some(user), _, _) => (format!("@{}", user.login), "Signed in".to_owned()),
-        (None, AuthStatus::Starting | AuthStatus::Awaiting(_), ReviewForge::GitHub) => (
-            "GitHub".to_owned(),
-            "Waiting for you to approve in the browser\u{2026}".to_owned(),
-        ),
-        (None, _, ReviewForge::GitHub) => (
-            "GitHub".to_owned(),
-            "Sign in to load pull requests and post reviews.".to_owned(),
-        ),
-        (None, _, ReviewForge::Bitbucket) => (
-            "Bitbucket".to_owned(),
+        (Some(user), _, _) => format!("Signed in as @{}", user.login),
+        _ if signed_in => "Signed in".to_owned(),
+        (None, AuthStatus::Starting | AuthStatus::Awaiting(_), ReviewForge::GitHub) => {
+            "Waiting for you to approve in the browser\u{2026}".to_owned()
+        }
+        (None, _, ReviewForge::GitHub) => {
+            "Sign in to load pull requests and post reviews.".to_owned()
+        }
+        (None, _, ReviewForge::Bitbucket) => {
             "Paste an Atlassian API token to load private pull requests and post reviews."
-                .to_owned(),
-        ),
+                .to_owned()
+        }
     };
-    let picture = avatar(title.clone())
-        .size(Ico::XXL)
-        .image(user.and(account.avatar.clone()));
+    let picture = match user {
+        Some(user) => {
+            let face = avatar(user.login.clone())
+                .size(Ico::XXL)
+                .image(account.avatar.clone());
+            view! { <div class="shrink-0">{face}</div> }
+        }
+        None => view! { scale,
+            <div class="flex-row items-center justify-center shrink-0" w={Ico::XXL} h={Ico::XXL}>
+                <icon svg={controls::forge_icon(forge)} size={Ico::XL} color={tc.text_muted} />
+            </div>
+        },
+    };
     let control = match (signed_in, forge) {
         (true, _) => Some(controls::button(
             "Sign out",
@@ -808,7 +837,7 @@ fn account_card(review: &ReviewController, forge: ReviewForge, cx: &ViewContext)
             <div class="flex-row items-center w-full" gap={Sp::MD}>
                 {picture}
                 <div class="flex-col flex-1" min_w={0.0} gap={Sp::XXS}>
-                    <text size={Px(body)} class="font-medium truncate" color={tc.text}>{title}</text>
+                    <text size={Px(body)} class="font-medium truncate" color={tc.text}>{forge.name()}</text>
                     <text size={Px(small)} class="truncate" color={tc.text_muted}>{detail}</text>
                 </div>
                 {?control}
