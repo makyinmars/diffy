@@ -133,6 +133,9 @@ pub struct Account {
     pub auth: AuthStatus,
     pub flow: Option<JobId>,
     pub token_loaded: bool,
+    /// The forge refused the stored token, which is no longer sent; the
+    /// account waits for a new sign-in.
+    pub rejected: bool,
     /// A pasted token being checked; it is kept only once the user loads.
     candidate: Option<Secret>,
 }
@@ -674,6 +677,10 @@ impl ReviewController {
         [ReviewForge::GitHub, ReviewForge::Bitbucket]
             .into_iter()
             .any(|forge| self.signed_in(forge))
+    }
+
+    pub fn needs_sign_in(&self, forge: ReviewForge) -> bool {
+        self.account(forge).rejected
     }
 
     pub fn signed_in(&self, forge: ReviewForge) -> bool {
@@ -1593,6 +1600,7 @@ impl ReviewController {
         };
         account.token = Some(token.clone());
         account.token_loaded = true;
+        account.rejected = false;
         if forge == ReviewForge::Bitbucket {
             self.bitbucket_token.set_text("");
         }
@@ -1620,13 +1628,38 @@ impl ReviewController {
         reduction
     }
 
+    /// The forge refused the stored token: stop sending it and ask for a new
+    /// sign-in. The keyring keeps it until a sign-in or sign-out replaces
+    /// it. A token still being checked reports through its sign-in flow.
+    fn token_rejected(&mut self, forge: ReviewForge, request: JobId) -> Reduction {
+        let account = self.accounts.get_mut(forge);
+        if account.flow == Some(request) {
+            return Reduction::default();
+        }
+        let Some(token) = account.token.take() else {
+            return Reduction::default();
+        };
+        account.rejected = true;
+        if forge == ReviewForge::Bitbucket
+            && self.bitbucket_email.text().trim().is_empty()
+            && let Some((email, _)) = token.expose().split_once(':')
+            && email.contains('@')
+        {
+            self.bitbucket_email.set_text(email.trim());
+        }
+        Reduction::changed()
+    }
+
     fn reduce_forge(
         &mut self,
         scope: ReviewScope,
         response: ForgeResponse,
         cx: &SharedContext,
     ) -> Reduction {
-        let keep = matches!(response, ForgeResponse::PullRequestCached { .. });
+        let keep = matches!(
+            response,
+            ForgeResponse::PullRequestCached { .. } | ForgeResponse::TokenRejected { .. }
+        );
         let Some(kind) = self.accept(scope, keep) else {
             return Reduction::default();
         };
@@ -1881,6 +1914,7 @@ impl ReviewController {
                 self.overview.error = Some(message);
                 Reduction::changed()
             }
+            ForgeResponse::TokenRejected { forge } => self.token_rejected(forge, scope.request),
             ForgeResponse::MyPullRequestsLoaded(pulls) => self.pulls_loaded(scope.request, pulls),
             ForgeResponse::MyPullRequestsLoadFailed { message } => {
                 let Pending::Pulls(forge) = kind else {
@@ -2158,6 +2192,7 @@ impl ReviewController {
                 account.auth = AuthStatus::Done;
                 account.token = Some(token.clone());
                 account.token_loaded = true;
+                account.rejected = false;
                 if self.overlay == Some(ReviewOverlay::Auth) {
                     self.close_overlay();
                 }

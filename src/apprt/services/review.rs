@@ -232,7 +232,7 @@ impl LiveForge {
             Ok(comparison) => ForgeResponse::PullRequestLoaded { url, comparison },
             Err(error) => ForgeResponse::PullRequestLoadFailed {
                 url,
-                message: error.user_message(),
+                message: failure_message(target.forge, &error, emit),
             },
         }
     }
@@ -371,6 +371,19 @@ impl ForgeBackend for LiveForge {
     }
 }
 
+/// The message for a failed request. A refused token is also reported, so
+/// the account can ask for a new sign-in.
+fn failure_message(
+    forge: ReviewForge,
+    error: &DiffyError,
+    emit: &mut dyn FnMut(ForgeResponse),
+) -> String {
+    if matches!(error, DiffyError::Auth { .. }) {
+        emit(ForgeResponse::TokenRejected { forge });
+    }
+    error.user_message()
+}
+
 fn bitbucket_api(token: Option<Secret>) -> BitbucketApi {
     let credentials = token
         .filter(|token| !token.is_empty())
@@ -417,7 +430,7 @@ impl LiveForge {
                     match GitHubApi::with_token(token.into_inner()).fetch_current_user() {
                         Ok(user) => ForgeResponse::UserFetched(user),
                         Err(error) => ForgeResponse::UserFetchFailed {
-                            message: error.user_message(),
+                            message: failure_message(ReviewForge::GitHub, &error, emit),
                         },
                     }
                 }
@@ -427,7 +440,7 @@ impl LiveForge {
                     Ok(info) => ForgeResponse::PullRequestPeeked { pr, info },
                     Err(error) => ForgeResponse::PullRequestPeekFailed {
                         pr,
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::GitHub, &error, emit),
                     },
                 }
             }
@@ -437,7 +450,7 @@ impl LiveForge {
                 Ok(comments) => ForgeResponse::ReviewCommentsLoaded { pr, comments },
                 Err(error) => ForgeResponse::ReviewCommentsLoadFailed {
                     pr,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::GitHub, &error, emit),
                 },
             },
             ForgeRequest::FetchReviewData { pr, token } => {
@@ -448,7 +461,7 @@ impl LiveForge {
                     },
                     Err(error) => ForgeResponse::ReviewDataLoadFailed {
                         pr,
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::GitHub, &error, emit),
                     },
                 }
             }
@@ -474,7 +487,7 @@ impl LiveForge {
                         pr,
                         submitted: Vec::new(),
                         draft_ids,
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::GitHub, &error, emit),
                     },
                 }
             }
@@ -492,7 +505,7 @@ impl LiveForge {
                 Err(error) => ForgeResponse::ThreadReplyAddFailed {
                     pr,
                     thread_id,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::GitHub, &error, emit),
                 },
             },
             ForgeRequest::UpdateComment {
@@ -505,7 +518,7 @@ impl LiveForge {
                 Err(error) => ForgeResponse::CommentUpdateFailed {
                     pr,
                     comment_id,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::GitHub, &error, emit),
                 },
             },
             ForgeRequest::DeleteComment {
@@ -521,7 +534,7 @@ impl LiveForge {
                 Err(error) => ForgeResponse::CommentDeleteFailed {
                     pr,
                     comment_id,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::GitHub, &error, emit),
                 },
             },
             ForgeRequest::SetThreadResolution {
@@ -534,7 +547,7 @@ impl LiveForge {
                 Err(error) => ForgeResponse::ThreadResolutionChangeFailed {
                     pr,
                     thread_id,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::GitHub, &error, emit),
                 },
             },
             ForgeRequest::FetchPullRequestOverview { pr, token } => match public_api(token)
@@ -546,14 +559,14 @@ impl LiveForge {
                 },
                 Err(error) => ForgeResponse::PullRequestOverviewLoadFailed {
                     pr,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::GitHub, &error, emit),
                 },
             },
             ForgeRequest::FetchMyPullRequests { token, .. } => {
                 match GitHubApi::with_token(token.into_inner()).fetch_my_pull_requests() {
                     Ok(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
                     Err(error) => ForgeResponse::MyPullRequestsLoadFailed {
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::GitHub, &error, emit),
                     },
                 }
             }
@@ -563,7 +576,7 @@ impl LiveForge {
                     Err(error) => ForgeResponse::PullRequestCommentAddFailed {
                         pr,
                         body,
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::GitHub, &error, emit),
                     },
                 }
             }
@@ -596,7 +609,7 @@ impl LiveForge {
                     Ok(info) => ForgeResponse::PullRequestPeeked { pr, info },
                     Err(error) => ForgeResponse::PullRequestPeekFailed {
                         pr,
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::Bitbucket, &error, emit),
                     },
                 }
             }
@@ -604,7 +617,7 @@ impl LiveForge {
                 match bitbucket_api(Some(token)).fetch_current_user() {
                     Ok(user) => ForgeResponse::UserFetched(user.user),
                     Err(error) => ForgeResponse::UserFetchFailed {
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::Bitbucket, &error, emit),
                     },
                 }
             }
@@ -643,7 +656,7 @@ impl LiveForge {
                 Err(error) => ForgeResponse::ThreadReplyAddFailed {
                     pr,
                     thread_id,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::Bitbucket, &error, emit),
                 },
             },
             ForgeRequest::UpdateComment {
@@ -656,7 +669,7 @@ impl LiveForge {
                 Err(error) => ForgeResponse::CommentUpdateFailed {
                     pr,
                     comment_id,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::Bitbucket, &error, emit),
                 },
             },
             ForgeRequest::DeleteComment {
@@ -672,7 +685,7 @@ impl LiveForge {
                 Err(error) => ForgeResponse::CommentDeleteFailed {
                     pr,
                     comment_id,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::Bitbucket, &error, emit),
                 },
             },
             ForgeRequest::SetThreadResolution {
@@ -691,7 +704,7 @@ impl LiveForge {
                 Err(error) => ForgeResponse::ThreadResolutionChangeFailed {
                     pr,
                     thread_id,
-                    message: error.user_message(),
+                    message: failure_message(ReviewForge::Bitbucket, &error, emit),
                 },
             },
             ForgeRequest::AddPullRequestComment { pr, token, body } => {
@@ -700,7 +713,7 @@ impl LiveForge {
                     Err(error) => ForgeResponse::PullRequestCommentAddFailed {
                         pr,
                         body,
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::Bitbucket, &error, emit),
                     },
                 }
             }
@@ -712,7 +725,7 @@ impl LiveForge {
                     },
                     Err(error) => ForgeResponse::PullRequestOverviewLoadFailed {
                         pr,
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::Bitbucket, &error, emit),
                     },
                 }
             }
@@ -720,7 +733,7 @@ impl LiveForge {
                 match bitbucket_api(Some(token)).fetch_my_pull_requests() {
                     Ok(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
                     Err(error) => ForgeResponse::MyPullRequestsLoadFailed {
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::Bitbucket, &error, emit),
                     },
                 }
             }
@@ -732,7 +745,7 @@ impl LiveForge {
                     },
                     Err(error) => ForgeResponse::ReviewDataLoadFailed {
                         pr,
-                        message: error.user_message(),
+                        message: failure_message(ReviewForge::Bitbucket, &error, emit),
                     },
                 }
             }

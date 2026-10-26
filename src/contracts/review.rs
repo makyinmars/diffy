@@ -420,6 +420,11 @@ pub enum ForgeResponse {
     MyPullRequestsLoadFailed {
         message: String,
     },
+    /// `forge` refused the request's credentials. Sent just before the
+    /// request's own failure response, under the same scope.
+    TokenRejected {
+        forge: ReviewForge,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,6 +562,7 @@ impl ReviewEvent {
                     | ForgeResponse::UserFetchFailed { .. }
                     | ForgeResponse::MyPullRequestsLoaded(_)
                     | ForgeResponse::MyPullRequestsLoadFailed { .. }
+                    | ForgeResponse::TokenRejected { .. }
             ),
             Self::DeviceFlowStarted { .. }
             | Self::DeviceFlowStartFailed { .. }
