@@ -939,3 +939,67 @@ fn a_folded_reformat_exposes_its_toggle_as_a_button() {
     ui.frame();
     ui.find(By::role_name(Role::Button, "Fold reformatted lines"));
 }
+
+#[test]
+fn guide_reveals_reach_a_line_and_wait_for_files_that_are_not_loaded() {
+    let base: String = (0..400).map(|n| format!("line {n}\n")).collect();
+    let edited = |word: &str| -> String {
+        (0..400)
+            .map(|n| match n % 10 {
+                0 => format!("{word} {n}\n"),
+                _ => format!("line {n}\n"),
+            })
+            .collect()
+    };
+    let first = prepared(1, 1, "a.rs", &base, &edited("edited"));
+    let second = prepared(2, 1, "b.rs", &base, &edited("other"));
+    let mut ui = harness(Host::new(), SHORT);
+    ui.app_mut().update_settings(|s| s.continuous_scroll = true);
+    ui.app_mut().install(ViewportInstall::File {
+        prepared: first,
+        remap: None,
+    });
+    ui.frame();
+    let shows = |ui: &UiTestHarness<Host>, text: &str| {
+        line_names(ui).iter().any(|name| name.contains(text))
+    };
+    assert!(!shows(&ui, "edited 390"));
+
+    ui.app_mut().intent(Intent::RevealSource(SourceTarget {
+        file: FileKey(1),
+        revision: FileRevision(1),
+        side: Side::New,
+        lines: 390..391,
+    }));
+    ui.frame();
+    assert!(shows(&ui, "edited 390"), "{:?}", line_names(&ui));
+
+    ui.app_mut().intent(Intent::RevealSource(SourceTarget {
+        file: FileKey(2),
+        revision: FileRevision(1),
+        side: Side::New,
+        lines: 390..391,
+    }));
+    ui.frame();
+    let asked = ui.app().intents.iter().any(|intent| {
+        matches!(
+            intent,
+            Intent::SelectFile(Some(SelectedFile {
+                key: FileKey(2),
+                origin: SelectionOrigin::Command
+            }))
+        )
+    });
+    assert!(asked, "an unloaded file is selected so it loads");
+    assert!(!shows(&ui, "other 390"));
+    ui.app_mut().install(ViewportInstall::File {
+        prepared: second,
+        remap: None,
+    });
+    ui.frame();
+    assert!(
+        shows(&ui, "other 390"),
+        "the line follows once the file arrives: {:?}",
+        line_names(&ui)
+    );
+}

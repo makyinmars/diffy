@@ -6,6 +6,18 @@ use serde_json::{Value, json};
 
 pub const OPENAI_MODEL: &str = "gpt-5.4-nano";
 pub const ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
+pub const OPENAI_THOROUGH_MODEL: &str = "gpt-5.4-mini";
+pub const ANTHROPIC_THOROUGH_MODEL: &str = "claude-sonnet-5-5";
+
+/// How much model a task gets. Commit messages and file ranking are short
+/// and frequent. A review guide reads a whole change and reasons across
+/// files, so it gets a stronger model and a longer deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ModelTier {
+    #[default]
+    Fast,
+    Thorough,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,9 +35,15 @@ impl Provider {
     }
 
     pub fn model_id(self) -> &'static str {
-        match self {
-            Self::OpenAi => OPENAI_MODEL,
-            Self::Anthropic => ANTHROPIC_MODEL,
+        self.model_for(ModelTier::Fast)
+    }
+
+    pub fn model_for(self, tier: ModelTier) -> &'static str {
+        match (self, tier) {
+            (Self::OpenAi, ModelTier::Fast) => OPENAI_MODEL,
+            (Self::OpenAi, ModelTier::Thorough) => OPENAI_THOROUGH_MODEL,
+            (Self::Anthropic, ModelTier::Fast) => ANTHROPIC_MODEL,
+            (Self::Anthropic, ModelTier::Thorough) => ANTHROPIC_THOROUGH_MODEL,
         }
     }
 }
@@ -36,6 +54,7 @@ pub struct GenerateRequest {
     pub api_key: String,
     pub user_message: String,
     pub max_tokens: u32,
+    pub tier: ModelTier,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +100,9 @@ async fn drive_stream(request: GenerateRequest, tx: Sender<StreamMessage>) {
         api_key,
         user_message,
         max_tokens,
+        tier,
     } = request;
+    let model = provider.model_for(tier);
 
     // Keys pasted from browser/terminals sometimes carry trailing whitespace.
     // Strip before building auth headers so failures are legible.
@@ -91,7 +112,7 @@ async fn drive_stream(request: GenerateRequest, tx: Sender<StreamMessage>) {
 
     tracing::info!(
         provider = provider.label(),
-        model = provider.model_id(),
+        model,
         api_key_len = api_key.len(),
         original_len,
         api_key_fingerprint = %fingerprint,
@@ -109,9 +130,20 @@ async fn drive_stream(request: GenerateRequest, tx: Sender<StreamMessage>) {
 
     let client = crate::core::http::client();
     if let Err(error) = match provider {
-        Provider::OpenAi => stream_openai(&client, &api_key, &user_message, max_tokens, &tx).await,
+        Provider::OpenAi => {
+            stream_openai(&client, &api_key, model, &user_message, max_tokens, &tx).await
+        }
         Provider::Anthropic => {
-            stream_anthropic(&client, &api_key, &user_message, max_tokens, &tx).await
+            stream_anthropic(
+                &client,
+                &api_key,
+                model,
+                &user_message,
+                max_tokens,
+                tier,
+                &tx,
+            )
+            .await
         }
     } {
         tracing::error!(
@@ -126,12 +158,13 @@ async fn drive_stream(request: GenerateRequest, tx: Sender<StreamMessage>) {
 async fn stream_openai(
     client: &reqwest::Client,
     api_key: &str,
+    model: &str,
     user_message: &str,
     max_tokens: u32,
     tx: &Sender<StreamMessage>,
 ) -> Result<(), String> {
     let body = json!({
-        "model": OPENAI_MODEL,
+        "model": model,
         "input": [
             {
                 "role": "user",
@@ -161,20 +194,25 @@ async fn stream_openai(
 async fn stream_anthropic(
     client: &reqwest::Client,
     api_key: &str,
+    model: &str,
     user_message: &str,
     max_tokens: u32,
+    tier: ModelTier,
     tx: &Sender<StreamMessage>,
 ) -> Result<(), String> {
-    let body = json!({
-        "model": ANTHROPIC_MODEL,
+    let mut body = json!({
+        "model": model,
         "messages": [
             { "role": "user", "content": user_message }
         ],
         "system": "You are a helpful assistant.",
         "max_tokens": max_tokens,
-        "temperature": 0.7,
         "stream": true
     });
+    // Sonnet 5.5 rejects sampling parameters with a 400.
+    if tier == ModelTier::Fast {
+        body["temperature"] = json!(0.7);
+    }
 
     let response = client
         .post("https://api.anthropic.com/v1/messages")

@@ -21,7 +21,7 @@ use crate::app::diff_slots::DiffSlots;
 use crate::app::route::{self, Controllers, MAX_INTENTS_PER_TURN, Routed};
 use crate::app::text_targets::{self, TextCx};
 use crate::app::tokens::{self, Layout, Sp, Sz, TextStyle};
-use crate::app::{commands, delivery, mutations, navigation, review, viewport};
+use crate::app::{commands, delivery, guide, mutations, navigation, review, viewport};
 use crate::contracts::commands::SettingsSection;
 use crate::contracts::commands::{CommandsAction, LauncherFolder, SettingsSnapshot, ToastUpdate};
 use crate::contracts::review::PullsAction;
@@ -172,6 +172,13 @@ impl<D: EffectDispatcher> DiffyApp<D> {
         self.shell.debug_overlay
     }
 
+    /// Applies an intent as if a stream had raised it, for tests that need
+    /// shared state without driving every worker.
+    #[cfg(test)]
+    pub fn inject(&mut self, intent: Intent) -> bool {
+        self.reduce(Reduction::default().intent(intent))
+    }
+
     fn copy(&mut self, text: String, cx: &mut UiContext) {
         cx.window.set_clipboard_text(&text);
         self.tick(cx);
@@ -310,7 +317,10 @@ impl<D: EffectDispatcher> DiffyApp<D> {
             | Intent::RequestConfirmation(_)
             | Intent::Toast(_)
             | Intent::RankFiles(_)
-            | Intent::RankFilesUnavailable { .. } => false,
+            | Intent::RankFilesUnavailable { .. }
+            | Intent::RequestGuide(_)
+            | Intent::GuideUnavailable { .. }
+            | Intent::RevealSource(_) => false,
         }
     }
 
@@ -638,10 +648,14 @@ impl<D: EffectDispatcher> DiffyApp<D> {
         }
         let theme = cx.theme;
         let fits = tokens::sidebar_fits(theme, width) && self.controllers.navigation.visible();
-        let (files_w, main_w) = match self.shell.sidebar.resolve(width).as_slice() {
+        let (files_w, pane_w) = match self.shell.sidebar.resolve(width).as_slice() {
             [files, main] if fits => (*files, *main),
             _ => (0.0, width),
         };
+        let guide_open = self.controllers.guide.is_open() && self.shared.repository.is_some();
+        let guide_w = tokens::sidebar_default(theme).min(pane_w);
+        let beside = guide_open && pane_w - guide_w >= tokens::main_surface_min(theme);
+        let main_w = if beside { pane_w - guide_w } else { pane_w };
         let files = fits.then(|| {
             let slot = Slot {
                 shared: &self.shared,
@@ -714,6 +728,21 @@ impl<D: EffectDispatcher> DiffyApp<D> {
                 {?strip}
                 <div w={main_w} h={body_h} class="relative">{main}{?bar}</div>
             </div>
+        };
+        let main = if guide_open {
+            let slot = Slot {
+                shared: &self.shared,
+                width: if beside { guide_w } else { pane_w },
+                height,
+            };
+            let panel = guide::panel(&self.controllers.guide, &slot, cx);
+            if beside {
+                view! { <div w={pane_w} h={height} class="flex-row">{main}{panel}</div> }
+            } else {
+                panel
+            }
+        } else {
+            main
         };
         let content = match files {
             Some(files) => Split::new(

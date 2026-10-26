@@ -163,7 +163,34 @@ const ENTRY_STEMS: &[&str] = &[
 
 const SOURCE_ROOTS: &[&str] = &["", "src", "lib", "app", "pkg", "cmd", "internal", "core"];
 
+/// Why a path is noise rather than code to read: a lockfile, a binary or
+/// asset, or generated, vendored and fixture data.
+pub fn noise_reason(path: &str, binary: bool) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    let (dir, name) = lower.rsplit_once('/').unwrap_or(("", lower.as_str()));
+    let ext = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => ext,
+        _ => "",
+    };
+    if LOCKFILES.contains(&name) || name.ends_with(".lock") {
+        Some("lockfile")
+    } else if binary || ASSET_EXTENSIONS.contains(&ext) {
+        Some("binary or asset")
+    } else if NOISE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        || name.contains(".generated.")
+        || name.contains("_generated.")
+        || dir.split('/').any(|segment| NOISE_DIRS.contains(&segment))
+    {
+        Some("generated or vendored")
+    } else {
+        None
+    }
+}
+
 pub fn tier(path: &str, binary: bool) -> Tier {
+    if noise_reason(path, binary).is_some() {
+        return Tier::Noise;
+    }
     let lower = path.to_ascii_lowercase();
     let (dir, name) = lower.rsplit_once('/').unwrap_or(("", lower.as_str()));
     let (stem, ext) = match name.rsplit_once('.') {
@@ -171,16 +198,6 @@ pub fn tier(path: &str, binary: bool) -> Tier {
         _ => (name, ""),
     };
     let in_dir = |names: &[&str]| dir.split('/').any(|segment| names.contains(&segment));
-    if binary
-        || LOCKFILES.contains(&name)
-        || NOISE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
-        || name.contains(".generated.")
-        || name.contains("_generated.")
-        || ASSET_EXTENSIONS.contains(&ext)
-        || in_dir(NOISE_DIRS)
-    {
-        return Tier::Noise;
-    }
     let original = path.rsplit('/').next().unwrap_or(path);
     let original = original.split('.').next().unwrap_or(original);
     if in_dir(TEST_DIRS) || is_test_name(name, stem, original) {

@@ -4,11 +4,13 @@ use quark_components::SplitEvent;
 
 use crate::app::commands::CommandsController;
 use crate::app::delivery::DeliveryController;
+use crate::app::guide::GuideController;
 use crate::app::mutations::MutationsController;
 use crate::app::navigation::NavigationController;
 use crate::app::review::ReviewController;
 use crate::app::viewport::ViewportController;
 use crate::contracts::commands::{CommandDescriptor, CommandSource, CommandsAction};
+use crate::contracts::guide::GuideAction;
 use crate::contracts::review::ReviewAction;
 use crate::contracts::shared::SharedContext;
 use crate::contracts::shell::{
@@ -23,14 +25,16 @@ pub enum Stream {
     Review,
     Mutations,
     Delivery,
+    Guide,
 }
 
-pub const INTENT_ORDER: [Stream; 6] = [
+pub const INTENT_ORDER: [Stream; 7] = [
     Stream::Navigation,
     Stream::Viewport,
     Stream::Mutations,
     Stream::Review,
     Stream::Delivery,
+    Stream::Guide,
     Stream::Commands,
 ];
 
@@ -49,6 +53,7 @@ pub struct Controllers {
     pub review: ReviewController,
     pub mutations: MutationsController,
     pub delivery: DeliveryController,
+    pub guide: GuideController,
 }
 
 impl Controllers {
@@ -85,7 +90,25 @@ impl Controllers {
             Action::Review(action) => self.review.reduce_action(action, cx),
             Action::Mutations(action) => self.mutations.reduce_action(action, cx),
             Action::Delivery(action) => self.delivery.reduce_action(action, cx),
+            Action::Guide(action) => self.guide_action(action, cx),
         })
+    }
+
+    fn guide_action(&mut self, action: GuideAction, cx: &SharedContext) -> Reduction {
+        if action == GuideAction::Generate {
+            let description = self.review.overview().data.as_ref();
+            self.guide
+                .observe_description(description.map(|overview| overview.body.as_str()));
+        }
+        let navigates = matches!(
+            action,
+            GuideAction::SelectStep(_) | GuideAction::StepBy(_) | GuideAction::HunkBy(_)
+        );
+        let mut reduction = self.guide.reduce_action(action, cx);
+        if navigates && self.review.overview_open() {
+            reduction.merge(self.review.reduce_action(ReviewAction::CloseOverview, cx));
+        }
+        reduction
     }
 
     fn commands_action(&mut self, action: CommandsAction, cx: &SharedContext) -> Reduction {
@@ -111,6 +134,7 @@ impl Controllers {
         self.review.commands(cx, &mut out);
         self.mutations.commands(cx, &mut out);
         self.delivery.commands(cx, &mut out);
+        self.guide.commands(cx, &mut out);
         self.viewport.interaction.commands(cx, &mut out);
         out.into()
     }
@@ -128,6 +152,7 @@ impl Controllers {
             AppEvent::Review(event) => self.review.reduce_event(event, cx),
             AppEvent::Mutations(event) => self.mutations.reduce_event(event, cx),
             AppEvent::Delivery(event) => self.delivery.reduce_event(event, cx),
+            AppEvent::Guide(event) => self.guide.reduce_event(event, cx),
         })
     }
 
@@ -141,6 +166,7 @@ impl Controllers {
                 Stream::Review => self.review.apply_intent(intent, cx),
                 Stream::Mutations => self.mutations.apply_intent(intent, cx),
                 Stream::Delivery => self.delivery.apply_intent(intent, cx),
+                Stream::Guide => self.guide.apply_intent(intent, cx),
             });
         }
         reduction
@@ -175,6 +201,7 @@ ui_action!(
     crate::contracts::review::ReviewAction,
     crate::contracts::mutations::MutationsAction,
     crate::contracts::delivery::DeliveryAction,
+    crate::contracts::guide::GuideAction,
 );
 
 fn opens_review_modal(action: &ReviewAction) -> bool {

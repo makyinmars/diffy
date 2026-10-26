@@ -97,6 +97,7 @@ pub struct InteractionController {
     pub(super) line_drag: Option<SourceTarget>,
     pub(super) stale_view: Option<f32>,
     pub(super) definition: Option<(SourcePoint, String)>,
+    guided: Option<SourcePoint>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -158,6 +159,7 @@ impl Default for InteractionController {
             line_drag: None,
             definition: None,
             stale_view: None,
+            guided: None,
         }
     }
 }
@@ -420,6 +422,7 @@ impl InteractionController {
         self.seeded.clear();
         self.scopes.borrow_mut().clear();
         self.stale_view = None;
+        self.guided = None;
         self.phase = Phase::Loading;
     }
 
@@ -591,7 +594,14 @@ impl InteractionController {
             self.reveal_file(selected.key);
         }
         self.sync_solo(cx.selected_file.map(|s| s.key));
-        Reduction::changed()
+        let mut reduction = Reduction::changed();
+        if let Some(point) = self.guided.filter(|point| installed.contains(&point.file))
+            && let Some(revealed) = self.reveal_source(point)
+        {
+            self.guided = None;
+            reduction.merge(self.follow(revealed, false));
+        }
+        reduction
     }
 
     fn sync_solo(&mut self, selected: Option<FileKey>) -> bool {
@@ -971,6 +981,32 @@ impl InteractionController {
             .intents
             .push(Intent::FocusReviewCard(Some(annotation.card.clone())));
         reduction
+    }
+
+    /// Reveals a line for the guide. A file that isn't loaded yet is shown
+    /// and selected so the pipeline loads it; the line follows on install.
+    fn reveal_guided(&mut self, target: &SourceTarget) -> Reduction {
+        let point = SourcePoint {
+            file: target.file,
+            side: target.side,
+            line: target.lines.start,
+            byte: 0,
+        };
+        if let Some(reduction) = self.reveal_source(point) {
+            self.guided = None;
+            return self.follow(reduction, false);
+        }
+        self.guided = Some(point);
+        let solo = self.sync_solo(Some(point.file));
+        let revealed = self.reveal_file(point.file);
+        Reduction {
+            changed: solo || revealed,
+            ..Reduction::default()
+        }
+        .intent(Intent::SelectFile(Some(SelectedFile {
+            key: point.file,
+            origin: SelectionOrigin::Command,
+        })))
     }
 
     fn reveal_source(&mut self, point: SourcePoint) -> Option<Reduction> {
@@ -1386,6 +1422,7 @@ impl Controller for InteractionController {
                 let open = InteractionAction::SetTextCompareView(TextCompareView::Edit);
                 return self.reduce_action(open, cx);
             }
+            Intent::RevealSource(target) => return self.reveal_guided(target),
             Intent::Startup(startup) => self.apply_settings(&startup.settings, true, cx),
             Intent::SettingsChanged(settings) => self.apply_settings(&settings.settings, false, cx),
             Intent::SelectFile(Some(selected)) if selected.origin != SelectionOrigin::Viewport => {

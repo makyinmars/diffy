@@ -3,6 +3,7 @@ use quark_ui::key_context::KeyBindings;
 
 use crate::contracts::commands::{CommandsAction, SettingsSection};
 use crate::contracts::delivery::DeliveryAction;
+use crate::contracts::guide::GuideAction;
 use crate::contracts::mutations::MutationsAction;
 use crate::contracts::navigation::CompareField;
 use crate::contracts::navigation::{NavigationAction, SidebarTab};
@@ -303,6 +304,29 @@ const REVIEW_KEYS: &[Entry] = &[
     ),
 ];
 
+const GUIDE_KEYS: &[Entry] = &[
+    Entry::new(WORKSPACE, C::ToggleGuide, &["i"], "Show or hide the guide"),
+    Entry::new(WORKSPACE, C::NextGuideStep, &["shift+."], "Next guide step"),
+    Entry::new(
+        WORKSPACE,
+        C::PreviousGuideStep,
+        &["shift+,"],
+        "Previous guide step",
+    ),
+    Entry::new(
+        WORKSPACE,
+        C::NextGuideHunk,
+        &["."],
+        "Next hunk in the guide",
+    ),
+    Entry::new(
+        WORKSPACE,
+        C::PreviousGuideHunk,
+        &[","],
+        "Previous hunk in the guide",
+    ),
+];
+
 const AREAS: &[Entry] = &[
     Entry::new(GLOBAL, C::JumpToElement, &["f"], "Jump to any control"),
     Entry::new(
@@ -340,6 +364,10 @@ const GROUPS: &[ShortcutGroup<ShortcutCommand>] = &[
     ShortcutGroup {
         title: "Review",
         entries: REVIEW_KEYS,
+    },
+    ShortcutGroup {
+        title: "Guide",
+        entries: GUIDE_KEYS,
     },
     ShortcutGroup {
         title: "Scrolling",
@@ -605,6 +633,11 @@ pub fn builtin_action(command: ShortcutCommand) -> Option<Action> {
         C::FocusAreaRight => ShellAction::FocusArea(AreaDirection::Right).into(),
         C::FocusAreaUp => ShellAction::FocusArea(AreaDirection::Up).into(),
         C::FocusAreaDown => ShellAction::FocusArea(AreaDirection::Down).into(),
+        C::ToggleGuide => GuideAction::Toggle.into(),
+        C::NextGuideStep => GuideAction::StepBy(1).into(),
+        C::PreviousGuideStep => GuideAction::StepBy(-1).into(),
+        C::NextGuideHunk => GuideAction::HunkBy(1).into(),
+        C::PreviousGuideHunk => GuideAction::HunkBy(-1).into(),
         C::ToggleFocus
         | C::GoPrefix
         | C::SettingsNextSection

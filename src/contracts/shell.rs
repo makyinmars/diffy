@@ -5,6 +5,7 @@ use crate::contracts::commands::{
 use crate::contracts::delivery::{
     DeliveryAction, DeliveryEffect, DeliveryEvent, GrammarAvailability,
 };
+use crate::contracts::guide::{GuideAction, GuideEffect, GuideEvent, GuideRequest};
 use crate::contracts::mutations::{MutationsAction, MutationsEffect, MutationsEvent};
 use crate::contracts::navigation::{
     NavigationAction, NavigationEffect, NavigationEvent, RankFilesRequest, RepositoryContext,
@@ -115,6 +116,7 @@ pub enum Action {
     Review(ReviewAction),
     Mutations(MutationsAction),
     Delivery(DeliveryAction),
+    Guide(GuideAction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +128,7 @@ pub enum Effect {
     Review(ReviewEffect),
     Mutations(MutationsEffect),
     Delivery(DeliveryEffect),
+    Guide(GuideEffect),
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +140,7 @@ pub enum AppEvent {
     Review(ReviewEvent),
     Mutations(MutationsEvent),
     Delivery(DeliveryEvent),
+    Guide(GuideEvent),
 }
 
 impl AppEvent {
@@ -193,6 +197,9 @@ pub enum Intent {
     Toast(ToastUpdate),
     RankFiles(Rc<RankFilesRequest>),
     RankFilesUnavailable { job: JobId, reason: String },
+    RequestGuide(Rc<GuideRequest>),
+    GuideUnavailable { job: JobId, reason: String },
+    RevealSource(SourceTarget),
 }
 
 #[derive(Debug, Default)]
@@ -258,7 +265,8 @@ route!(
     Commands(CommandsAction),
     Review(ReviewAction),
     Mutations(MutationsAction),
-    Delivery(DeliveryAction)
+    Delivery(DeliveryAction),
+    Guide(GuideAction)
 );
 route!(
     Effect,
@@ -268,7 +276,8 @@ route!(
     Commands(CommandsEffect),
     Review(ReviewEffect),
     Mutations(MutationsEffect),
-    Delivery(DeliveryEffect)
+    Delivery(DeliveryEffect),
+    Guide(GuideEffect)
 );
 route!(
     AppEvent,
@@ -278,5 +287,6 @@ route!(
     Commands(CommandsEvent),
     Review(ReviewEvent),
     Mutations(MutationsEvent),
-    Delivery(DeliveryEvent)
+    Delivery(DeliveryEvent),
+    Guide(GuideEvent)
 );

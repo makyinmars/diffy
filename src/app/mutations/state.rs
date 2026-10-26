@@ -19,6 +19,7 @@ use crate::app::text_targets::{
 use crate::contracts::commands::{
     CommandDescriptor, CommandSource, ConfirmationRequest, ToastKind, ToastUpdate,
 };
+use crate::contracts::guide::{GuideEffect, GuideJob, GuideRequest};
 use crate::contracts::mutations::{
     AiBackend, ConfirmedMutation, FileOperationRequest, GenerateCommitMessageRequest,
     MutationSelection, MutationSource, MutationSourceKey, MutationsAction, MutationsEffect,
@@ -111,6 +112,7 @@ pub struct AiState {
 enum AiTask {
     CommitMessage,
     RankFiles(RankFilesRequest),
+    Guide(Rc<GuideRequest>),
 }
 
 enum Backend {
@@ -1055,6 +1057,23 @@ impl MutationsController {
         match task {
             AiTask::CommitMessage => self.generate_commit_message(cx),
             AiTask::RankFiles(request) => self.rank_files(&request, cx),
+            AiTask::Guide(request) => self.request_guide(&request, cx),
+        }
+    }
+
+    fn request_guide(&mut self, request: &Rc<GuideRequest>, cx: &SharedContext) -> Reduction {
+        match self.ai_backend(|| AiTask::Guide(request.clone()), cx) {
+            Backend::Ready(backend) => {
+                Reduction::default().effect(GuideEffect::Generate(Box::new(GuideJob {
+                    request: GuideRequest::clone(request),
+                    backend,
+                })))
+            }
+            Backend::Waiting(reduction) => reduction,
+            Backend::Unavailable(reason) => Reduction::default().intent(Intent::GuideUnavailable {
+                job: request.job,
+                reason,
+            }),
         }
     }
 
@@ -2138,6 +2157,7 @@ impl Controller for MutationsController {
                 reduction
             }
             Intent::RankFiles(request) => self.rank_files(request, cx),
+            Intent::RequestGuide(request) => self.request_guide(request, cx),
             Intent::ActivateWorkspace { .. } => {
                 let mut reduction = self.cancel_generation();
                 self.reset();

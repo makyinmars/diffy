@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::Provider;
+use super::{ModelTier, Provider};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant. Reply with plain text only.";
-const CLAUDE_MODEL: &str = "haiku";
-const CODEX_EFFORT: &str = "model_reasoning_effort=\"low\"";
+
 const WORKDIR: &str = "diffy";
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
+const THOROUGH_TIMEOUT: Duration = Duration::from_secs(420);
 const POLL: Duration = Duration::from_millis(100);
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const DRAIN_WAIT: Duration = Duration::from_secs(1);
@@ -180,7 +180,27 @@ pub fn workdir() -> Option<PathBuf> {
     crate::platform::startup::app_config_dir().map(|dir| dir.join(WORKDIR))
 }
 
-fn args(tool: CliTool, workdir: &Path) -> Vec<OsString> {
+/// The model or effort each tool runs a tier with, as passed on its command
+/// line.
+pub fn tier_setting(tool: CliTool, tier: ModelTier) -> &'static str {
+    match (tool, tier) {
+        (CliTool::ClaudeCode, ModelTier::Fast) => "haiku",
+        (CliTool::ClaudeCode, ModelTier::Thorough) => "sonnet",
+        (CliTool::Codex, ModelTier::Fast) => "low",
+        (CliTool::Codex, ModelTier::Thorough) => "medium",
+    }
+}
+
+fn timeout(tier: ModelTier) -> Duration {
+    match tier {
+        ModelTier::Fast => RUN_TIMEOUT,
+        ModelTier::Thorough => THOROUGH_TIMEOUT,
+    }
+}
+
+fn args(tool: CliTool, workdir: &Path, tier: ModelTier) -> Vec<OsString> {
+    let setting = tier_setting(tool, tier);
+    let effort = format!("model_reasoning_effort=\"{setting}\"");
     let fixed: &[&str] = match tool {
         CliTool::ClaudeCode => &[
             "-p",
@@ -189,7 +209,7 @@ fn args(tool: CliTool, workdir: &Path) -> Vec<OsString> {
             "--verbose",
             "--include-partial-messages",
             "--model",
-            CLAUDE_MODEL,
+            setting,
             "--tools",
             "",
             "--strict-mcp-config",
@@ -212,7 +232,7 @@ fn args(tool: CliTool, workdir: &Path) -> Vec<OsString> {
             "--color",
             "never",
             "-c",
-            CODEX_EFFORT,
+            &effort,
         ],
     };
     let mut args: Vec<OsString> = fixed.iter().map(OsString::from).collect();
@@ -228,6 +248,7 @@ pub fn run(
     command: &CliCommand,
     workdir: &Path,
     user_message: &str,
+    tier: ModelTier,
     live: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(String) -> bool,
 ) -> Result<RunOutcome, String> {
@@ -236,7 +257,7 @@ pub fn run(
         .map_err(|error| format!("couldn't create {}: {error}", workdir.display()))?;
     let mut process = Command::new(&command.program);
     process
-        .args(args(command.tool, workdir))
+        .args(args(command.tool, workdir, tier))
         .current_dir(workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -275,7 +296,8 @@ pub fn run(
         }
     });
 
-    let deadline = Instant::now() + RUN_TIMEOUT;
+    let limit = timeout(tier);
+    let deadline = Instant::now() + limit;
     let mut failure = None;
     let mut warning = None;
     let mut exited_at = None;
@@ -305,7 +327,7 @@ pub fn run(
         }
         if Instant::now() >= deadline {
             stop(&mut child);
-            return Err(timed_out(label));
+            return Err(timed_out(label, limit));
         }
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -336,11 +358,8 @@ pub fn run(
     Ok(RunOutcome::Finished)
 }
 
-fn timed_out(label: &str) -> String {
-    format!(
-        "{label} didn't answer within {} seconds",
-        RUN_TIMEOUT.as_secs()
-    )
+fn timed_out(label: &str, limit: Duration) -> String {
+    format!("{label} didn't answer within {} seconds", limit.as_secs())
 }
 
 fn exit_message(label: &str, status: ExitStatus, warning: Option<String>, stderr: &str) -> String {
@@ -531,7 +550,7 @@ fn codex_message(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliEvent, CliTool, StreamParser, args};
+    use super::{CliEvent, CliTool, ModelTier, StreamParser, args};
     use std::path::Path;
 
     fn feed(tool: CliTool, lines: &[&str]) -> Vec<CliEvent> {
@@ -626,14 +645,32 @@ mod tests {
 
     #[test]
     fn invocations_disable_tools_and_persistence() {
-        let claude = args(CliTool::ClaudeCode, Path::new("/tmp/work"));
+        let claude = args(CliTool::ClaudeCode, Path::new("/tmp/work"), ModelTier::Fast);
         for flag in ["--no-session-persistence", "--tools", "--strict-mcp-config"] {
             assert!(claude.iter().any(|arg| arg == flag), "{flag}");
         }
-        let codex = args(CliTool::Codex, Path::new("/tmp/work"));
+        let codex = args(CliTool::Codex, Path::new("/tmp/work"), ModelTier::Fast);
         for flag in ["--ephemeral", "read-only", "--ignore-user-config"] {
             assert!(codex.iter().any(|arg| arg == flag), "{flag}");
         }
         assert_eq!(codex.last().map(|arg| arg.as_os_str()), Some("-".as_ref()));
+    }
+
+    #[test]
+    fn thorough_tier_runs_the_stronger_model() {
+        let value_after = |args: &[std::ffi::OsString], flag: &str| {
+            let at = args.iter().position(|arg| arg == flag)?;
+            args.get(at + 1).cloned()
+        };
+        let work = Path::new("/tmp/work");
+        let fast = args(CliTool::ClaudeCode, work, ModelTier::Fast);
+        let thorough = args(CliTool::ClaudeCode, work, ModelTier::Thorough);
+        assert_eq!(value_after(&fast, "--model"), Some("haiku".into()));
+        assert_eq!(value_after(&thorough, "--model"), Some("sonnet".into()));
+        let codex = args(CliTool::Codex, work, ModelTier::Thorough);
+        assert_eq!(
+            value_after(&codex, "-c"),
+            Some("model_reasoning_effort=\"medium\"".into())
+        );
     }
 }

@@ -106,6 +106,7 @@ impl MutationsServices {
             backend,
             user_message,
             ai::COMMIT_MAX_TOKENS,
+            ai::ModelTier::Fast,
             live,
             &mut forward,
         );
@@ -149,11 +150,16 @@ impl MutationsServices {
             bytes = user_message.len(),
             "ai.rank: dispatch"
         );
-        let reply =
-            super::ai::complete_text(backend, user_message, ai::rank::RANK_MAX_TOKENS, &|| true)
-                .inspect_err(|message| {
-                    tracing::warn!(job = request.job.0, %message, "ai.rank: request failed");
-                })?;
+        let reply = super::ai::complete_text(
+            backend,
+            user_message,
+            ai::rank::RANK_MAX_TOKENS,
+            ai::ModelTier::Fast,
+            &|| true,
+        )
+        .inspect_err(|message| {
+            tracing::warn!(job = request.job.0, %message, "ai.rank: request failed");
+        })?;
         let ranking = ai::rank::parse_ranking(&reply, sent);
         tracing::info!(
             job = request.job.0,

@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, Row};
 use sea_query::{
-    ColumnDef, Expr, ExprTrait, Iden, OnConflict, Query, SelectStatement, SqliteQueryBuilder,
-    Table, TableCreateStatement,
+    ColumnDef, Expr, ExprTrait, Iden, Index, OnConflict, Query, SelectStatement,
+    SqliteQueryBuilder, Table, TableCreateStatement,
 };
 use sea_query_rusqlite::{RusqliteBinder, RusqliteValues};
 
@@ -41,6 +41,15 @@ pub enum Frecency {
 pub enum ReviewSessions {
     Table,
     Key,
+    Json,
+}
+
+#[derive(Iden)]
+pub enum Guides {
+    Table,
+    Key,
+    Subject,
+    UpdatedMs,
     Json,
 }
 
@@ -108,7 +117,24 @@ fn repository_remotes() -> Vec<String> {
     ]
 }
 
-const MIGRATIONS: &[fn() -> Vec<String>] = &[schema_v1, repository_remotes];
+fn guides() -> Vec<String> {
+    vec![
+        Table::create()
+            .table(Guides::Table)
+            .col(ColumnDef::new(Guides::Key).text().primary_key())
+            .col(ColumnDef::new(Guides::Subject).text().not_null())
+            .col(ColumnDef::new(Guides::UpdatedMs).big_integer().not_null())
+            .col(ColumnDef::new(Guides::Json).text().not_null())
+            .to_string(SqliteQueryBuilder),
+        Index::create()
+            .name("guides_subject")
+            .table(Guides::Table)
+            .col(Guides::Subject)
+            .to_string(SqliteQueryBuilder),
+    ]
+}
+
+const MIGRATIONS: &[fn() -> Vec<String>] = &[schema_v1, repository_remotes, guides];
 
 #[derive(Clone)]
 pub struct Database {

@@ -16,6 +16,7 @@ use crate::app::icons;
 use crate::app::shell::Slot;
 use crate::app::text_targets::REVIEW_OVERVIEW;
 use crate::app::tokens::{self, Ico, Layout, Rad, Sp, Sz, TextStyle, Tint};
+use crate::contracts::guide::GuideAction;
 use crate::contracts::review::{CardKey, ReviewAction};
 use crate::core::forge::model::{
     PullRequestCheckContext, PullRequestInfo, PullRequestLabel, PullRequestOverview,
@@ -201,6 +202,9 @@ impl Page<'_> {
             self.theme,
         )
         .disabled(self.review.overview.loading);
+        let guide = controls::button("Guide", GuideAction::Open, Tone::Secondary)
+            .icon(lucide::SPARKLES)
+            .tooltip("A step-by-step walk through the change (i)");
         let browser = controls::icon_button(
             lucide::EXTERNAL_LINK,
             &self.on_forge("Open on"),
@@ -242,6 +246,7 @@ impl Page<'_> {
                     </div>
                     <text size={Px(small)} color={tc.text_muted}>{format!("#{}", summary.number)}</text>
                     <spacer />
+                    <div test_id="review.overview.guide">{guide}</div>
                     <div test_id="review.overview.refresh">{refresh}</div>
                     <div test_id="review.overview.open_in_browser">{browser}</div>
                     <div test_id="review.overview.back">{back}</div>

@@ -1,13 +1,14 @@
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
-use crate::ai::{self, CliCommand, GenerateRequest, RunOutcome, StreamMessage};
+use crate::ai::{self, CliCommand, GenerateRequest, ModelTier, RunOutcome, StreamMessage};
 use crate::contracts::mutations::AiBackend;
 
 pub fn complete(
     backend: AiBackend,
     prompt: String,
     max_tokens: u32,
+    tier: ModelTier,
     live: &dyn Fn() -> bool,
     forward: &mut dyn FnMut(String) -> bool,
 ) -> Result<RunOutcome, String> {
@@ -18,11 +19,12 @@ pub fn complete(
                 api_key: api_key.into_inner(),
                 user_message: prompt,
                 max_tokens,
+                tier,
             },
             live,
             forward,
         ),
-        AiBackend::Cli(command) => run_cli(&command, &prompt, live, forward),
+        AiBackend::Cli(command) => run_cli(&command, &prompt, tier, live, forward),
     }
 }
 
@@ -30,10 +32,11 @@ pub fn complete_text(
     backend: AiBackend,
     prompt: String,
     max_tokens: u32,
+    tier: ModelTier,
     live: &dyn Fn() -> bool,
 ) -> Result<String, String> {
     let mut reply = String::new();
-    let outcome = complete(backend, prompt, max_tokens, live, &mut |chunk| {
+    let outcome = complete(backend, prompt, max_tokens, tier, live, &mut |chunk| {
         reply.push_str(&chunk);
         true
     })?;
@@ -72,6 +75,7 @@ fn stream_api(
 fn run_cli(
     command: &CliCommand,
     user_message: &str,
+    tier: ModelTier,
     live: &dyn Fn() -> bool,
     forward: &mut dyn FnMut(String) -> bool,
 ) -> Result<RunOutcome, String> {
@@ -84,5 +88,5 @@ fn run_cli(
         user_message_bytes = user_message.len(),
         "ai.cli: run"
     );
-    ai::cli::run(command, &workdir, user_message, live, forward)
+    ai::cli::run(command, &workdir, user_message, tier, live, forward)
 }

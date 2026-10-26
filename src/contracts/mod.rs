@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod delivery;
+pub mod guide;
 pub mod mutations;
 pub mod navigation;
 pub mod review;

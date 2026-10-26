@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::ai::{CliCommand, CliScan, Provider};
+use crate::ai::{CliCommand, CliScan, CliTool, ModelTier, Provider};
 use crate::contracts::navigation::{RankFilesRequest, RepositoryRevision};
 use crate::contracts::review::Secret;
 use crate::contracts::shared::{FileKey, FileRevision, HunkTarget, JobId, SourceTarget};
@@ -234,6 +234,21 @@ impl AiBackend {
         match self {
             Self::Api { provider, .. } => provider.label(),
             Self::Cli(command) => command.tool.label(),
+        }
+    }
+
+    /// Names the model a tier runs on this backend, for display and as part
+    /// of cache keys.
+    pub fn model_label(&self, tier: ModelTier) -> String {
+        match self {
+            Self::Api { provider, .. } => provider.model_for(tier).to_owned(),
+            Self::Cli(command) => {
+                let setting = crate::ai::cli::tier_setting(command.tool, tier);
+                match command.tool {
+                    CliTool::ClaudeCode => format!("Claude Code ({setting})"),
+                    CliTool::Codex => format!("Codex ({setting} effort)"),
+                }
+            }
         }
     }
 }

@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod delivery;
+pub mod guide;
 pub mod mutations;
 pub mod navigation;
 pub mod review;
@@ -34,6 +35,7 @@ pub struct AppRuntime {
     review: review::ReviewRuntime,
     mutations: mutations::MutationsRuntime,
     delivery: delivery::DeliveryRuntime,
+    guide: guide::GuideRuntime,
 }
 
 impl AppRuntime {
@@ -56,6 +58,7 @@ impl AppRuntime {
                 options.keyring_enabled,
             ),
             delivery: delivery::DeliveryRuntime::new(services.delivery),
+            guide: guide::GuideRuntime::new(services.guide),
             events,
         }
     }
@@ -70,6 +73,7 @@ impl AppRuntime {
             Effect::Review(effect) => self.review.dispatch(effect, events),
             Effect::Mutations(effect) => self.mutations.dispatch(effect, events),
             Effect::Delivery(effect) => self.delivery.dispatch(effect, events),
+            Effect::Guide(effect) => self.guide.dispatch(effect, events),
         }
     }
 

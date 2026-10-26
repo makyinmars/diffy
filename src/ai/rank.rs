@@ -85,7 +85,7 @@ pub fn parse_ranking(text: &str, count: usize) -> Result<Vec<u32>, String> {
     Ok(ranked)
 }
 
-fn extract_json(text: &str) -> Option<Value> {
+pub(super) fn extract_json(text: &str) -> Option<Value> {
     let text = text.trim();
     if let Ok(value) = serde_json::from_str(text) {
         return Some(value);

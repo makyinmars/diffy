@@ -92,6 +92,11 @@ pub enum ShortcutCommand {
     FocusAreaRight,
     FocusAreaUp,
     FocusAreaDown,
+    ToggleGuide,
+    NextGuideStep,
+    PreviousGuideStep,
+    NextGuideHunk,
+    PreviousGuideHunk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

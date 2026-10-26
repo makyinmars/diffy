@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod commands;
 pub mod delivery;
+pub mod guide;
 pub mod mutations;
 pub mod navigation;
 pub mod review;
@@ -13,11 +14,13 @@ use crate::core::error::{DiffyError, Result};
 use crate::core::vcs::backend::VcsRepository;
 use crate::core::vcs::discovery;
 use crate::core::vcs::git::is_pr_ref;
+use crate::platform::guide_store::GuideStore;
 use crate::platform::persistence::SettingsStore;
 use crate::platform::review_store::ReviewStore;
 
 pub use commands::CommandsServices;
 pub use delivery::DeliveryServices;
+pub use guide::GuideServices;
 pub use mutations::MutationsServices;
 pub use navigation::NavigationServices;
 pub use review::{ForgeBackend, LiveForge, ReviewServices};
@@ -32,6 +35,7 @@ pub struct AppServices {
     pub review: ReviewServices,
     pub mutations: MutationsServices,
     pub delivery: DeliveryServices,
+    pub guide: GuideServices,
 }
 
 impl AppServices {
@@ -51,6 +55,7 @@ impl AppServices {
             viewport: ViewportServices::default(),
             navigation: NavigationServices,
             commands: CommandsServices::new(settings_store.clone()),
+            guide: GuideServices::new(GuideStore::for_settings_store(&settings_store)),
             review: ReviewServices::new(settings_store, review_store, forge),
             mutations: MutationsServices,
             delivery: DeliveryServices,
