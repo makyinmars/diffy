@@ -41,10 +41,11 @@ use crate::contracts::viewport::pipeline::ManifestFile;
 use crate::core::compare::stats::CompareFilePaths;
 use crate::core::forge::github::{CreatePullRequestReview, DeviceFlowState};
 use crate::core::forge::model::{
-    ForgeUser, MyPullRequest, PullRequestFilter, PullRequestPage, PullRequestActor, PullRequestCheckContext, PullRequestCheckSummary,
-    PullRequestInfo, PullRequestLabel, PullRequestOverview, PullRequestReviewData,
-    PullRequestReviewThread, PullRequestReviewThreadComment, PullRequestReviewer, PullRequestStats,
-    PullRequestTimelineItem, PullRequestTimelineKind, ReviewThreadResolution,
+    ForgeUser, MyPullRequest, PullRequestActor, PullRequestCheckContext, PullRequestCheckSummary,
+    PullRequestFilter, PullRequestInfo, PullRequestLabel, PullRequestOverview, PullRequestPage,
+    PullRequestReviewData, PullRequestReviewThread, PullRequestReviewThreadComment,
+    PullRequestReviewer, PullRequestStats, PullRequestTimelineItem, PullRequestTimelineKind,
+    ReviewThreadResolution,
 };
 use crate::core::review::{
     ReviewAnchor, ReviewComment, ReviewCommentId, ReviewDecision, ReviewDraftKind,
@@ -214,7 +215,8 @@ struct Script {
     /// Post only the first draft, the way Bitbucket stops partway.
     partial_submit: bool,
     bitbucket_pulls: Option<Vec<MyPullRequest>>,
-    pages: HashMap<(ReviewForge, PullRequestFilter, Option<String>), Result<PullRequestPage, String>>,
+    pages:
+        HashMap<(ReviewForge, PullRequestFilter, Option<String>), Result<PullRequestPage, String>>,
     comparisons: HashMap<String, PullRequestComparison>,
     overviews: HashMap<ReviewForge, PullRequestOverview>,
     requests: Vec<ForgeRequest>,
@@ -243,8 +245,14 @@ impl ForgeBackend for FakeGitHub {
             )
         });
         let (pulls, fail_pulls) = self.with(|s| (s.pulls.clone(), s.fail_pulls));
-        if let ForgeRequest::FetchMyPullRequests { forge, filter, cursor, .. } = &request
-            && let Some(result) = self.with(|s| s.pages.get(&(*forge, *filter, cursor.clone())).cloned())
+        if let ForgeRequest::FetchMyPullRequests {
+            forge,
+            filter,
+            cursor,
+            ..
+        } = &request
+            && let Some(result) =
+                self.with(|s| s.pages.get(&(*forge, *filter, cursor.clone())).cloned())
         {
             emit(match result {
                 Ok(page) => ForgeResponse::MyPullRequestsLoaded(page),
@@ -256,17 +264,16 @@ impl ForgeBackend for FakeGitHub {
         match request {
             ForgeRequest::LoadPullRequest { url, .. } => {
                 let number = pr_number(&url);
-                let comparison = self.with(|s| s.comparisons.get(&url).cloned()).unwrap_or_else(|| comparison(number));
+                let comparison = self
+                    .with(|s| s.comparisons.get(&url).cloned())
+                    .unwrap_or_else(|| comparison(number));
                 if cached {
                     emit(ForgeResponse::PullRequestCached {
                         url: url.clone(),
                         comparison: comparison.clone(),
                     });
                 }
-                emit(ForgeResponse::PullRequestLoaded {
-                    url,
-                    comparison,
-                });
+                emit(ForgeResponse::PullRequestLoaded { url, comparison });
             }
             ForgeRequest::FetchUser { token, .. }
                 if self.with(|s| s.rejected_tokens.iter().any(|t| t == token.expose())) =>
@@ -365,7 +372,9 @@ impl ForgeBackend for FakeGitHub {
                     message: "overview unavailable".to_owned(),
                 }
             } else {
-                let overview = self.with(|s| s.overviews.get(&pr.forge).cloned()).unwrap_or_else(|| overview_fixture(token.is_some()));
+                let overview = self
+                    .with(|s| s.overviews.get(&pr.forge).cloned())
+                    .unwrap_or_else(|| overview_fixture(token.is_some()));
                 ForgeResponse::PullRequestOverviewLoaded {
                     pr,
                     overview: Box::new(overview),
@@ -378,7 +387,10 @@ impl ForgeBackend for FakeGitHub {
                 forge: ReviewForge::Bitbucket,
                 ..
             } => emit(match self.with(|s| s.bitbucket_pulls.clone()) {
-                Some(pulls) => ForgeResponse::MyPullRequestsLoaded(PullRequestPage { pulls, ..PullRequestPage::default() }),
+                Some(pulls) => ForgeResponse::MyPullRequestsLoaded(PullRequestPage {
+                    pulls,
+                    ..PullRequestPage::default()
+                }),
                 None => ForgeResponse::MyPullRequestsLoadFailed {
                     message: "workspaces unavailable".to_owned(),
                 },
@@ -388,7 +400,10 @@ impl ForgeBackend for FakeGitHub {
                     message: "search unavailable".to_owned(),
                 }
             } else {
-                ForgeResponse::MyPullRequestsLoaded(PullRequestPage { pulls, ..PullRequestPage::default() })
+                ForgeResponse::MyPullRequestsLoaded(PullRequestPage {
+                    pulls,
+                    ..PullRequestPage::default()
+                })
             }),
         }
     }
@@ -2806,6 +2821,7 @@ fn my_pull(
 ) -> MyPullRequest {
     let mut pull = MyPullRequest {
         id: format!("PR_{number}"),
+        state: "OPEN".to_owned(),
         number,
         title: title.to_owned(),
         url: format!("https://github.com/{repo}/pull/{number}"),
@@ -3170,4 +3186,375 @@ fn pull_request_list_errors_offer_retry_and_empty_lists_say_so() {
     assert!(ui.try_find(By::test_id("review.pulls.error")).is_none());
     ui.find(By::role_name(Role::Status, "No open pull requests"));
     assert_eq!(pulls_requests(&ui.app().driver), 2);
+}
+
+fn history_pull(forge: ReviewForge, state: &str, number: i32) -> MyPullRequest {
+    my_pull(
+        number,
+        "owner/repo",
+        &format!("{state} historical change"),
+        |pull| {
+            pull.forge = forge;
+            pull.state = state.to_owned();
+            pull.url = match forge {
+                ReviewForge::GitHub => format!("https://github.com/owner/repo/pull/{number}"),
+                ReviewForge::Bitbucket => {
+                    format!("https://bitbucket.org/owner/repo/pull-requests/{number}")
+                }
+            };
+            pull.updated_at = format!("2026-10-{number:02}T12:00:00Z");
+            if forge == ReviewForge::Bitbucket {
+                pull.stats = None;
+                pull.checks = None;
+            }
+        },
+    )
+}
+
+fn history_page(pulls: Vec<MyPullRequest>, next: Option<&str>) -> PullRequestPage {
+    PullRequestPage {
+        pulls,
+        next_cursor: next.map(str::to_owned),
+        ..PullRequestPage::default()
+    }
+}
+
+fn history_driver(forge: ReviewForge) -> Driver {
+    let mut driver = pulls_driver();
+    if forge == ReviewForge::Bitbucket {
+        driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
+        driver.deliver(ReviewEvent::TokenLoaded {
+            forge,
+            token: Some(Secret::new("history-fixture-token")),
+        });
+    }
+    driver.fake.clones.push((
+        "bitbucket.org/owner/repo".to_owned(),
+        PathBuf::from("/tmp/repo"),
+    ));
+    driver.fake.github.with(|script| {
+        for (filter, state, number) in [
+            (PullRequestFilter::Open, "OPEN", 1),
+            (PullRequestFilter::Merged, "MERGED", 2),
+            (
+                PullRequestFilter::Closed,
+                if forge == ReviewForge::Bitbucket {
+                    "DECLINED"
+                } else {
+                    "CLOSED"
+                },
+                3,
+            ),
+        ] {
+            let pull = history_pull(forge, state, number);
+            let mut comparison = comparison(number);
+            comparison.info.title = pull.title.clone();
+            comparison.info.state = if state == "MERGED" {
+                "closed".to_owned()
+            } else {
+                state.to_ascii_lowercase()
+            };
+            comparison.info.merged = state == "MERGED";
+            comparison.info.base_sha = format!("historical-base-{number}");
+            comparison.info.head_sha = format!("historical-head-{number}");
+            script.comparisons.insert(pull.url.clone(), comparison);
+            script
+                .pages
+                .insert((forge, filter, None), Ok(history_page(vec![pull], None)));
+        }
+    });
+    driver
+}
+
+#[test]
+fn history_tab_changes_drop_stale_open_merged_and_closed_responses() {
+    for forge in [ReviewForge::GitHub, ReviewForge::Bitbucket] {
+        let mut driver = history_driver(forge);
+        driver.fake.hold = true;
+        driver.act(pulls(PullsAction::Open));
+        driver.act(pulls(PullsAction::SetState(PullRequestFilter::Merged)));
+        driver.act(pulls(PullsAction::SetState(PullRequestFilter::Closed)));
+        let held = std::mem::take(&mut driver.fake.held);
+        let filters: Vec<_> = held
+            .iter()
+            .filter_map(|effect| match effect {
+                ReviewEffect::Forge { request, .. } => match request.as_ref() {
+                    ForgeRequest::FetchMyPullRequests {
+                        forge: requested,
+                        filter,
+                        cursor,
+                        ..
+                    } => {
+                        assert_eq!(*requested, forge);
+                        assert!(cursor.is_none());
+                        Some(*filter)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            filters,
+            [
+                PullRequestFilter::Open,
+                PullRequestFilter::Merged,
+                PullRequestFilter::Closed
+            ]
+        );
+        driver.fake.hold = false;
+        for effect in held.into_iter().rev() {
+            for event in driver.fake.run(effect) {
+                driver.deliver(event);
+            }
+        }
+        assert_eq!(driver.review.pulls().state, PullRequestFilter::Closed);
+        assert!(!driver.review.pulls().loading);
+        let data = driver.review.pulls().data.as_ref().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].number, 3);
+        assert!(driver.errors().is_empty());
+    }
+}
+
+#[test]
+fn history_load_more_is_explicit_deduplicated_retryable_and_refresh_restarts() {
+    for forge in [ReviewForge::GitHub, ReviewForge::Bitbucket] {
+        let mut driver = history_driver(forge);
+        let first = history_pull(forge, "MERGED", 1);
+        let second = history_pull(forge, "MERGED", 2);
+        driver.fake.github.with(|script| {
+            script.pages.insert(
+                (forge, PullRequestFilter::Merged, None),
+                Ok(history_page(vec![first.clone()], Some("opaque-next"))),
+            );
+            script.pages.insert(
+                (
+                    forge,
+                    PullRequestFilter::Merged,
+                    Some("opaque-next".to_owned()),
+                ),
+                Err("history temporarily unavailable".to_owned()),
+            );
+        });
+        driver.act(pulls(PullsAction::Open));
+        driver.act(pulls(PullsAction::SetState(PullRequestFilter::Merged)));
+        assert_eq!(driver.review.pulls().total(), 1);
+        assert!(driver.review.pulls().has_more());
+        let requests = pulls_requests(&driver);
+        driver.fake.hold = true;
+        driver.act(pulls(PullsAction::LoadMore));
+        driver.act(pulls(PullsAction::LoadMore));
+        assert!(driver.review.pulls().loading_more);
+        assert_eq!(driver.fake.held.len(), 1);
+        driver.release();
+        assert_eq!(pulls_requests(&driver), requests + 1);
+        assert!(driver.review.pulls().has_more());
+        assert_eq!(driver.review.pulls().total(), 1);
+        assert_eq!(
+            driver.review.pulls().error.as_deref(),
+            Some("history temporarily unavailable")
+        );
+        driver.fake.github.with(|script| {
+            script.pages.insert(
+                (
+                    forge,
+                    PullRequestFilter::Merged,
+                    Some("opaque-next".to_owned()),
+                ),
+                Ok(history_page(vec![first, second], None)),
+            );
+        });
+        driver.act(pulls(PullsAction::LoadMore));
+        assert!(!driver.review.pulls().has_more());
+        assert!(driver.review.pulls().error.is_none());
+        let numbers: Vec<_> = driver
+            .review
+            .pulls()
+            .data
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pull| pull.number)
+            .collect();
+        assert_eq!(numbers, [2, 1]);
+        driver.act(pulls(PullsAction::Refresh));
+        assert_eq!(driver.review.pulls().total(), 1);
+        assert!(driver.review.pulls().has_more());
+        assert!(matches!(
+            driver.fake.requests().last(),
+            Some(ForgeRequest::FetchMyPullRequests {
+                filter: PullRequestFilter::Merged,
+                cursor: None,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn history_refresh_after_switch_and_account_changes_invalidate_old_pages() {
+    let mut driver = history_driver(ReviewForge::GitHub);
+    driver.act(pulls(PullsAction::Open));
+    driver.fake.hold = true;
+    driver.act(pulls(PullsAction::SetState(PullRequestFilter::Merged)));
+    let old = std::mem::take(&mut driver.fake.held);
+    driver.fake.hold = false;
+    driver.act(pulls(PullsAction::SetState(PullRequestFilter::Closed)));
+    driver.act(pulls(PullsAction::Refresh));
+    for effect in old {
+        for event in driver.fake.run(effect) {
+            driver.deliver(event);
+        }
+    }
+    assert_eq!(
+        driver.review.pulls().selected_pull().unwrap().state,
+        "CLOSED"
+    );
+    driver.fake.hold = true;
+    driver.act(pulls(PullsAction::LoadMore));
+    driver.act(pulls(PullsAction::Refresh));
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
+    driver.release();
+    assert!(driver.review.pulls().data.is_none());
+    assert!(!driver.review.pulls().loading);
+    driver.deliver(ReviewEvent::TokenLoaded {
+        forge: ReviewForge::GitHub,
+        token: Some(Secret::new("new-history-account")),
+    });
+    assert_eq!(driver.review.pulls().state, PullRequestFilter::Closed);
+    assert_eq!(
+        driver.review.pulls().selected_pull().unwrap().state,
+        "CLOSED"
+    );
+}
+
+#[test]
+fn historical_tabs_preview_and_overview_use_provider_lifecycle_labels() {
+    for forge in [ReviewForge::GitHub, ReviewForge::Bitbucket] {
+        let mut ui = harness(history_driver(forge));
+        ui.click_node(By::role_name(Role::Button, "Review PR"));
+        ui.find(By::role_name(Role::Tab, "Open"));
+        ui.find(By::role_name(Role::Tab, "Merged"));
+        ui.find(By::role_name(Role::Tab, "Closed"));
+        ui.find(By::role_name(Role::Label, "Pull requests authored by you"));
+        assert_eq!(
+            ui.app().driver.review.pulls().state,
+            PullRequestFilter::Open
+        );
+        for (key, filter, state, label, number) in [
+            ("2", PullRequestFilter::Merged, "MERGED", "Merged", 2),
+            (
+                "3",
+                PullRequestFilter::Closed,
+                if forge == ReviewForge::Bitbucket {
+                    "DECLINED"
+                } else {
+                    "CLOSED"
+                },
+                if forge == ReviewForge::Bitbucket {
+                    "Declined"
+                } else {
+                    "Closed"
+                },
+                3,
+            ),
+        ] {
+            ui.key(key);
+            assert_eq!(ui.app().driver.review.pulls().state, filter);
+            assert_eq!(ui.focus(), Some(focus_id(LogicalFocus::ReviewPulls)));
+            ui.find(By::role_name(Role::Label, format!("State: {label}")));
+            let text = ui.painted_text();
+            assert!(
+                !text.contains("Ready to merge")
+                    && !text.contains("Needs you")
+                    && !text.contains("Checking mergeability"),
+                "{text}"
+            );
+            ui.app_mut().driver.fake.github.with(|script| {
+                let mut overview = overview_fixture(true);
+                overview.state = state.to_owned();
+                script.overviews.insert(forge, overview);
+            });
+            ui.key("enter");
+            let driver = &ui.app().driver;
+            let session = driver.session();
+            assert_eq!(session.target.forge, forge);
+            assert_eq!(session.target.number, number);
+            assert_eq!(
+                session.pull_request.base_sha,
+                format!("historical-base-{number}")
+            );
+            assert_eq!(
+                session.pull_request.head_sha,
+                format!("historical-head-{number}")
+            );
+            ui.app_mut().driver.act(ReviewAction::OpenOverview);
+            ui.send_message(ReviewEvent::TokenSaveFailed {
+                forge,
+                message: "redraw".to_owned(),
+            });
+            ui.find(By::role_name(Role::Label, format!("State: {label}")));
+            assert!(!ui.painted_text().contains("Ready to merge"));
+            ui.app_mut().driver.act(pulls(PullsAction::Open));
+            ui.send_message(ReviewEvent::TokenSaveFailed {
+                forge,
+                message: "redraw".to_owned(),
+            });
+        }
+    }
+}
+
+#[test]
+fn historical_loading_empty_pagination_and_narrow_tabs_are_accessible() {
+    let mut driver = history_driver(ReviewForge::Bitbucket);
+    driver.fake.hold = true;
+    driver.act(pulls(PullsAction::Open));
+    driver.act(pulls(PullsAction::SetState(PullRequestFilter::Merged)));
+    let mut ui = UiTestHarness::new(App::new(driver), (480.0, 640.0), 2.0);
+    ui.find(By::role_name(Role::Status, "Loading merged pull requests"));
+    let page = ui.find(By::test_id("review.pulls")).bounds;
+    for id in [
+        "review.pulls.tab.open",
+        "review.pulls.tab.merged",
+        "review.pulls.tab.closed",
+    ] {
+        let bounds = ui.find(By::test_id(id)).bounds;
+        assert!(
+            bounds.width > 0.0 && contains(page, bounds),
+            "{id}: {bounds:?} in {page:?}"
+        );
+    }
+    ui.app_mut().driver.fake.github.with(|script| {
+        script.pages.insert(
+            (ReviewForge::Bitbucket, PullRequestFilter::Merged, None),
+            Ok(history_page(Vec::new(), Some("next"))),
+        );
+        script.pages.insert(
+            (
+                ReviewForge::Bitbucket,
+                PullRequestFilter::Merged,
+                Some("next".to_owned()),
+            ),
+            Ok(history_page(Vec::new(), None)),
+        );
+    });
+    ui.app_mut().driver.release();
+    ui.send_message(ReviewEvent::TokenSaveFailed {
+        forge: ReviewForge::Bitbucket,
+        message: "redraw".to_owned(),
+    });
+    ui.find(By::role_name(
+        Role::Status,
+        "No merged pull requests loaded yet",
+    ));
+    ui.find(By::role_name(Role::Button, "Load more"));
+    ui.key("m");
+    ui.find(By::role_name(Role::Status, "No merged pull requests"));
+    assert!(ui.try_find(By::test_id("review.pulls.load_more")).is_none());
+    ui.key("1");
+    assert_eq!(
+        ui.app().driver.review.pulls().state,
+        PullRequestFilter::Open
+    );
 }
