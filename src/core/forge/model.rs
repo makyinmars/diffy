@@ -4,7 +4,8 @@
 //!
 //! State strings (check states, review states, mergeability, review
 //! decisions) use GitHub's uppercase vocabulary (`SUCCESS`, `APPROVED`,
-//! `MERGEABLE`, ...). Other forges map their values onto it.
+//! `MERGEABLE`, ...). Other forges map their values onto it. Authored pull
+//! request lifecycle states retain each provider's uppercase vocabulary.
 
 use serde::{Deserialize, Serialize};
 
@@ -268,12 +269,48 @@ pub struct PullRequestStats {
     pub changed_files: i32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum PullRequestFilter {
+    #[default]
+    Open,
+    Merged,
+    Closed,
+}
+
+impl PullRequestFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Merged => "Merged",
+            Self::Closed => "Closed",
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullRequestPage {
+    pub pulls: Vec<MyPullRequest>,
+    pub next_cursor: Option<String>,
+    pub total_count: Option<usize>,
+    pub limit_reached: bool,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MyPullRequest {
     pub forge: ReviewForge,
     pub id: String,
     pub number: i32,
     pub title: String,
+    pub state: String,
     pub url: String,
     pub repository: String,
     pub is_draft: bool,

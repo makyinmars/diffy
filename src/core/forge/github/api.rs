@@ -233,6 +233,8 @@ impl CreatePullRequestReview {
 #[derive(Debug, Clone, Default)]
 pub struct GitHubApi {
     token: String,
+    #[cfg(test)]
+    pub(super) graphql_url: Option<String>,
 }
 
 impl GitHubApi {
@@ -243,6 +245,8 @@ impl GitHubApi {
     pub fn with_token(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
+            #[cfg(test)]
+            graphql_url: None,
         }
     }
 
@@ -583,6 +587,12 @@ impl GitHubApi {
     }
 
     pub(super) fn graphql_query(&self, query: &str, variables: Value) -> Result<Value> {
+        #[cfg(test)]
+        let value = match self.graphql_url.as_deref() {
+            Some(url) => transport::graphql_query_at(&self.token, query, variables, url)?,
+            None => transport::graphql_query(&self.token, query, variables)?,
+        };
+        #[cfg(not(test))]
         let value = transport::graphql_query(&self.token, query, variables)?;
         let errors = transport::graphql_errors(&value);
         if !errors.is_empty() {

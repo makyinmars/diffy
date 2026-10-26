@@ -22,21 +22,35 @@ static VIEWERS: Mutex<Vec<(u64, BitbucketUser)>> = Mutex::new(Vec::new());
 #[derive(Debug, Clone, Default)]
 pub struct BitbucketApi {
     credentials: Credentials,
+    #[cfg(test)]
+    pub(super) api_root: Option<String>,
 }
 
 impl BitbucketApi {
     pub fn new(credentials: Credentials) -> Self {
-        Self { credentials }
+        Self {
+            credentials,
+            #[cfg(test)]
+            api_root: None,
+        }
     }
 
     pub(super) fn credentials(&self) -> &Credentials {
         &self.credentials
     }
 
+    pub(super) fn api_root(&self) -> &str {
+        #[cfg(test)]
+        if let Some(root) = self.api_root.as_deref() {
+            return root;
+        }
+        API_ROOT
+    }
+
     pub fn fetch_current_user(&self) -> Result<BitbucketUser> {
         let value = transport::get_json(
             &self.credentials,
-            &format!("{API_ROOT}/user"),
+            &format!("{}/user", self.api_root()),
             "Bitbucket user fetch",
         )?;
         let user = parse_user(&value)?;
