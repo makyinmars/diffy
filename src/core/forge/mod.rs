@@ -50,7 +50,7 @@ pub fn parse_remote(url: &str) -> Option<ForgeRepo> {
 
 /// A repository typed as `owner/repo` (GitHub) or pasted as a forge URL.
 pub fn parse_repo_reference(input: &str) -> Option<ForgeRepo> {
-    if input.contains("bitbucket.org") {
+    if input.to_ascii_lowercase().contains("bitbucket.org") {
         return bitbucket::parse_remote(input);
     }
     github::parse_repo_reference(input)

@@ -650,9 +650,12 @@ fn gix_error(error: impl std::fmt::Display) -> DiffyError {
     git_error("repository read", error.to_string())
 }
 
-const FORGE_HOSTS: [(&str, ReviewForge); 2] = [
+const FORGE_HOSTS: [(&str, ReviewForge); 4] = [
     ("github.com", ReviewForge::GitHub),
     ("bitbucket.org", ReviewForge::Bitbucket),
+    // Bitbucket Cloud's SSH host since 2026 and its port-443 fallback.
+    ("ssh.bitbucket.org", ReviewForge::Bitbucket),
+    ("altssh.bitbucket.org", ReviewForge::Bitbucket),
 ];
 
 fn forge_host(forge: ReviewForge) -> &'static str {
@@ -786,8 +789,10 @@ fn repo_url_from_remote_transport(
     repo: &str,
 ) -> Option<String> {
     let trimmed = url.trim();
-    let host = forge_host(forge);
-    if trimmed.strip_prefix(&format!("git@{host}:")).is_some() {
+    if let Some((host, _)) = FORGE_HOSTS
+        .iter()
+        .find(|(host, known)| *known == forge && trimmed.starts_with(&format!("git@{host}:")))
+    {
         return Some(format!("git@{host}:{owner}/{repo}.git"));
     }
 
@@ -1916,8 +1921,9 @@ impl GitService {
     /// branch from the destination repository and the source branch from the
     /// source repository, which may be a fork. The refs are then pinned to
     /// the commits the pull request names when git has them: a merged pull
-    /// request's destination branch already contains its source, and a
-    /// deleted source branch or fork leaves only those commits.
+    /// request's destination branch already contains its source, a source
+    /// branch may have moved past it, and a deleted source branch or fork
+    /// leaves only those commits.
     fn resolve_bitbucket_comparison(
         &self,
         target: &ReviewTarget,
@@ -1979,8 +1985,11 @@ impl GitService {
                 };
             }
         }
+        // Pin even after a successful fetch: a merged or declined pull
+        // request's source branch may have moved on since.
         self.pin_ref(&base_target, &info.base_sha);
-        if !head_fetched && !self.pin_ref(&head_target, &info.head_sha) {
+        let head_pinned = self.pin_ref(&head_target, &info.head_sha);
+        if !head_fetched && !head_pinned {
             return Err(git_error(
                 "pull request fetch",
                 match head_source {
@@ -2856,6 +2865,11 @@ mod tests {
         assert_eq!(key("ssh://git@bitbucket.org/ws/repo.git"), expected);
         assert_eq!(key("https://me@bitbucket.org/ws/repo.git"), expected);
         assert_eq!(key("https://bitbucket.org/ws/repo"), expected);
+        assert_eq!(key("git@ssh.bitbucket.org:ws/repo.git"), expected);
+        assert_eq!(
+            key("ssh://git@altssh.bitbucket.org:443/ws/repo.git"),
+            expected
+        );
         assert_eq!(key("https://bitbucket.example.com/ws/repo"), None);
     }
 
@@ -2869,6 +2883,14 @@ mod tests {
         assert_eq!(
             rewrite("https://me@bitbucket.org/me/fork.git"),
             Some("https://me@bitbucket.org/acme/widgets.git".to_owned())
+        );
+        assert_eq!(
+            rewrite("git@ssh.bitbucket.org:me/fork.git"),
+            Some("git@ssh.bitbucket.org:acme/widgets.git".to_owned())
+        );
+        assert_eq!(
+            rewrite("ssh://git@altssh.bitbucket.org:443/me/fork.git"),
+            Some("ssh://git@altssh.bitbucket.org:443/acme/widgets.git".to_owned())
         );
         assert_eq!(rewrite("git@github.com:me/fork.git"), None);
     }
@@ -3358,6 +3380,63 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("source repository"), "{error}");
+    }
+
+    #[test]
+    fn bitbucket_pull_requests_diff_their_recorded_head_after_the_source_branch_moves() {
+        let upstream = TempDir::new().unwrap();
+        Repository::init_bare(upstream.path()).unwrap();
+        let seed_dir = TempDir::new().unwrap();
+        let seed = Repository::init(seed_dir.path()).unwrap();
+        let mut origin = seed
+            .remote("origin", upstream.path().to_str().unwrap())
+            .unwrap();
+        let base_oid = commit_file(&seed, "a.txt", "base\n", "base");
+        origin
+            .push::<&str>(&["+HEAD:refs/heads/main"], None)
+            .unwrap();
+        let head_oid = commit_file(&seed, "a.txt", "head\n", "head");
+        // A long-lived source branch keeps moving after its pull request
+        // was merged or declined.
+        commit_file(&seed, "a.txt", "later\n", "later");
+        origin
+            .push::<&str>(&["+HEAD:refs/heads/develop"], None)
+            .unwrap();
+        let local_dir = TempDir::new().unwrap();
+        let local = Repository::init(local_dir.path()).unwrap();
+        commit_file(&local, "README.md", "local\n", "local");
+        local
+            .config()
+            .unwrap()
+            .set_str(
+                &format!("url.{}.insteadOf", upstream.path().display()),
+                "https://bitbucket.org/acme/widgets.git",
+            )
+            .unwrap();
+        let mut git = GitService::new();
+        git.open(local_dir.path().to_str().unwrap()).unwrap();
+        let target = ReviewTarget {
+            forge: BITBUCKET,
+            owner: "acme".to_owned(),
+            repo: "widgets".to_owned(),
+            number: 11,
+        };
+        let info = PullRequestInfo {
+            number: 11,
+            merged: true,
+            base_branch: "main".to_owned(),
+            head_branch: "develop".to_owned(),
+            base_sha: base_oid[..12].to_owned(),
+            head_sha: head_oid[..12].to_owned(),
+            base_repo_url: "https://bitbucket.org/acme/widgets.git".to_owned(),
+            head_repo_url: "https://bitbucket.org/acme/widgets.git".to_owned(),
+            ..PullRequestInfo::default()
+        };
+
+        let (resolved, _, right) = git.resolve_pull_request_comparison(&target, info).unwrap();
+
+        assert_eq!(git.resolve_commit_oid(&right).unwrap(), head_oid);
+        assert_eq!(resolved.head_sha, head_oid);
     }
 
     fn make_remote_and_clone() -> (TempDir, TempDir) {
