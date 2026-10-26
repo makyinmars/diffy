@@ -16,14 +16,8 @@ const HOSTS: [&str; 4] = [
 /// `ssh://git@altssh.bitbucket.org:443/ws/repo.git`,
 /// `https://user@bitbucket.org/ws/repo.git`, `https://bitbucket.org/ws/repo`.
 pub fn parse_remote(url: &str) -> Option<ForgeRepo> {
-    let url = url.trim();
-    let (scheme, rest) = match url.split_once("://") {
-        Some((_, rest)) => (true, rest),
-        None => (false, url),
-    };
-    let rest = rest.split_once('@').map_or(rest, |(_, rest)| rest);
-    let (host, path) = rest.split_at(rest.find([':', '/']).unwrap_or(rest.len()));
-    if !HOSTS.iter().any(|known| host.eq_ignore_ascii_case(known)) {
+    let (scheme, host, path) = split_host(url);
+    if !is_cloud_host(host) {
         return None;
     }
     let path = match path.strip_prefix(':') {
@@ -32,6 +26,30 @@ pub fn parse_remote(url: &str) -> Option<ForgeRepo> {
         None => path,
     };
     slug(path.strip_prefix('/')?)
+}
+
+/// Whether a URL, scp-style remote or bare `host/path` names a Bitbucket
+/// Cloud host. `owner/repo` shorthand names no host.
+pub fn names_cloud_host(input: &str) -> bool {
+    let (_, host, _) = split_host(input);
+    is_cloud_host(host)
+}
+
+fn is_cloud_host(host: &str) -> bool {
+    HOSTS.iter().any(|known| host.eq_ignore_ascii_case(known))
+}
+
+/// Whether the input had a scheme, then the host and what follows it
+/// (`:port/path`, `:path` or `/path`), with any `user@` dropped.
+fn split_host(url: &str) -> (bool, &str, &str) {
+    let url = url.trim();
+    let (scheme, rest) = match url.split_once("://") {
+        Some((_, rest)) => (true, rest),
+        None => (false, url),
+    };
+    let rest = rest.split_once('@').map_or(rest, |(_, rest)| rest);
+    let (host, path) = rest.split_at(rest.find([':', '/']).unwrap_or(rest.len()));
+    (scheme, host, path)
 }
 
 fn slug(path: &str) -> Option<ForgeRepo> {

@@ -9,6 +9,6 @@ mod write;
 
 pub use api::{BitbucketApi, BitbucketUser};
 pub use pull_request::parse_pr_url;
-pub use repository::parse_remote;
+pub use repository::{names_cloud_host, parse_remote};
 pub use transport::Credentials;
 pub use write::DraftSubmission;

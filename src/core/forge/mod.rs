@@ -50,10 +50,10 @@ pub fn parse_remote(url: &str) -> Option<ForgeRepo> {
 
 /// A repository typed as `owner/repo` (GitHub) or pasted as a forge URL.
 pub fn parse_repo_reference(input: &str) -> Option<ForgeRepo> {
-    if !input.to_ascii_lowercase().contains("bitbucket.org") {
-        return github::parse_repo_reference(input);
+    if bitbucket::names_cloud_host(input) {
+        return bitbucket::parse_remote(input);
     }
-    bitbucket::parse_remote(input).or_else(|| github::parse_remote(input))
+    github::parse_repo_reference(input)
 }
 
 /// The forge and pull request a web URL points at.
@@ -169,5 +169,9 @@ mod tests {
             Some((ReviewForge::Bitbucket, "github.com-mirror".to_owned()))
         );
         assert_eq!(parse_repo_reference("bitbucket.org/ws"), None);
+        assert_eq!(
+            parse_repo_reference("acme/Bitbucket.org-mirror").map(|repo| repo.forge),
+            Some(ReviewForge::GitHub)
+        );
     }
 }
