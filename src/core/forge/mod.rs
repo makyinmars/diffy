@@ -2,6 +2,9 @@ pub mod bitbucket;
 pub mod github;
 pub mod model;
 
+#[cfg(test)]
+mod test_http;
+
 use crate::core::review::{ReviewForge, ReviewTarget};
 
 /// A repository on a forge: a GitHub `owner/repo` or a Bitbucket

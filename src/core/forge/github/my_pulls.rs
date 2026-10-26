@@ -8,25 +8,26 @@ use super::api::{
 use super::overview::{actor, nodes};
 use crate::core::error::{DiffyError, Result};
 use crate::core::forge::model::{
-    MyPullRequest, PullRequestCheckSummary, PullRequestReviewer, PullRequestStats,
+    MyPullRequest, PullRequestCheckSummary, PullRequestFilter, PullRequestPage,
+    PullRequestReviewer, PullRequestStats,
 };
 use crate::core::review::ReviewForge;
 
-const SEARCH: &str = "is:pr is:open author:@me archived:false sort:updated-desc";
 const EXCERPT_CHARS: usize = 280;
+const SEARCH_LIMIT: usize = 1_000;
 
-// One search with every field times out on GitHub's side for large
-// monorepo PRs, so the diff stats and the check rollup are separate
-// queries over the same search, run in parallel and joined by node id.
 const CORE_QUERY: &str = r#"
-query DiffyMyPullRequests($search: String!) {
+query DiffyMyPullRequests($search: String!, $after: String) {
   viewer { login }
-  search(query: $search, type: ISSUE, first: 50) {
+  search(query: $search, type: ISSUE, first: 50, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
         id
         number
         title
+        state
         url
         isDraft
         updatedAt
@@ -56,19 +57,16 @@ query DiffyMyPullRequests($search: String!) {
 "#;
 
 const STATS_QUERY: &str = r#"
-query DiffyMyPullRequestStats($search: String!) {
-  search(query: $search, type: ISSUE, first: 50) {
-    nodes {
+query DiffyMyPullRequestStats($ids: [ID!]!) {
+  nodes(ids: $ids) {
       ... on PullRequest { id mergeable additions deletions changedFiles }
-    }
   }
 }
 "#;
 
 const CHECKS_QUERY: &str = r#"
-query DiffyMyPullRequestChecks($search: String!) {
-  search(query: $search, type: ISSUE, first: 50) {
-    nodes {
+query DiffyMyPullRequestChecks($ids: [ID!]!) {
+  nodes(ids: $ids) {
       ... on PullRequest {
         id
         commits(last: 1) {
@@ -91,48 +89,132 @@ query DiffyMyPullRequestChecks($search: String!) {
           }
         }
       }
-    }
   }
 }
 "#;
 
 impl GitHubApi {
-    pub fn fetch_my_pull_requests(&self) -> Result<Vec<MyPullRequest>> {
+    pub fn fetch_my_pull_requests(
+        &self,
+        filter: PullRequestFilter,
+        cursor: Option<&str>,
+    ) -> Result<PullRequestPage> {
         if !self.has_token() {
             return Err(DiffyError::auth(
                 "GitHub authentication is required to list your pull requests".to_owned(),
             ));
         }
-        let variables = json!({ "search": SEARCH });
-        let (core, stats, checks) = std::thread::scope(|scope| {
+        let (after, seen) = match cursor {
+            Some(cursor) => {
+                let value: Value = serde_json::from_str(cursor)?;
+                if value.get("filter").and_then(Value::as_str) != Some(filter.id()) {
+                    return Err(DiffyError::Parse(
+                        "GitHub pull request cursor belongs to another filter".to_owned(),
+                    ));
+                }
+                let after = value.get("after").and_then(Value::as_str);
+                let seen = value.get("seen").and_then(Value::as_u64);
+                match (after, seen) {
+                    (Some(after), Some(seen))
+                        if !after.is_empty() && seen < SEARCH_LIMIT as u64 =>
+                    {
+                        (Some(after.to_owned()), seen as usize)
+                    }
+                    _ => {
+                        return Err(DiffyError::Parse(
+                            "invalid GitHub pull request cursor".to_owned(),
+                        ));
+                    }
+                }
+            }
+            None => (None, 0),
+        };
+        let state = match filter {
+            PullRequestFilter::Open => "is:open",
+            PullRequestFilter::Merged => "is:merged",
+            PullRequestFilter::Closed => "is:closed is:unmerged",
+        };
+        let search = format!("is:pr {state} author:@me archived:false sort:updated-desc");
+        let core = self.graphql_query(CORE_QUERY, json!({ "search": search, "after": after }))?;
+        let mut pulls = parse_core(&core);
+        let total_count = core
+            .pointer("/data/search/issueCount")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok());
+        let has_next = core
+            .pointer("/data/search/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                DiffyError::Parse("missing GitHub pull request page information".to_owned())
+            })?;
+        let seen = seen + nodes(&core, "/data/search/nodes").count();
+        let limit_reached = seen >= SEARCH_LIMIT
+            && (has_next || total_count.is_some_and(|count| count > SEARCH_LIMIT));
+        let next_cursor = if has_next && seen < SEARCH_LIMIT && !pulls.is_empty() {
+            let next = core
+                .pointer("/data/search/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .filter(|next| !next.is_empty() && Some(*next) != after.as_deref())
+                .ok_or_else(|| {
+                    DiffyError::Parse("invalid GitHub pull request page cursor".to_owned())
+                })?;
+            Some(json!({ "filter": filter.id(), "after": next, "seen": seen }).to_string())
+        } else {
+            None
+        };
+        if pulls.is_empty() {
+            return Ok(PullRequestPage {
+                pulls,
+                next_cursor,
+                total_count,
+                limit_reached,
+                warnings: Vec::new(),
+            });
+        }
+        let variables =
+            json!({ "ids": pulls.iter().map(|pull| pull.id.as_str()).collect::<Vec<_>>() });
+        let (stats, checks) = std::thread::scope(|scope| {
             let stats = scope.spawn(|| self.graphql_query(STATS_QUERY, variables.clone()));
             let checks = scope.spawn(|| self.graphql_query(CHECKS_QUERY, variables.clone()));
-            let core = self.graphql_query(CORE_QUERY, variables.clone());
-            (
-                core,
-                optional(stats.join(), "stats"),
-                optional(checks.join(), "checks"),
-            )
+            (stats.join(), checks.join())
         });
-        let mut pulls = parse_core(&core?);
+        let mut warnings = Vec::new();
+        let stats = optional(stats, "stats", &mut warnings);
+        let checks = optional(checks, "checks", &mut warnings);
+        let stats = stats?;
+        let checks = checks?;
         let stats = stats.as_ref().map(parse_stats).unwrap_or_default();
         let checks = checks.as_ref().map(parse_checks).unwrap_or_default();
         for pull in &mut pulls {
             pull.stats = stats.get(&pull.id).cloned();
             pull.checks = checks.get(&pull.id).cloned();
         }
-        Ok(pulls)
+        Ok(PullRequestPage {
+            pulls,
+            next_cursor,
+            total_count,
+            limit_reached,
+            warnings,
+        })
     }
 }
 
-fn optional(joined: std::thread::Result<Result<Value>>, part: &str) -> Option<Value> {
+fn optional(
+    joined: std::thread::Result<Result<Value>>,
+    part: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Option<Value>> {
     match joined {
-        Ok(Ok(value)) => Some(value),
+        Ok(Ok(value)) => Ok(Some(value)),
+        Ok(Err(error @ DiffyError::Auth { .. })) => Err(error),
         Ok(Err(error)) => {
-            tracing::warn!("your pull requests: {part} query failed: {error}");
-            None
+            warnings.push(format!("Pull request {part} unavailable: {error}"));
+            Ok(None)
         }
-        Err(_) => None,
+        Err(_) => {
+            warnings.push(format!("Pull request {part} unavailable"));
+            Ok(None)
+        }
     }
 }
 
@@ -178,6 +260,7 @@ fn parse_pull(node: &Value, viewer: &str) -> MyPullRequest {
         id: string_field(node, "id"),
         number: int_field(node, "number") as i32,
         title: string_field(node, "title"),
+        state: string_field(node, "state"),
         url: string_field(node, "url"),
         repository: node
             .pointer("/repository/nameWithOwner")
@@ -201,28 +284,37 @@ fn parse_pull(node: &Value, viewer: &str) -> MyPullRequest {
 }
 
 fn parse_stats(value: &Value) -> HashMap<String, PullRequestStats> {
-    search_nodes(value)
-        .map(|node| {
-            (
-                string_field(node, "id"),
+    nodes(value, "/data/nodes")
+        .filter_map(|node| {
+            let count = |key| {
+                node.get(key)
+                    .and_then(Value::as_i64)
+                    .and_then(|count| i32::try_from(count).ok())
+            };
+            let id = optional_string_field(node, "id")?;
+            Some((
+                id,
                 PullRequestStats {
                     mergeable: string_field(node, "mergeable"),
-                    additions: int_field(node, "additions") as i32,
-                    deletions: int_field(node, "deletions") as i32,
-                    changed_files: int_field(node, "changedFiles") as i32,
+                    additions: count("additions")?,
+                    deletions: count("deletions")?,
+                    changed_files: count("changedFiles")?,
                 },
-            )
+            ))
         })
         .collect()
 }
 
 fn parse_checks(value: &Value) -> HashMap<String, PullRequestCheckSummary> {
-    search_nodes(value)
+    nodes(value, "/data/nodes")
         .filter_map(|node| {
             let rollup = node
                 .pointer("/commits/nodes/0/commit/statusCheckRollup")
                 .filter(|rollup| !rollup.is_null())?;
-            Some((string_field(node, "id"), parse_rollup(rollup)))
+            rollup
+                .pointer("/contexts/totalCount")
+                .and_then(Value::as_i64)?;
+            Some((optional_string_field(node, "id")?, parse_rollup(rollup)))
         })
         .collect()
 }
@@ -264,6 +356,251 @@ pub(crate) fn excerpt(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::forge::test_http::{Request, Server};
+
+    fn api(server: &Server) -> GitHubApi {
+        let mut api = GitHubApi::with_token("fixture-token");
+        api.graphql_url = Some(format!("{}/graphql", server.root));
+        api
+    }
+
+    fn request(request: Request) -> Value {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/graphql");
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "Bearer fixture-token")
+        );
+        serde_json::from_str(&request.body).unwrap()
+    }
+
+    fn core_page(pulls: Vec<Value>, next: Option<&str>, count: usize) -> Value {
+        json!({ "data": { "viewer": { "login": "me" }, "search": {
+            "nodes": pulls, "issueCount": count,
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next }
+        } } })
+    }
+
+    #[test]
+    fn wire_filters_authored_search_and_preserves_states_drafts_and_unknown_metadata() {
+        for (filter, qualifier, state) in [
+            (PullRequestFilter::Open, "is:open", "OPEN"),
+            (PullRequestFilter::Merged, "is:merged", "MERGED"),
+            (PullRequestFilter::Closed, "is:closed is:unmerged", "CLOSED"),
+        ] {
+            let server = Server::new(3, move |incoming| {
+                let body = request(incoming);
+                let query = body["query"].as_str().unwrap();
+                if query.contains("query DiffyMyPullRequests(") {
+                    assert_eq!(
+                        body["variables"]["search"],
+                        format!("is:pr {qualifier} author:@me archived:false sort:updated-desc")
+                    );
+                    assert!(body["variables"]["after"].is_null());
+                    assert!(query.contains("first: 50, after: $after"));
+                    assert!(query.contains("pageInfo { hasNextPage endCursor }"));
+                    (
+                        200,
+                        core_page(
+                            vec![json!({ "id": "PR_1", "state": state, "isDraft": true })],
+                            None,
+                            1,
+                        ),
+                    )
+                } else {
+                    assert!(query.contains("nodes(ids: $ids)"));
+                    assert!(!query.contains("search("));
+                    assert_eq!(body["variables"], json!({ "ids": ["PR_1"] }));
+                    (
+                        200,
+                        json!({ "data": { "nodes": [null, { "id": "PR_1", "additions": 0 }] } }),
+                    )
+                }
+            });
+            let page = api(&server).fetch_my_pull_requests(filter, None).unwrap();
+            assert_eq!(page.pulls.len(), 1);
+            assert_eq!(page.pulls[0].state, state);
+            assert!(page.pulls[0].is_draft);
+            assert!(page.pulls[0].stats.is_none());
+            assert!(page.pulls[0].checks.is_none());
+            assert_eq!(page.total_count, Some(1));
+            assert!(page.next_cursor.is_none());
+            server.finish();
+        }
+    }
+
+    #[test]
+    fn wire_pages_use_provider_cursor_and_enrich_only_the_same_ids() {
+        let server = Server::new(6, |incoming| {
+            let body = request(incoming);
+            let query = body["query"].as_str().unwrap();
+            if query.contains("query DiffyMyPullRequests(") {
+                if body["variables"]["after"].is_null() {
+                    (
+                        200,
+                        core_page(
+                            vec![json!({ "id": "PR_1" }), json!({ "id": "PR_2" })],
+                            Some("opaque+/=\""),
+                            3,
+                        ),
+                    )
+                } else {
+                    assert_eq!(body["variables"]["after"], "opaque+/=\"");
+                    (
+                        200,
+                        core_page(vec![json!({ "id": "PR_3", "state": "MERGED" })], None, 3),
+                    )
+                }
+            } else {
+                let ids = body["variables"]["ids"].as_array().unwrap();
+                assert!(ids == &vec![json!("PR_1"), json!("PR_2")] || ids == &vec![json!("PR_3")]);
+                if query.contains("Stats(") {
+                    let nodes = ids.iter().rev().map(|id| json!({ "id": id, "mergeable": "UNKNOWN", "additions": if id == "PR_1" { 7 } else { 2 }, "deletions": 1, "changedFiles": 1 })).collect::<Vec<_>>();
+                    (200, json!({ "data": { "nodes": nodes } }))
+                } else {
+                    (
+                        200,
+                        json!({ "data": { "nodes": [{ "id": "PR_1", "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS", "contexts": { "totalCount": 1, "nodes": [] } } } }] } }] } }),
+                    )
+                }
+            }
+        });
+        let api = api(&server);
+        let first = api
+            .fetch_my_pull_requests(PullRequestFilter::Merged, None)
+            .unwrap();
+        assert_eq!(first.pulls[0].stats.as_ref().unwrap().additions, 7);
+        assert_eq!(first.pulls[1].stats.as_ref().unwrap().additions, 2);
+        assert_eq!(
+            first.pulls[0].checks.as_ref().unwrap().state.as_deref(),
+            Some("SUCCESS")
+        );
+        assert!(first.pulls[1].checks.is_none());
+        assert!(matches!(
+            api.fetch_my_pull_requests(PullRequestFilter::Closed, first.next_cursor.as_deref()),
+            Err(DiffyError::Parse(_))
+        ));
+        let second = api
+            .fetch_my_pull_requests(PullRequestFilter::Merged, first.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(second.pulls[0].id, "PR_3");
+        assert!(second.pulls[0].checks.is_none());
+        assert!(second.next_cursor.is_none());
+        server.finish();
+    }
+
+    #[test]
+    fn wire_empty_page_skips_optional_queries() {
+        let server = Server::new(1, |incoming| {
+            request(incoming);
+            (200, core_page(Vec::new(), None, 0))
+        });
+        let page = api(&server)
+            .fetch_my_pull_requests(PullRequestFilter::Open, None)
+            .unwrap();
+        assert!(page.pulls.is_empty());
+        assert_eq!(page.total_count, Some(0));
+        assert!(page.next_cursor.is_none());
+        server.finish();
+    }
+
+    #[test]
+    fn wire_401_in_core_or_either_optional_query_is_auth_and_sanitized() {
+        for operation in [
+            "DiffyMyPullRequests(",
+            "DiffyMyPullRequestStats(",
+            "DiffyMyPullRequestChecks(",
+        ] {
+            let count = if operation == "DiffyMyPullRequests(" {
+                1
+            } else {
+                3
+            };
+            let server = Server::new(count, move |incoming| {
+                let body = request(incoming);
+                let query = body["query"].as_str().unwrap();
+                if query.contains(operation) {
+                    (401, json!({ "message": "reflected-secret" }))
+                } else if query.contains("DiffyMyPullRequests(") {
+                    (200, core_page(vec![json!({ "id": "PR_1" })], None, 1))
+                } else {
+                    (200, json!({ "data": { "nodes": [] } }))
+                }
+            });
+            let error = api(&server)
+                .fetch_my_pull_requests(PullRequestFilter::Open, None)
+                .unwrap_err();
+            assert!(matches!(error, DiffyError::Auth { .. }));
+            assert!(!error.to_string().contains("reflected-secret"));
+            server.finish();
+        }
+    }
+
+    #[test]
+    fn wire_optional_failure_keeps_core_and_reports_unknown_metadata() {
+        for status in [403, 502, 200] {
+            let server = Server::new(3, move |incoming| {
+                let body = request(incoming);
+                if body["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("DiffyMyPullRequests(")
+                {
+                    (200, core_page(vec![json!({ "id": "PR_1" })], None, 1))
+                } else {
+                    (
+                        status,
+                        json!({ "data": { "nodes": [{ "id": "PR_1", "additions": 99 }] }, "errors": [{ "type": "FORBIDDEN", "message": "Resource not accessible" }] }),
+                    )
+                }
+            });
+            let page = api(&server)
+                .fetch_my_pull_requests(PullRequestFilter::Open, None)
+                .unwrap();
+            assert_eq!(page.pulls.len(), 1);
+            assert!(page.pulls[0].stats.is_none());
+            assert!(page.pulls[0].checks.is_none());
+            assert_eq!(page.warnings.len(), 2);
+            server.finish();
+        }
+    }
+
+    #[test]
+    fn wire_search_cap_stops_even_when_provider_advertises_more() {
+        let server = Server::new(3, |incoming| {
+            let body = request(incoming);
+            if body["query"]
+                .as_str()
+                .unwrap()
+                .contains("DiffyMyPullRequests(")
+            {
+                assert_eq!(body["variables"]["after"], "page-19");
+                (
+                    200,
+                    core_page(
+                        (0..50)
+                            .map(|id| json!({ "id": format!("PR_{id}") }))
+                            .collect(),
+                        Some("page-20"),
+                        1_200,
+                    ),
+                )
+            } else {
+                (200, json!({ "data": { "nodes": [] } }))
+            }
+        });
+        let cursor = json!({ "filter": "closed", "after": "page-19", "seen": 950 }).to_string();
+        let page = api(&server)
+            .fetch_my_pull_requests(PullRequestFilter::Closed, Some(&cursor))
+            .unwrap();
+        assert_eq!(page.pulls.len(), 50);
+        assert!(page.limit_reached);
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.total_count, Some(1_200));
+        server.finish();
+    }
 
     #[test]
     fn core_stats_and_checks_merge_by_node_id() {
@@ -292,10 +629,10 @@ mod tests {
                 {}
             ] }
         } });
-        let stats = json!({ "data": { "search": { "nodes": [
+        let stats = json!({ "data": { "nodes": [
             { "id": "PR_1", "mergeable": "CONFLICTING", "additions": 5, "deletions": 2, "changedFiles": 1 }
-        ] } } });
-        let checks = json!({ "data": { "search": { "nodes": [
+        ] } });
+        let checks = json!({ "data": { "nodes": [
             { "id": "PR_1", "commits": { "nodes": [ { "commit": { "statusCheckRollup": {
                 "state": "FAILURE",
                 "contexts": {
@@ -309,7 +646,7 @@ mod tests {
                     "nodes": [ { "__typename": "CheckRun", "name": "lint", "conclusion": "FAILURE" } ]
                 }
             } } } ] } }
-        ] } } });
+        ] } });
 
         let mut pulls = parse_core(&core);
         assert_eq!(pulls.len(), 1);
