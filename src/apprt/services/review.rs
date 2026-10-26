@@ -549,8 +549,8 @@ impl LiveForge {
                     message: error.user_message(),
                 },
             },
-            ForgeRequest::FetchMyPullRequests { token, .. } => {
-                match GitHubApi::with_token(token.into_inner()).fetch_my_pull_requests() {
+            ForgeRequest::FetchMyPullRequests { token, filter, cursor, .. } => {
+                match GitHubApi::with_token(token.into_inner()).fetch_my_pull_requests(filter, cursor.as_deref()) {
                     Ok(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
                     Err(error) => ForgeResponse::MyPullRequestsLoadFailed {
                         message: error.user_message(),
@@ -716,8 +716,8 @@ impl LiveForge {
                     },
                 }
             }
-            ForgeRequest::FetchMyPullRequests { token, .. } => {
-                match bitbucket_api(Some(token)).fetch_my_pull_requests() {
+            ForgeRequest::FetchMyPullRequests { token, filter, cursor, .. } => {
+                match bitbucket_api(Some(token)).fetch_my_pull_requests(filter, cursor.as_deref()) {
                     Ok(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
                     Err(error) => ForgeResponse::MyPullRequestsLoadFailed {
                         message: error.user_message(),

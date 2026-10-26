@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -41,7 +41,7 @@ use crate::contracts::viewport::pipeline::ManifestFile;
 use crate::core::compare::stats::CompareFilePaths;
 use crate::core::forge::github::{CreatePullRequestReview, DeviceFlowState};
 use crate::core::forge::model::{
-    ForgeUser, MyPullRequest, PullRequestActor, PullRequestCheckContext, PullRequestCheckSummary,
+    ForgeUser, MyPullRequest, PullRequestFilter, PullRequestPage, PullRequestActor, PullRequestCheckContext, PullRequestCheckSummary,
     PullRequestInfo, PullRequestLabel, PullRequestOverview, PullRequestReviewData,
     PullRequestReviewThread, PullRequestReviewThreadComment, PullRequestReviewer, PullRequestStats,
     PullRequestTimelineItem, PullRequestTimelineKind, ReviewThreadResolution,
@@ -214,6 +214,9 @@ struct Script {
     /// Post only the first draft, the way Bitbucket stops partway.
     partial_submit: bool,
     bitbucket_pulls: Option<Vec<MyPullRequest>>,
+    pages: HashMap<(ReviewForge, PullRequestFilter, Option<String>), Result<PullRequestPage, String>>,
+    comparisons: HashMap<String, PullRequestComparison>,
+    overviews: HashMap<ReviewForge, PullRequestOverview>,
     requests: Vec<ForgeRequest>,
 }
 
@@ -240,19 +243,29 @@ impl ForgeBackend for FakeGitHub {
             )
         });
         let (pulls, fail_pulls) = self.with(|s| (s.pulls.clone(), s.fail_pulls));
+        if let ForgeRequest::FetchMyPullRequests { forge, filter, cursor, .. } = &request
+            && let Some(result) = self.with(|s| s.pages.get(&(*forge, *filter, cursor.clone())).cloned())
+        {
+            emit(match result {
+                Ok(page) => ForgeResponse::MyPullRequestsLoaded(page),
+                Err(message) => ForgeResponse::MyPullRequestsLoadFailed { message },
+            });
+            return;
+        }
         let pr_number = |url: &str| if url == OTHER_URL { 7 } else { 42 };
         match request {
             ForgeRequest::LoadPullRequest { url, .. } => {
                 let number = pr_number(&url);
+                let comparison = self.with(|s| s.comparisons.get(&url).cloned()).unwrap_or_else(|| comparison(number));
                 if cached {
                     emit(ForgeResponse::PullRequestCached {
                         url: url.clone(),
-                        comparison: comparison(number),
+                        comparison: comparison.clone(),
                     });
                 }
                 emit(ForgeResponse::PullRequestLoaded {
                     url,
-                    comparison: comparison(number),
+                    comparison,
                 });
             }
             ForgeRequest::FetchUser { token, .. }
@@ -352,9 +365,10 @@ impl ForgeBackend for FakeGitHub {
                     message: "overview unavailable".to_owned(),
                 }
             } else {
+                let overview = self.with(|s| s.overviews.get(&pr.forge).cloned()).unwrap_or_else(|| overview_fixture(token.is_some()));
                 ForgeResponse::PullRequestOverviewLoaded {
                     pr,
-                    overview: Box::new(overview_fixture(token.is_some())),
+                    overview: Box::new(overview),
                 }
             }),
             ForgeRequest::AddPullRequestComment { pr, .. } => {
@@ -364,7 +378,7 @@ impl ForgeBackend for FakeGitHub {
                 forge: ReviewForge::Bitbucket,
                 ..
             } => emit(match self.with(|s| s.bitbucket_pulls.clone()) {
-                Some(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
+                Some(pulls) => ForgeResponse::MyPullRequestsLoaded(PullRequestPage { pulls, ..PullRequestPage::default() }),
                 None => ForgeResponse::MyPullRequestsLoadFailed {
                     message: "workspaces unavailable".to_owned(),
                 },
@@ -374,7 +388,7 @@ impl ForgeBackend for FakeGitHub {
                     message: "search unavailable".to_owned(),
                 }
             } else {
-                ForgeResponse::MyPullRequestsLoaded(pulls)
+                ForgeResponse::MyPullRequestsLoaded(PullRequestPage { pulls, ..PullRequestPage::default() })
             }),
         }
     }
