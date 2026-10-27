@@ -64,6 +64,7 @@ pub enum PullStatus {
     Closed,
     Declined,
     Superseded,
+    Unknown,
 }
 
 impl PullStatus {
@@ -75,7 +76,9 @@ impl PullStatus {
             }
             Self::Approved | Self::Ready => PullGroup::Ready,
             Self::Draft => PullGroup::Drafts,
-            Self::Merged | Self::Closed | Self::Declined | Self::Superseded => PullGroup::History,
+            Self::Merged | Self::Closed | Self::Declined | Self::Superseded | Self::Unknown => {
+                PullGroup::History
+            }
         }
     }
 
@@ -94,6 +97,7 @@ impl PullStatus {
             Self::Closed => "Closed",
             Self::Declined => "Declined",
             Self::Superseded => "Superseded",
+            Self::Unknown => "Unknown status",
         }
     }
 }
@@ -104,7 +108,8 @@ pub fn pull_status(pull: &MyPullRequest) -> PullStatus {
         "CLOSED" => return PullStatus::Closed,
         "DECLINED" => return PullStatus::Declined,
         "SUPERSEDED" => return PullStatus::Superseded,
-        _ => {}
+        "OPEN" => {}
+        _ => return PullStatus::Unknown,
     }
     let decision = pull.review_decision.as_deref();
     let checks = pull.checks.as_ref().and_then(|c| c.state.as_deref());
@@ -348,7 +353,6 @@ impl ReviewController {
                 self.fetch_pulls().effect(self.resolve_clones())
             }
             PullsAction::Move(delta) => {
-                
                 if self.pulls.step(delta) {
                     Reduction::changed()
                 } else {
@@ -508,7 +512,12 @@ impl ReviewController {
             self.pulls.requests.push((scope.request, forge, filter));
             reduction = reduction.effect(ReviewEffect::Forge {
                 scope,
-                request: Box::new(ForgeRequest::FetchMyPullRequests { forge, token, filter, cursor }),
+                request: Box::new(ForgeRequest::FetchMyPullRequests {
+                    forge,
+                    token,
+                    filter,
+                    cursor,
+                }),
             });
         }
         reduction
@@ -555,7 +564,11 @@ impl ReviewController {
         if more && let Some(data) = self.pulls.data.as_ref() {
             pulls.extend(data.iter().cloned());
         }
-        pulls.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.url.cmp(&b.url)));
+        pulls.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.url.cmp(&b.url))
+        });
         let mut seen = std::collections::HashSet::new();
         pulls.retain(|pull| seen.insert(pull.url.clone()));
         self.pulls.error = None;
@@ -588,7 +601,11 @@ impl ReviewController {
             self.pulls.next_cursors.remove(&forge);
         }
         self.pulls.limit_reached |= page.limit_reached;
-        self.pulls.failures.extend(page.warnings.into_iter().map(|warning| format!("{}: {warning}", forge.name())));
+        self.pulls.failures.extend(
+            page.warnings
+                .into_iter()
+                .map(|warning| format!("{}: {warning}", forge.name())),
+        );
         self.pulls.forges_answered += 1;
         self.pulls.gathered.extend(page.pulls);
         self.finish_pulls()
@@ -701,6 +718,7 @@ mod tests {
     fn pull(number: i32, updated: &str) -> MyPullRequest {
         MyPullRequest {
             id: format!("PR_{number}"),
+            state: "OPEN".to_owned(),
             number,
             title: format!("Tidy the widget {number}"),
             url: format!("https://github.com/owner/repo/pull/{number}"),
@@ -781,6 +799,24 @@ mod tests {
         ];
         for (pull, expected) in cases {
             assert_eq!(pull_status(&pull), expected, "{pull:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_lifecycle_never_claims_open_draft_or_merge_readiness() {
+        for forge in [ReviewForge::GitHub, ReviewForge::Bitbucket] {
+            for state in ["", "UNKNOWN", "new-provider-state"] {
+                let mut pull = pull(1, "2026-01-01T00:00:00Z");
+                pull.forge = forge;
+                pull.state = state.to_owned();
+                pull.is_draft = true;
+                pull.review_decision = Some("CHANGES_REQUESTED".into());
+                assert_eq!(pull_status(&pull), PullStatus::Unknown);
+                assert_eq!(
+                    super::super::overview::state_badge(state, true).0,
+                    "Unknown"
+                );
+            }
         }
     }
 

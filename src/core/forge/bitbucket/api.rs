@@ -479,6 +479,32 @@ mod tests {
     }
 
     #[test]
+    fn historical_hash_expansion_preserves_token_rejection() {
+        use crate::core::forge::test_http::Server;
+        let server = Server::new(1, |request| {
+            assert_eq!(
+                request.target,
+                "/repositories/acme/widgets/commit/abcdefabcdef"
+            );
+            (401, json!({"error": {"message": "expired"}}))
+        });
+        let mut api = BitbucketApi::new(Credentials::parse("fixture-token").unwrap());
+        api.api_root = Some(server.root.clone());
+        let mut info = parse_pull_request(&pull_request()).unwrap();
+        let pr = ReviewTarget {
+            forge: crate::core::review::ReviewForge::Bitbucket,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 42,
+        };
+        assert!(matches!(
+            api.expand_historical_commits(&pr, &mut info),
+            Err(DiffyError::Auth { .. })
+        ));
+        server.finish();
+    }
+
+    #[test]
     fn a_deleted_fork_leaves_the_head_repository_empty() {
         let mut value = pull_request();
         value["source"]["repository"] = Value::Null;

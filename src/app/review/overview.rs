@@ -89,9 +89,14 @@ pub(super) fn state_badge(state: &str, draft: bool) -> (&'static str, &'static s
         ("MERGED", _) => ("Merged", icons::GIT_MERGE, BadgeVariant::Accent),
         ("CLOSED", _) => ("Closed", lucide::GIT_PULL_REQUEST, BadgeVariant::Error),
         ("DECLINED", _) => ("Declined", lucide::GIT_PULL_REQUEST, BadgeVariant::Error),
-        ("SUPERSEDED", _) => ("Superseded", lucide::GIT_PULL_REQUEST, BadgeVariant::Default),
-        (_, true) => ("Draft", lucide::GIT_PULL_REQUEST, BadgeVariant::Default),
-        _ => ("Open", lucide::GIT_PULL_REQUEST, BadgeVariant::Success),
+        ("SUPERSEDED", _) => (
+            "Superseded",
+            lucide::GIT_PULL_REQUEST,
+            BadgeVariant::Default,
+        ),
+        ("OPEN", true) => ("Draft", lucide::GIT_PULL_REQUEST, BadgeVariant::Default),
+        ("OPEN", false) => ("Open", lucide::GIT_PULL_REQUEST, BadgeVariant::Success),
+        _ => ("Unknown", lucide::GIT_PULL_REQUEST, BadgeVariant::Default),
     }
 }
 

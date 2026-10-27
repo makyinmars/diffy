@@ -19,7 +19,9 @@ use crate::app::shell::Slot;
 use crate::app::text_targets::{REVIEW_PULLS, REVIEW_PULLS_FILTER};
 use crate::app::tokens::{self, Bp, Ico, Layout, Rad, Sp, TextStyle};
 use crate::contracts::review::{PullsAction, ReviewAction};
-use crate::core::forge::model::{MyPullRequest, PullRequestFilter, PullRequestCheckSummary, PullRequestReviewer};
+use crate::core::forge::model::{
+    MyPullRequest, PullRequestCheckSummary, PullRequestFilter, PullRequestReviewer,
+};
 use crate::core::ref_catalog::{now_secs, relative_age};
 use crate::core::review::ReviewForge;
 
@@ -108,6 +110,7 @@ fn merge_label(status: PullStatus) -> &'static str {
         PullStatus::Closed => "Closed without merging",
         PullStatus::Declined => "Declined without merging",
         PullStatus::Superseded => "Superseded",
+        PullStatus::Unknown => "Status unavailable",
     }
 }
 
@@ -178,7 +181,10 @@ impl Page<'_> {
     fn header(&self, page: &PullsPage) -> AnyElement {
         let scale = self.scale;
         let tc = &self.theme.colors;
-        let count = page.data.as_ref().map(|_| format!("{} loaded", page.total()));
+        let count = page
+            .data
+            .as_ref()
+            .map(|_| format!("{} loaded", page.total()));
         let updated = match (page.loading, page.fetched_at) {
             (true, _) => Some("Updating\u{2026}".to_owned()),
             (false, Some(at)) => Some(match relative_age(self.now, at).as_str() {
@@ -246,7 +252,7 @@ impl Page<'_> {
                     {...tabs}
                 </div>
                 <div class="flex-row w-full" px={Sp::XS} accessibility_role={AccessibilityRole::Label} aria-label="Pull requests authored by you">
-                    {self.muted("Authored by you · newest activity first")}
+                    {self.muted("Authored by you · newest loaded activity first")}
                 </div>
             </div>
         }
@@ -258,14 +264,23 @@ impl Page<'_> {
         }
         let scale = self.scale;
         let tc = &self.theme.colors;
-        let more = page.has_more().then(|| controls::button(
-            if page.loading_more { "Loading more…" } else { "Load more" },
-            pulls(PullsAction::LoadMore), Tone::Secondary,
-        ).disabled(page.loading).tooltip("m"));
+        let more = page.has_more().then(|| {
+            controls::button(
+                if page.loading_more {
+                    "Loading more…"
+                } else {
+                    "Load more"
+                },
+                pulls(PullsAction::LoadMore),
+                Tone::Secondary,
+            )
+            .disabled(page.loading)
+            .tooltip("m")
+        });
         let detail = if page.limit_reached {
             "GitHub search stops at 1,000 results. Older GitHub pull requests remain available on GitHub."
         } else if self.review.signed_in(ReviewForge::Bitbucket) {
-            "Load more checks additional workspace pages."
+            "More workspaces may contain newer activity."
         } else {
             "Load more pull requests, 50 at a time."
         };
@@ -580,7 +595,11 @@ impl Page<'_> {
                 </div>
             }),
             (Some(data), _) if data.is_empty() => Some(self.notice(
-                &format!("No {} pull requests{}", page.state.id(), if page.has_more() { " loaded yet" } else { "" }),
+                &format!(
+                    "No {} pull requests{}",
+                    page.state.id(),
+                    if page.has_more() { " loaded yet" } else { "" }
+                ),
                 &format!(
                     "Pull requests you authored on {} show up here.",
                     listed_forges(self.review)
