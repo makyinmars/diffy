@@ -1880,6 +1880,12 @@ impl GitService {
                 &format!("refs/heads/{}", info.head_branch),
                 &info.head_sha,
             );
+        } else if forge == ReviewForge::Bitbucket {
+            self.fetch_recorded_commit(
+                &base_source,
+                &format!("refs/heads/{}", info.base_branch),
+                &info.head_sha,
+            );
         }
         let comparison = self.cached_pull_request_comparison(target, info)?;
         tracing::info!(
@@ -3598,6 +3604,89 @@ mod tests {
     {
         for deleted in [false, true] {
             historical_pull_request_fixture(BITBUCKET, false, deleted);
+        }
+    }
+
+    #[test]
+    fn merged_bitbucket_pull_requests_recover_deleted_fork_heads_from_the_destination() {
+        for cached_base in [false, true] {
+            for abbreviated_head in [false, true] {
+                let upstream_dir = TempDir::new().unwrap();
+                Repository::init_bare(upstream_dir.path()).unwrap();
+                let seed_dir = TempDir::new().unwrap();
+                let seed = Repository::init(seed_dir.path()).unwrap();
+                let base_oid = commit_file(&seed, "a.txt", "old\n", "base");
+                let mut upstream = seed
+                    .remote("upstream", upstream_dir.path().to_str().unwrap())
+                    .unwrap();
+                upstream
+                    .push(&[format!("+{base_oid}:refs/heads/main")], None)
+                    .unwrap();
+
+                let local_dir = TempDir::new().unwrap();
+                let local = Repository::init(local_dir.path()).unwrap();
+                local
+                    .config()
+                    .unwrap()
+                    .set_str(
+                        &format!("url.{}.insteadOf", upstream_dir.path().display()),
+                        "https://bitbucket.org/acme/widgets.git",
+                    )
+                    .unwrap();
+                let mut git = GitService::new();
+                git.open(local_dir.path().to_str().unwrap()).unwrap();
+                if cached_base {
+                    git.fetch_refspecs(
+                        upstream_dir.path().to_str().unwrap(),
+                        std::slice::from_ref(&base_oid),
+                    )
+                    .unwrap();
+                }
+
+                let head_oid = commit_file(&seed, "a.txt", "reviewed\n", "merged PR");
+                let tip_oid = commit_file(&seed, "a.txt", "later destination\n", "later change");
+                upstream
+                    .push(&[format!("+{tip_oid}:refs/heads/main")], None)
+                    .unwrap();
+                assert!(local.find_commit(head_oid.parse().unwrap()).is_err());
+                assert_eq!(
+                    local.find_commit(base_oid.parse().unwrap()).is_ok(),
+                    cached_base
+                );
+
+                let target = ReviewTarget {
+                    forge: BITBUCKET,
+                    owner: "acme".to_owned(),
+                    repo: "widgets".to_owned(),
+                    number: 24,
+                };
+                let info = PullRequestInfo {
+                    number: target.number,
+                    state: "closed".to_owned(),
+                    merged: true,
+                    base_branch: "main".to_owned(),
+                    head_branch: "deleted-feature".to_owned(),
+                    base_sha: base_oid.clone(),
+                    head_sha: if abbreviated_head {
+                        head_oid[..12].to_owned()
+                    } else {
+                        head_oid.clone()
+                    },
+                    base_repo_url: "https://bitbucket.org/acme/widgets.git".to_owned(),
+                    head_repo_url: String::new(),
+                    ..PullRequestInfo::default()
+                };
+                let (resolved, left, right) = git
+                    .resolve_pull_request_comparison(&target, info)
+                    .expect("a deleted fork's merged head is recoverable from the destination");
+                assert_eq!(resolved.base_sha, base_oid);
+                assert_eq!(resolved.head_sha, head_oid);
+                assert_eq!(git.resolve_commit_oid(&left).unwrap(), base_oid);
+                assert_eq!(git.resolve_commit_oid(&right).unwrap(), head_oid);
+                let patch = git.diff_two_refs(&left, &right).unwrap();
+                assert!(patch.contains("-old\n+reviewed\n"), "{patch}");
+                assert!(!patch.contains("later destination"), "{patch}");
+            }
         }
     }
 
