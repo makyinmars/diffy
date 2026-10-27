@@ -335,14 +335,24 @@ fn account_view(review: &ReviewController, theme: &Theme) -> AnyElement {
     let scale = tokens::ui_scale(theme);
     let forge = review.active_forge();
     if !review.signed_in(forge) {
-        let accessible = format!("Sign in to {}", forge.name());
+        let rejected = review.needs_sign_in(forge);
+        let accessible = if rejected {
+            format!(
+                "{}. Sign in to {}",
+                controls::sign_in_stopped(forge),
+                forge.name()
+            )
+        } else {
+            format!("Sign in to {}", forge.name())
+        };
         return controls::ghost_chip(
             GhostChip {
                 icon: controls::forge_icon(forge),
-                label: "Sign in",
+                label: if rejected { "Sign in again" } else { "Sign in" },
                 accessible: &accessible,
                 focus: REVIEW_ACCOUNT,
                 test_id: "review.sign_in",
+                alert: rejected,
             },
             action(ReviewAction::OpenAuthModal),
             theme,
@@ -778,6 +788,7 @@ fn account_card(review: &ReviewController, forge: ReviewForge, cx: &ViewContext)
     let body = TextStyle::Body.font_size(theme);
     let small = TextStyle::BodySmall.font_size(theme);
     let signed_in = review.signed_in(forge);
+    let rejected = review.needs_sign_in(forge);
     let account = review.account(forge);
     let user = account.user.as_ref().filter(|_| signed_in);
     let detail = match (user, &account.auth, forge) {
@@ -786,6 +797,14 @@ fn account_card(review: &ReviewController, forge: ReviewForge, cx: &ViewContext)
         }
         (Some(user), _, _) => format!("Signed in as @{}", user.login),
         _ if signed_in => "Signed in".to_owned(),
+        (None, _, ReviewForge::GitHub) if rejected => format!(
+            "{}. Sign in again to load pull requests and post reviews.",
+            controls::sign_in_stopped(forge)
+        ),
+        (None, _, ReviewForge::Bitbucket) if rejected => format!(
+            "{}. Paste a new API token to sign in again.",
+            controls::sign_in_stopped(forge)
+        ),
         (None, AuthStatus::Starting | AuthStatus::Awaiting(_), ReviewForge::GitHub) => {
             "Waiting for you to approve in the browser\u{2026}".to_owned()
         }
@@ -810,22 +829,24 @@ fn account_card(review: &ReviewController, forge: ReviewForge, cx: &ViewContext)
             </div>
         },
     };
-    let control = match (signed_in, forge) {
-        (true, _) => Some(controls::button(
-            "Sign out",
-            action(ReviewAction::SignOut(forge)),
-            Tone::Secondary,
-        )),
-        (false, ReviewForge::GitHub) => Some(
+    let sign_out = |tone| controls::button("Sign out", action(ReviewAction::SignOut(forge)), tone);
+    let mut actions = Vec::new();
+    if signed_in {
+        actions.push(sign_out(Tone::Secondary));
+    } else if rejected {
+        // Signing out forgets the refused token the keyring still holds.
+        actions.push(sign_out(Tone::Ghost));
+    }
+    if !signed_in && forge == ReviewForge::GitHub {
+        actions.push(
             controls::button(
                 "Sign in",
                 action(ReviewAction::OpenSignIn(forge)),
                 Tone::Primary,
             )
             .icon(lucide::GITHUB_MARK),
-        ),
-        (false, ReviewForge::Bitbucket) => None,
-    };
+        );
+    }
     let form =
         (!signed_in && forge == ReviewForge::Bitbucket).then(|| bitbucket_form(review, false, cx));
     view! { scale,
@@ -838,9 +859,11 @@ fn account_card(review: &ReviewController, forge: ReviewForge, cx: &ViewContext)
                 {picture}
                 <div class="flex-col flex-1" min_w={0.0} gap={Sp::XXS}>
                     <text size={Px(body)} class="font-medium truncate" color={tc.text}>{forge.name()}</text>
-                    <text size={Px(small)} class="truncate" color={tc.text_muted}>{detail}</text>
+                    <div class="flex-row w-full" min_w={0.0} test_id={format!("settings.accounts.{}.detail", forge.key())}>
+                        <text size={Px(small)} color={if rejected { tc.status_warning } else { tc.text_muted }}>{detail}</text>
+                    </div>
                 </div>
-                {?control}
+                {...actions}
             </div>
             {?form}
         </div>

@@ -171,6 +171,7 @@ impl Default for CommandsController {
         palette.register(palette::Commands);
         palette.register(palette::Files);
         palette.register(palette::Repositories);
+        let launcher = Launcher::with_short_forge(Rc::clone(&pull_request_forge));
         Self {
             settings: Rc::default(),
             layers: Vec::new(),
@@ -194,7 +195,7 @@ impl Default for CommandsController {
             repo_scan: None,
             repo_scanning: false,
             repo_picker_current: None,
-            launcher: Some(Launcher::default()),
+            launcher: Some(launcher),
             clones: Vec::new(),
             next_clone: 0,
             file_picker: None,
@@ -2477,6 +2478,9 @@ impl Controller for CommandsController {
                 self.startup(&cx.settings, startup.options.args.repo.is_none())
             }
             Intent::ActivateWorkspace { .. } => {
+                // Short pull request references are GitHub until the new
+                // repository reports its forge.
+                self.pull_request_forge.set(ReviewForge::GitHub);
                 if let Some(launcher) = &mut self.launcher {
                     launcher.reset();
                 }

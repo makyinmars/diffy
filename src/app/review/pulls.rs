@@ -184,7 +184,7 @@ pub struct PullsPage {
     requested: usize,
     gathered: Vec<MyPullRequest>,
     forges_answered: usize,
-    failures: Vec<String>,
+    failures: Vec<(ReviewForge, String)>,
     clones_job: Option<JobId>,
     last_focus: Option<LogicalFocus>,
     return_focus: Option<LogicalFocus>,
@@ -462,16 +462,25 @@ impl ReviewController {
     }
 
     /// Publish the merged listing once every forge has answered. A forge
-    /// that failed while another listed pull requests shows as a toast.
+    /// that failed while another listed pull requests shows as a toast; one
+    /// whose token was refused shows as a sign-in banner instead.
     fn finish_pulls(&mut self) -> Reduction {
         if !self.pulls.requests.is_empty() {
             return Reduction::default();
         }
         self.pulls.loading = false;
         let answered = std::mem::take(&mut self.pulls.forges_answered);
-        let failures = std::mem::take(&mut self.pulls.failures);
+        let failures: Vec<String> = std::mem::take(&mut self.pulls.failures)
+            .into_iter()
+            .filter(|(forge, _)| !self.needs_sign_in(*forge))
+            .map(|(_, message)| message)
+            .collect();
         let mut pulls = std::mem::take(&mut self.pulls.gathered);
         if answered == 0 {
+            if failures.is_empty() {
+                self.pulls.error = None;
+                return Reduction::changed();
+            }
             let message = failures.join("\n");
             tracing::warn!("failed to list your pull requests: {message}");
             self.pulls.error = Some(message);
@@ -518,11 +527,12 @@ impl ReviewController {
         if !self.take_pulls_request(request) {
             return Reduction::default();
         }
-        self.pulls.failures.push(if self.pulls.requested == 1 {
+        let message = if self.pulls.requested == 1 {
             message
         } else {
             format!("{}: {message}", forge.name())
-        });
+        };
+        self.pulls.failures.push((forge, message));
         self.finish_pulls()
     }
 
