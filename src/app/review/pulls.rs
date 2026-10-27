@@ -604,7 +604,7 @@ impl ReviewController {
         self.pulls.failures.extend(
             page.warnings
                 .into_iter()
-                .map(|warning| format!("{}: {warning}", forge.name())),
+                .map(|warning| (forge, format!("{}: {warning}", forge.name()))),
         );
         self.pulls.forges_answered += 1;
         self.pulls.gathered.extend(page.pulls);

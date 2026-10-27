@@ -7,8 +7,9 @@ use quark_ui::document::DocumentEvent;
 use crate::contracts::shared::{AccountEpoch, JobId, SourceTarget};
 use crate::core::forge::github::DeviceFlowState;
 use crate::core::forge::model::{
-    ForgeUser, PullRequestFilter, PullRequestPage, PullRequestInfo, PullRequestOverview, PullRequestReviewComment,
-    PullRequestReviewData, PullRequestReviewThreadComment, ReviewThreadResolution,
+    ForgeUser, PullRequestFilter, PullRequestInfo, PullRequestOverview, PullRequestPage,
+    PullRequestReviewComment, PullRequestReviewData, PullRequestReviewThreadComment,
+    ReviewThreadResolution,
 };
 use crate::core::forge::parse_pull_request_url;
 use crate::core::review::{

@@ -3233,6 +3233,16 @@ mod tests {
         assert_eq!(git.resolve_commit_oid(&right).unwrap(), head_oid);
 
         // Cached refs that match the short hashes are reused without a fetch.
+        git.fetch_refspecs(
+            upstream.path().to_str().unwrap(),
+            std::slice::from_ref(&destination_tip),
+        )
+        .unwrap();
+        git.fetch_refspecs(
+            fork.path().to_str().unwrap(),
+            std::slice::from_ref(&source_tip),
+        )
+        .unwrap();
         drop(upstream);
         drop(fork);
         let (again, _, _) = git.resolve_pull_request_comparison(&target, info).unwrap();

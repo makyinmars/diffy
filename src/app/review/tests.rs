@@ -3225,10 +3225,7 @@ fn history_driver(forge: ReviewForge) -> Driver {
     let mut driver = pulls_driver();
     if forge == ReviewForge::Bitbucket {
         driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
-        driver.deliver(ReviewEvent::TokenLoaded {
-            forge,
-            token: Some(Secret::new("history-fixture-token")),
-        });
+        sign_in_to_bitbucket(&mut driver);
     }
     driver.fake.clones.push((
         "bitbucket.org/owner/repo".to_owned(),
@@ -3420,10 +3417,7 @@ fn history_refresh_after_switch_and_account_changes_invalidate_old_pages() {
     driver.release();
     assert!(driver.review.pulls().data.is_none());
     assert!(!driver.review.pulls().loading);
-    driver.deliver(ReviewEvent::TokenLoaded {
-        forge: ReviewForge::GitHub,
-        token: Some(Secret::new("new-history-account")),
-    });
+    driver.act(ReviewAction::StartDeviceFlow);
     assert_eq!(driver.review.pulls().state, PullRequestFilter::Closed);
     assert_eq!(
         driver.review.pulls().selected_pull().unwrap().state,
@@ -3496,7 +3490,12 @@ fn historical_tabs_preview_and_overview_use_provider_lifecycle_labels() {
                 forge,
                 message: "redraw".to_owned(),
             });
-            ui.find(By::role_name(Role::Label, format!("State: {label}")));
+            for id in ["review.pull_request.state", "review.overview.state"] {
+                assert_eq!(
+                    ui.find(By::test_id(id)).name.as_deref(),
+                    Some(format!("State: {label}").as_str())
+                );
+            }
             assert!(!ui.painted_text().contains("Ready to merge"));
             ui.app_mut().driver.act(pulls(PullsAction::Open));
             ui.send_message(ReviewEvent::TokenSaveFailed {
