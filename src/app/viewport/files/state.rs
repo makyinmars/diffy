@@ -332,6 +332,7 @@ impl FilesController {
 
     pub fn apply_intent(&mut self, intent: &Intent) -> Reduction {
         match intent {
+            Intent::RevealSource(_) => self.show_diff(),
             Intent::ActivateWorkspace { .. } if !self.tabs.is_empty() => {
                 self.tabs.clear();
                 self.active = None;
@@ -344,4 +345,38 @@ impl FilesController {
 
 fn focus_viewport() -> ShellEffect {
     ShellEffect::Focus(Some(LogicalFocus::Viewport))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::shared::{FileKey, FileRevision, SourceTarget};
+    use crate::core::vcs::model::RevisionId;
+
+    #[test]
+    fn guide_reveals_show_the_diff_without_closing_full_file_tabs() {
+        let mut files = FilesController::default();
+        files.tabs.push(FileTab {
+            id: TabId(1),
+            file: FileAt {
+                path: "a.rs".into(),
+                revision: RevisionId::git("head"),
+                label: "head".into(),
+            },
+            state: TabState::Loading,
+            reveal: None,
+        });
+        files.active = Some(TabId(1));
+        let reduction = files.apply_intent(&Intent::RevealSource(SourceTarget {
+            file: FileKey(1),
+            revision: FileRevision(1),
+            side: Side::New,
+            lines: 0..1,
+        }));
+        assert!(reduction.changed);
+        assert_eq!(files.active(), None);
+        assert_eq!(files.tabs().len(), 1);
+        files.reduce_action(FilesAction::Activate(TabId(1)), &SharedContext::default());
+        assert_eq!(files.active(), Some(TabId(1)));
+    }
 }

@@ -1003,3 +1003,43 @@ fn guide_reveals_reach_a_line_and_wait_for_files_that_are_not_loaded() {
         line_names(&ui)
     );
 }
+
+#[test]
+fn newer_navigation_supersedes_a_pending_guide_reveal() {
+    for select_file in [true, false] {
+        let mut ui = loaded(Host::new());
+        ui.app_mut().intent(Intent::RevealSource(SourceTarget {
+            file: FileKey(3),
+            revision: FileRevision(1),
+            side: Side::New,
+            lines: 0..1,
+        }));
+        if select_file {
+            let selected = SelectedFile {
+                key: FileKey(1),
+                origin: SelectionOrigin::Sidebar,
+            };
+            ui.app_mut().shared.selected_file = Some(selected);
+            ui.app_mut().intent(Intent::SelectFile(Some(selected)));
+        } else {
+            focus_diff(&mut ui);
+            ui.key("home");
+        }
+        ui.app_mut().intents.clear();
+        ui.app_mut().install(ViewportInstall::File {
+            prepared: prepared(3, 1, "c.rs", "old\n", "late guide target\n"),
+            remap: None,
+        });
+        ui.frame();
+        assert!(
+            !ui.app().intents.iter().any(|intent| matches!(
+                intent,
+                Intent::SelectFile(Some(SelectedFile {
+                    key: FileKey(3),
+                    ..
+                }))
+            )),
+            "late guide must not publish another selection"
+        );
+    }
+}

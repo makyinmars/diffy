@@ -86,22 +86,37 @@ impl GuideServices {
             hunks = prompt.outline.sent_hunks(),
             "guide: prompt built"
         );
-        let mut reply = String::new();
-        let mut reported = Instant::now();
-        let mut forward = |chunk: String| {
-            reply.push_str(&chunk);
-            if reported.elapsed() < PROGRESS_EVERY {
-                return true;
-            }
-            reported = Instant::now();
-            progress(reply.len(), builder::drafted_steps(&reply))
-        };
-        if complete(prompt.text, &mut forward)? == RunOutcome::Cancelled {
+        if !live() {
             return Ok(None);
         }
-        let parsed = builder::parse_guide(&reply, &prompt.outline).inspect_err(|message| {
-            tracing::warn!(job = request.job.0, %message, reply_bytes = reply.len(), "guide: reply rejected");
-        })?;
+        let parsed = if prompt.outline.needs_model() {
+            let mut reply = String::new();
+            let mut reported = Instant::now();
+            let mut forward = |chunk: String| {
+                reply.push_str(&chunk);
+                if reported.elapsed() < PROGRESS_EVERY {
+                    return true;
+                }
+                reported = Instant::now();
+                progress(reply.len(), builder::drafted_steps(&reply))
+            };
+            if complete(prompt.text, &mut forward)? == RunOutcome::Cancelled {
+                return Ok(None);
+            }
+            builder::parse_guide(&reply, &prompt.outline).inspect_err(|message| {
+                tracing::warn!(
+                    job = request.job.0,
+                    %message,
+                    reply_bytes = reply.len(),
+                    "guide: reply rejected"
+                );
+            })?
+        } else {
+            builder::mechanical_guide(&prompt.outline)?
+        };
+        if !live() {
+            return Ok(None);
+        }
         let guide = Guide {
             overview: parsed.overview,
             steps: parsed.steps,
@@ -129,6 +144,9 @@ fn read_patches(
     request: &GuideRequest,
     live: &dyn Fn() -> bool,
 ) -> Result<Option<HashMap<String, Vec<builder::PatchHunk>>>, String> {
+    if !live() {
+        return Ok(None);
+    }
     let git = GitService::new_with_open(Path::new(&request.repo_path))
         .map_err(|error| format!("Guides need a Git repository: {}", error.user_message()))?;
     let order = builder::reviewable_order(&request.files);

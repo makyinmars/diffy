@@ -120,6 +120,85 @@ fn no_progress(_: usize, _: usize) -> bool {
 }
 
 #[test]
+fn mechanical_only_guides_never_call_a_model_and_are_cached() {
+    let mut fx = fixture();
+    fx.request.files.retain(|file| file.path == "Cargo.lock");
+    let guide = fx
+        .services
+        .generate_with(
+            &fx.request,
+            "fake-model".to_owned(),
+            &|| true,
+            &mut no_progress,
+            |_, _| panic!("mechanical changes must not call a model"),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(guide.steps.len(), 1);
+    assert_eq!(guide.steps[0].kind, StepKind::Mechanical);
+    assert_eq!(guide.steps[0].anchors[0].path, "Cargo.lock");
+    assert!(guide.overview.contains("No model was called"));
+    assert_eq!(
+        fx.services.load(
+            &fx.request.subject.key(),
+            &fx.request.base,
+            &fx.request.head
+        ),
+        Some(guide)
+    );
+    assert_eq!(
+        fx.services.generate_with(
+            &fx.request,
+            "fake-model".to_owned(),
+            &|| false,
+            &mut no_progress,
+            |_, _| panic!("cancelled mechanical changes must not call a model"),
+        ),
+        Ok(None)
+    );
+}
+
+#[test]
+fn git_quoted_utf8_paths_keep_their_real_hunks() {
+    let mut fx = fixture();
+    let path = "src/café\t\"\\.rs";
+    git(fx._dir.path(), &["config", "core.quotePath", "true"]);
+    fx.request.base = commit(fx._dir.path(), &[(path, "before\n".into())]);
+    fx.request.head = commit(fx._dir.path(), &[(path, "after\n".into())]);
+    fx.request.files = vec![ChangedFile {
+        path: path.into(),
+        old_path: None,
+        status: 'M',
+        stats: Some((1, 1)),
+        binary: false,
+    }];
+    let guide = fx
+        .services
+        .generate_with(
+            &fx.request,
+            "fake-model".into(),
+            &|| true,
+            &mut no_progress,
+            |prompt, forward| {
+                assert!(prompt.contains("H0 @@"), "{prompt}");
+                assert!(prompt.contains("+after"), "{prompt}");
+                forward(r#"{"overview":"Change.","steps":[{"title":"Edit","hunks":[0]}]}"#.into());
+                Ok(RunOutcome::Finished)
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(guide.steps[0].anchors[0].path, path);
+    assert_eq!(
+        guide.steps[0].anchors[0].hunk,
+        Some(HunkSpot {
+            side: HunkSide::Old,
+            line: 0
+        })
+    );
+}
+
+#[test]
 fn generates_a_guide_from_the_repository_and_caches_it() {
     let fx = fixture();
     let mut prompt_seen = String::new();

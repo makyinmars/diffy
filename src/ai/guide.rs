@@ -80,6 +80,10 @@ impl Outline {
     pub fn indexed_files(&self) -> usize {
         self.indexed
     }
+
+    pub fn needs_model(&self) -> bool {
+        !self.files.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,21 +224,37 @@ fn unquote(path: &str) -> String {
     else {
         return path.to_owned();
     };
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    let mut out = Vec::with_capacity(inner.len());
+    let mut bytes = inner.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            out.push(byte);
             continue;
         }
-        match chars.next() {
-            Some('t') => out.push('\t'),
-            Some('n') => out.push('\n'),
+        match bytes.next() {
+            Some(first @ b'0'..=b'3') => {
+                let mut value = first - b'0';
+                for _ in 0..2 {
+                    let Some(&next @ b'0'..=b'7') = bytes.peek() else {
+                        break;
+                    };
+                    bytes.next();
+                    value = value * 8 + next - b'0';
+                }
+                out.push(value);
+            }
+            Some(b'a') => out.push(7),
+            Some(b'b') => out.push(8),
+            Some(b't') => out.push(b'\t'),
+            Some(b'n') => out.push(b'\n'),
+            Some(b'v') => out.push(11),
+            Some(b'f') => out.push(12),
+            Some(b'r') => out.push(b'\r'),
             Some(other) => out.push(other),
             None => {}
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 struct OpenHunk {
@@ -721,26 +741,41 @@ pub fn parse_guide(reply: &str, outline: &Outline) -> Result<ParsedGuide, String
                 .collect(),
         });
     }
-    if !outline.mechanical.is_empty() {
-        steps.push(GuideStep {
-            title: MECHANICAL_TITLE.to_owned(),
-            body: "Listed by name only. Their contents weren\u{2019}t sent to the model."
-                .to_owned(),
-            kind: StepKind::Mechanical,
-            files: outline.mechanical.clone(),
-            anchors: outline
-                .mechanical
-                .iter()
-                .map(|file| GuideAnchor {
-                    path: file.path.clone(),
-                    hunk: None,
-                })
-                .collect(),
-        });
+    if let Some(step) = mechanical_step(outline) {
+        steps.push(step);
     }
     Ok(ParsedGuide {
         overview: clip(Some(overview), MAX_OVERVIEW_CHARS),
         steps,
+    })
+}
+
+fn mechanical_step(outline: &Outline) -> Option<GuideStep> {
+    if outline.mechanical.is_empty() {
+        return None;
+    }
+    Some(GuideStep {
+        title: MECHANICAL_TITLE.to_owned(),
+        body: "Listed by name only. Their contents weren\u{2019}t sent to the model.".to_owned(),
+        kind: StepKind::Mechanical,
+        files: outline.mechanical.clone(),
+        anchors: outline
+            .mechanical
+            .iter()
+            .map(|file| GuideAnchor {
+                path: file.path.clone(),
+                hunk: None,
+            })
+            .collect(),
+    })
+}
+
+pub fn mechanical_guide(outline: &Outline) -> Result<ParsedGuide, String> {
+    let step = mechanical_step(outline).ok_or("There are no changed files to guide.")?;
+    Ok(ParsedGuide {
+        overview: "This change contains only mechanical or generated files. No model was called."
+            .to_owned(),
+        steps: vec![step],
     })
 }
 

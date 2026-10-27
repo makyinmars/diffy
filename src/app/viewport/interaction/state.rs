@@ -1229,6 +1229,7 @@ impl Controller for InteractionController {
 
     fn reduce_action(&mut self, action: Self::Action, cx: &SharedContext) -> Reduction {
         use InteractionAction as A;
+        self.guided = None;
         match action {
             A::Diff(DiffInput(DiffEvent::Key(
                 key @ (DiffKey::NextHunk
@@ -1428,6 +1429,7 @@ impl Controller for InteractionController {
             Intent::Startup(startup) => self.apply_settings(&startup.settings, true, cx),
             Intent::SettingsChanged(settings) => self.apply_settings(&settings.settings, false, cx),
             Intent::SelectFile(Some(selected)) if selected.origin != SelectionOrigin::Viewport => {
+                self.guided = None;
                 let solo = self.sync_solo(Some(selected.key));
                 self.reveal_file(selected.key) | solo
             }

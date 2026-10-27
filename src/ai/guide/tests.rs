@@ -92,6 +92,36 @@ fn prompt() -> GuidePrompt {
     )
 }
 
+#[test]
+fn quoted_paths_decode_octal_utf8_and_c_escapes() {
+    assert_eq!(
+        unquote(r#""src/caf\303\251\t\"\\.rs""#),
+        "src/café\t\"\\.rs"
+    );
+    assert_eq!(unquote(r#""\a\b\v\f\r\n""#), "\u{7}\u{8}\u{b}\u{c}\r\n");
+}
+
+#[test]
+fn mechanical_only_outlines_produce_a_synthetic_guide() {
+    let prompt = build_prompt(
+        None,
+        None,
+        &[
+            file("Cargo.lock", 'M', Some((1, 1))),
+            file("gone.rs", 'D', Some((0, 1))),
+            file("renamed.rs", 'R', Some((0, 0))),
+        ],
+        &HashMap::new(),
+    );
+    assert!(!prompt.outline.needs_model());
+    let guide = mechanical_guide(&prompt.outline).unwrap();
+    assert_eq!(guide.steps.len(), 1);
+    assert_eq!(guide.steps[0].kind, StepKind::Mechanical);
+    assert_eq!(guide.steps[0].files.len(), 3);
+    assert!(mechanical_guide(&Outline::default()).is_err());
+    assert!(self::prompt().outline.needs_model());
+}
+
 fn spot(side: HunkSide, line: u32) -> Option<HunkSpot> {
     Some(HunkSpot { side, line })
 }
