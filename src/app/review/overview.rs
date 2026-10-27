@@ -867,7 +867,9 @@ impl Page<'_> {
                 <icon svg={lucide::ALERT_CIRCLE} size={Ico::SM} color={tc.status_error} />
                 <div class="flex-1 flex-col" min_w={0.0} gap={Sp::XXS}>
                     <text size={Px(self.small())} class="font-medium" color={tc.text}>"Couldn\u{2019}t load the overview"</text>
-                    <text size={Px(self.small())} class="truncate" color={tc.text_muted}>{message.to_owned()}</text>
+                    <div class="flex-row w-full" min_w={0.0}>
+                        <text size={Px(self.small())} class="truncate" color={tc.text_muted}>{message.to_owned()}</text>
+                    </div>
                 </div>
                 <div class="shrink-0" test_id="review.overview.retry">{retry}</div>
             </div>

@@ -406,9 +406,43 @@ impl Page<'_> {
                     <icon svg={lucide::ALERT_CIRCLE} size={Ico::SM} color={tc.status_error} />
                     <div class="flex-1 flex-col" min_w={0.0} gap={Sp::XXS}>
                         <text size={Px(self.small())} class="font-medium" color={tc.text}>"Couldn\u{2019}t load your pull requests"</text>
-                        <text size={Px(self.small())} class="truncate" color={tc.text_muted}>{message.to_owned()}</text>
+                        <div class="flex-row w-full" min_w={0.0}>
+                            <text size={Px(self.small())} class="truncate" color={tc.text_muted}>{message.to_owned()}</text>
+                        </div>
                     </div>
                     <div class="shrink-0" test_id="review.pulls.retry">{retry}</div>
+                </div>
+            </div>
+        }
+    }
+
+    /// A forge that refused its stored token offers a new sign-in, not a
+    /// retry.
+    fn reauth_banner(&self, forge: ReviewForge) -> AnyElement {
+        let scale = self.scale;
+        let tc = &self.theme.colors;
+        let sign_in = controls::button(
+            format!("Sign in to {}", forge.name()),
+            ReviewAction::OpenSignIn(forge),
+            Tone::Primary,
+        )
+        .icon(controls::forge_icon(forge));
+        let stopped = controls::sign_in_stopped(forge);
+        view! { scale,
+            <div class="flex-row w-full shrink-0" px={Sp::SM} py={Sp::XS}>
+                <div class="flex-1 flex-row items-center" min_w={0.0} gap={Sp::SM} px={Sp::MD} py={Sp::SM}
+                     rounded={Rad::LG} bg={tc.elevated_surface} border={tc.border}
+                     accessibility_role={AccessibilityRole::Alert}
+                     aria-label={stopped}
+                     test_id={format!("review.pulls.reauth.{}", forge.key())}>
+                    <icon svg={lucide::ALERT_CIRCLE} size={Ico::SM} color={tc.status_warning} />
+                    <div class="flex-1 flex-col" min_w={0.0} gap={Sp::XXS}>
+                        <text size={Px(self.small())} class="font-medium" color={tc.text}>{stopped}</text>
+                        <div class="flex-row w-full" min_w={0.0}>
+                            <text size={Px(self.small())} class="truncate" color={tc.text_muted}>{format!("Sign in again to list your {} pull requests.", forge.name())}</text>
+                        </div>
+                    </div>
+                    <div class="shrink-0">{sign_in}</div>
                 </div>
             </div>
         }
@@ -451,7 +485,11 @@ impl Page<'_> {
     fn list_pane(&self, page: &PullsPage, width: f32, filter_focused: bool) -> AnyElement {
         let scale = self.scale;
         let tc = &self.theme.colors;
-        let mut body: Vec<AnyElement> = Vec::new();
+        let mut body: Vec<AnyElement> = [ReviewForge::GitHub, ReviewForge::Bitbucket]
+            .into_iter()
+            .filter(|forge| self.review.needs_sign_in(*forge))
+            .map(|forge| self.reauth_banner(forge))
+            .collect();
         if let (Some(error), Some(_)) = (page.error.as_deref(), page.data.as_ref()) {
             body.push(self.banner(error));
         }
@@ -759,6 +797,22 @@ impl Page<'_> {
             .icon(controls::forge_icon(forge));
             view! { <div test_id={format!("review.pulls.sign_in.{}", forge.key())}>{button}</div> }
         };
+        let stopped: Vec<AnyElement> = [ReviewForge::GitHub, ReviewForge::Bitbucket]
+            .into_iter()
+            .filter(|forge| self.review.needs_sign_in(*forge))
+            .map(|forge| {
+                let stopped = controls::sign_in_stopped(forge);
+                view! { scale,
+                    <div class="flex-row items-center" gap={Sp::XS}
+                         accessibility_role={AccessibilityRole::Alert}
+                         aria-label={stopped}
+                         test_id={format!("review.pulls.reauth.{}", forge.key())}>
+                        <icon svg={lucide::ALERT_CIRCLE} size={Ico::SM} color={tc.status_warning} />
+                        <text size={Px(self.small())} color={tc.status_warning}>{format!("{stopped}. Sign in again.")}</text>
+                    </div>
+                }
+            })
+            .collect();
         view! { scale,
             <div class="flex-col items-center justify-center w-full flex-1" gap={Sp::SM} p={Sp::LG}
                  accessibility_role={AccessibilityRole::Group} aria-label="Sign in to see your pull requests"
@@ -766,6 +820,7 @@ impl Page<'_> {
                 <icon svg={lucide::GIT_PULL_REQUEST} size={Ico::XL} color={tc.text_muted} />
                 <text size={Px(TextStyle::Body.font_size(self.theme))} class="font-medium" color={tc.text}>"Sign in to see your pull requests"</text>
                 <text size={Px(self.small())} color={tc.text_muted}>"Diffy lists the open pull requests you authored on GitHub and Bitbucket."</text>
+                {...stopped}
                 <div class="flex-row flex-wrap items-center justify-center" gap={Sp::SM}>
                     {sign_in(ReviewForge::GitHub)}
                     {sign_in(ReviewForge::Bitbucket)}

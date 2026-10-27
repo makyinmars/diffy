@@ -248,6 +248,23 @@ impl ForgeRequest {
         }
     }
 
+    pub fn token(&self) -> Option<&Secret> {
+        match self {
+            Self::FetchUser { token, .. } | Self::FetchMyPullRequests { token, .. } => Some(token),
+            Self::LoadPullRequest { token, .. }
+            | Self::PeekPullRequest { token, .. }
+            | Self::FetchReviewComments { token, .. }
+            | Self::FetchReviewData { token, .. }
+            | Self::SubmitSessionDrafts { token, .. }
+            | Self::AddThreadReply { token, .. }
+            | Self::UpdateComment { token, .. }
+            | Self::DeleteComment { token, .. }
+            | Self::SetThreadResolution { token, .. }
+            | Self::FetchPullRequestOverview { token, .. }
+            | Self::AddPullRequestComment { token, .. } => token.as_ref(),
+        }
+    }
+
     /// The failure response this request reports when it cannot run.
     pub fn fail(self, message: String) -> ForgeResponse {
         match self {
@@ -420,6 +437,11 @@ pub enum ForgeResponse {
     MyPullRequestsLoadFailed {
         message: String,
     },
+    /// `forge` refused the request's credentials. Sent just before the
+    /// request's own failure response, under the same scope.
+    TokenRejected {
+        forge: ReviewForge,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,6 +579,7 @@ impl ReviewEvent {
                     | ForgeResponse::UserFetchFailed { .. }
                     | ForgeResponse::MyPullRequestsLoaded(_)
                     | ForgeResponse::MyPullRequestsLoadFailed { .. }
+                    | ForgeResponse::TokenRejected { .. }
             ),
             Self::DeviceFlowStarted { .. }
             | Self::DeviceFlowStartFailed { .. }
