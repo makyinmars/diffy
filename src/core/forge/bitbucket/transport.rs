@@ -38,17 +38,19 @@ impl Credentials {
     }
 
     /// `email:api_token` or a bare `api_token`, the forms Diffy stores.
-    /// RFC 7617 forbids `:` in the user part and API tokens hold no `@`, so
-    /// an email before the first `:` marks Basic auth.
+    /// RFC 7617 forbids `:` in the user part and API tokens hold neither `:`
+    /// nor `@`, so a `:` marks Basic auth. Bitbucket only accepts the
+    /// Atlassian account email there: a username before the `:` (the old
+    /// app password form) is refused.
     pub fn parse(secret: &str) -> Option<Self> {
         let secret = secret.trim();
         if secret.is_empty() {
             return None;
         }
         let auth = match secret.split_once(':') {
-            Some((email, token)) if email.contains('@') => {
+            Some((email, token)) => {
                 let (email, token) = (email.trim(), token.trim());
-                if token.is_empty() {
+                if !email.contains('@') || token.is_empty() {
                     return None;
                 }
                 Auth::Basic {
@@ -56,7 +58,7 @@ impl Credentials {
                     token: token.to_owned(),
                 }
             }
-            _ => Auth::Bearer(secret.to_owned()),
+            None => Auth::Bearer(secret.to_owned()),
         };
         Some(Self { auth: Some(auth) })
     }
@@ -171,7 +173,7 @@ pub(super) fn send_accepting(
     if status.is_success() || accepted.contains(&status) {
         Ok(text)
     } else {
-        Err(failure(status, &text, context))
+        Err(failure(status, &text, context, credentials.is_anonymous()))
     }
 }
 
@@ -213,33 +215,72 @@ fn rate_limit_error(until: SystemTime, now: SystemTime) -> DiffyError {
     ))
 }
 
-fn failure(status: StatusCode, body: &str, context: &str) -> DiffyError {
-    let message = error_message(body).unwrap_or_else(|| body.trim().to_owned());
-    let details = format!("{context} returned {status}: {message}");
-    if status == StatusCode::UNAUTHORIZED {
-        DiffyError::auth(details)
-    } else {
-        DiffyError::Network {
+fn failure(status: StatusCode, body: &str, context: &str, anonymous: bool) -> DiffyError {
+    let details = match error_message(body).or_else(|| plain_message(body)) {
+        Some(message) => format!("{context} returned {status}: {message}"),
+        None => format!("{context} returned {status}."),
+    };
+    if status != StatusCode::UNAUTHORIZED {
+        return DiffyError::Network {
             details,
             retryable: http::status_is_retryable(status),
-        }
+        };
     }
+    // API tokens expire within a year, so a stored token stops working.
+    let hint = if anonymous {
+        "Sign in to Bitbucket to continue."
+    } else {
+        "Bitbucket rejected the API token, which may be wrong or expired. Sign in again with a valid token."
+    };
+    let separator = if details.ends_with('.') { " " } else { ". " };
+    DiffyError::auth(format!("{details}{separator}{hint}"))
 }
 
-/// The message of a `{"type": "error", "error": {"message": ...}}` body.
+/// The message of a `{"type": "error", "error": {"message": ...}}` body,
+/// with its detail: a string, the scopes a token lacks
+/// (`{"required": [...], "granted": [...]}`), or per-field problems.
 fn error_message(body: &str) -> Option<String> {
     let value: Value = serde_json::from_str(body).ok()?;
-    let error = value.get("error")?;
+    let error = value.get("error").unwrap_or(&value);
     let message = error.get("message")?.as_str()?.trim();
-    let detail = error
-        .get("detail")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|detail| !detail.is_empty());
+    let detail = match error.get("detail") {
+        Some(Value::String(detail)) => Some(detail.trim().to_owned()),
+        Some(detail) => detail
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|scopes| {
+                let scopes: Vec<&str> = scopes.iter().filter_map(Value::as_str).collect();
+                format!("needs {}", scopes.join(", "))
+            }),
+        None => None,
+    }
+    .or_else(|| {
+        let fields = error.get("fields")?.as_object()?;
+        let problems: Vec<String> = fields
+            .iter()
+            .map(|(field, problem)| match problem {
+                Value::Array(items) => {
+                    let items: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+                    format!("{field}: {}", items.join(" "))
+                }
+                other => format!("{field}: {}", other.as_str().unwrap_or_default()),
+            })
+            .collect();
+        Some(problems.join("; "))
+    })
+    .filter(|detail| !detail.is_empty());
     Some(match detail {
         Some(detail) => format!("{message} ({detail})"),
         None => message.to_owned(),
     })
+}
+
+/// A short plain-text body; HTML error pages and long bodies are left out
+/// of the message.
+fn plain_message(body: &str) -> Option<String> {
+    let body = body.trim();
+    (!body.is_empty() && !body.starts_with('<') && body.len() <= 200 && !body.contains('\n'))
+        .then(|| body.to_owned())
 }
 
 #[cfg(test)]
@@ -262,6 +303,8 @@ mod tests {
         assert_eq!(format!("{bearer:?}"), "Credentials(bearer)");
 
         assert!(Credentials::parse("me@example.com:").is_none());
+        // Bitbucket refuses usernames with API tokens; only the email works.
+        assert!(Credentials::parse("maky:ATATT3xToken").is_none());
         assert!(Credentials::parse("  ").is_none());
         assert!(Credentials::anonymous().is_anonymous());
     }
@@ -295,20 +338,82 @@ mod tests {
     #[test]
     fn errors_carry_bitbucket_messages_and_401_is_an_auth_error() {
         let body = r#"{"type": "error", "error": {"message": "Bad token", "detail": "Expired"}}"#;
-        let error = failure(StatusCode::UNAUTHORIZED, body, "Bitbucket user fetch");
+        let error = failure(
+            StatusCode::UNAUTHORIZED,
+            body,
+            "Bitbucket user fetch",
+            false,
+        );
         assert!(matches!(error, DiffyError::Auth { .. }));
         assert_eq!(
             error.to_string(),
-            "Bitbucket user fetch returned 401 Unauthorized: Bad token (Expired)"
+            "Bitbucket user fetch returned 401 Unauthorized: Bad token (Expired). Bitbucket rejected the API token, which may be wrong or expired. Sign in again with a valid token."
         );
         let error = failure(
             StatusCode::NOT_FOUND,
             "not json",
             "Bitbucket pull request fetch",
+            false,
         );
         assert_eq!(
             error.to_string(),
             "Bitbucket pull request fetch returned 404 Not Found: not json"
+        );
+    }
+
+    /// Bodies shaped like the ones Bitbucket documents: an empty 401 to an
+    /// anonymous request, a 403 naming the scopes a token lacks, a 400 with
+    /// field errors, a removed endpoint's 404, and an HTML error page that
+    /// must not reach a toast.
+    #[test]
+    fn error_bodies_become_short_readable_messages() {
+        let anonymous = failure(StatusCode::UNAUTHORIZED, "", "Bitbucket user fetch", true);
+        assert_eq!(
+            anonymous.to_string(),
+            "Bitbucket user fetch returned 401 Unauthorized. Sign in to Bitbucket to continue."
+        );
+
+        let scopes = r#"{"type": "error", "error": {"message": "Your credentials lack one or more required privilege scopes.", "detail": {"required": ["read:user:bitbucket"], "granted": ["read:pullrequest:bitbucket"]}}}"#;
+        assert_eq!(
+            failure(StatusCode::FORBIDDEN, scopes, "Bitbucket user fetch", false).to_string(),
+            "Bitbucket user fetch returned 403 Forbidden: Your credentials lack one or more required privilege scopes. (needs read:user:bitbucket)"
+        );
+
+        let fields = r#"{"type": "error", "error": {"message": "Bad request", "fields": {"content": ["This field is required."]}}}"#;
+        assert_eq!(
+            failure(
+                StatusCode::BAD_REQUEST,
+                fields,
+                "Bitbucket comment create",
+                false
+            )
+            .to_string(),
+            "Bitbucket comment create returned 400 Bad Request: Bad request (content: This field is required.)"
+        );
+
+        let removed =
+            r#"{"message": "Resource not found", "detail": "There is no API hosted at this URL."}"#;
+        assert_eq!(
+            failure(
+                StatusCode::NOT_FOUND,
+                removed,
+                "Bitbucket workspaces fetch",
+                false
+            )
+            .to_string(),
+            "Bitbucket workspaces fetch returned 404 Not Found: Resource not found (There is no API hosted at this URL.)"
+        );
+
+        let html = "<!DOCTYPE html>\n<html><body>Something went wrong</body></html>";
+        assert_eq!(
+            failure(
+                StatusCode::BAD_GATEWAY,
+                html,
+                "Bitbucket diffstat fetch",
+                false
+            )
+            .to_string(),
+            "Bitbucket diffstat fetch returned 502 Bad Gateway."
         );
     }
 }

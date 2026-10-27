@@ -18,6 +18,7 @@ const API_VERSION: &str = "2026-03-10";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const CACHE_CAPACITY: usize = 64;
+const ERROR_MESSAGE_MAX: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Media {
@@ -201,10 +202,62 @@ fn success_body(reply: Reply, context: &str) -> Result<String> {
 }
 
 fn failure(reply: &Reply, context: &str) -> DiffyError {
+    let details = match error_message(&reply.body) {
+        Some(message) => format!("{context} returned {}: {message}", reply.status),
+        None => format!("{context} returned {}.", reply.status),
+    };
+    if reply.status == StatusCode::UNAUTHORIZED {
+        let separator = if details.ends_with('.') { " " } else { ". " };
+        return DiffyError::auth(format!(
+            "{details}{separator}GitHub rejected the token, which may have been revoked or expired. Sign in again."
+        ));
+    }
     DiffyError::Network {
-        details: format!("{context} returned {}: {}", reply.status, reply.body),
+        details,
         retryable: http::status_is_retryable(reply.status),
     }
+}
+
+/// GitHub's error `message` with any per-field `errors`, or a short
+/// plain-text body. HTML pages and multi-line bodies stay out of messages
+/// people read.
+fn error_message(body: &str) -> Option<String> {
+    let body = body.trim();
+    let message = match serde_json::from_str::<Value>(body) {
+        Ok(value) => {
+            let message = value.get("message")?.as_str()?.trim();
+            let errors: Vec<&str> = value
+                .get("errors")
+                .and_then(Value::as_array)
+                .map(|errors| {
+                    errors
+                        .iter()
+                        .filter_map(|error| {
+                            error
+                                .as_str()
+                                .or_else(|| error.get("message").and_then(Value::as_str))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if errors.is_empty() {
+                message.to_owned()
+            } else {
+                format!("{message} ({})", errors.join("; "))
+            }
+        }
+        Err(_) if !body.starts_with('<') && !body.contains('\n') => body.to_owned(),
+        Err(_) => return None,
+    };
+    if message.is_empty() {
+        return None;
+    }
+    Some(if message.chars().count() > ERROR_MESSAGE_MAX {
+        let cut: String = message.chars().take(ERROR_MESSAGE_MAX - 1).collect();
+        format!("{}\u{2026}", cut.trim_end())
+    } else {
+        message
+    })
 }
 
 fn settle(credential: u64, quota: Quota, reply: &Reply, errors: &[Value]) -> Result<()> {
@@ -416,6 +469,58 @@ mod tests {
             retry_at(&headers(&[("x-ratelimit-reset", "900")]), now),
             now + RATE_LIMIT_COOLDOWN
         );
+    }
+
+    fn reply(status: StatusCode, body: &str) -> Reply {
+        Reply {
+            status,
+            headers: HeaderMap::new(),
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn failures_show_github_messages_and_401_is_an_auth_error() {
+        let bad = r#"{"message": "Bad credentials", "documentation_url": "https://docs.github.com/rest", "status": "401"}"#;
+        let error = failure(&reply(StatusCode::UNAUTHORIZED, bad), "GitHub user fetch");
+        assert!(matches!(error, DiffyError::Auth { .. }));
+        assert_eq!(
+            error.to_string(),
+            "GitHub user fetch returned 401 Unauthorized: Bad credentials. GitHub rejected the token, which may have been revoked or expired. Sign in again."
+        );
+
+        let invalid = r#"{"message": "Validation Failed", "errors": [{"resource": "PullRequestReviewComment", "message": "line must be part of the diff"}, "body is too long"]}"#;
+        let error = failure(
+            &reply(StatusCode::UNPROCESSABLE_ENTITY, invalid),
+            "GitHub review create",
+        );
+        assert!(matches!(
+            error,
+            DiffyError::Network {
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "GitHub review create returned 422 Unprocessable Entity: Validation Failed (line must be part of the diff; body is too long)"
+        );
+
+        let html = "<!DOCTYPE html>\n<html><body>Unicorn!</body></html>";
+        let error = failure(
+            &reply(StatusCode::BAD_GATEWAY, html),
+            "GitHub GraphQL request",
+        );
+        assert!(error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "GitHub GraphQL request returned 502 Bad Gateway."
+        );
+
+        let long = format!(r#"{{"message": "{}"}}"#, "x".repeat(500));
+        let message = error_message(&long).unwrap();
+        assert_eq!(message.chars().count(), ERROR_MESSAGE_MAX);
+        assert!(message.ends_with('\u{2026}'));
     }
 
     #[test]

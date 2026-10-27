@@ -3,10 +3,13 @@ use quark_components::{Button, ButtonSize, ButtonStyle};
 use quark_ui::FocusId;
 use quark_ui::accessibility::AccessibilityRole;
 use quark_ui::element::*;
+use quark_ui::icons::lucide;
 use quark_ui::style::Styled;
 use quark_ui::theme::{ControlMetrics, Theme};
 
+use crate::app::icons;
 use crate::app::tokens::{Ico, Rad, Sp, TextStyle};
+use crate::core::review::ReviewForge;
 
 const TEXT_LINE_HEIGHT: f32 = 1.5;
 
@@ -26,6 +29,21 @@ impl Tone {
             Self::Ghost => ButtonStyle::Ghost,
             Self::Destructive => ButtonStyle::Danger,
         }
+    }
+}
+
+pub fn forge_icon(forge: ReviewForge) -> &'static str {
+    match forge {
+        ReviewForge::GitHub => lucide::GITHUB_MARK,
+        ReviewForge::Bitbucket => icons::BITBUCKET,
+    }
+}
+
+/// What a forge that refused its stored token says.
+pub fn sign_in_stopped(forge: ReviewForge) -> &'static str {
+    match forge {
+        ReviewForge::GitHub => "Your GitHub sign-in stopped working",
+        ReviewForge::Bitbucket => "Your Bitbucket token stopped working",
     }
 }
 
@@ -77,6 +95,8 @@ pub struct GhostChip<'a> {
     pub accessible: &'a str,
     pub focus: FocusId,
     pub test_id: &'a str,
+    /// Draws the chip in the warning color.
+    pub alert: bool,
 }
 
 pub fn ghost_chip(
@@ -89,6 +109,11 @@ pub fn ghost_chip(
     let m = theme.components.button_compact;
     let icon = m.icon_size.unwrap_or(Ico::BUTTON_COMPACT);
     let on_click: quark_ui::Action = on_click.into();
+    let color = if chip.alert {
+        tc.status_warning
+    } else {
+        tc.text_muted
+    };
     view! { scale,
         <div
             class="flex-row items-center shrink-0"
@@ -109,8 +134,8 @@ pub fn ghost_chip(
                 pb={0.0}
             }
         >
-            <icon svg={chip.icon} size={icon} color={tc.text_muted} />
-            <text class="text-xs font-medium" color={tc.text_muted}>{chip.label}</text>
+            <icon svg={chip.icon} size={icon} color={color} />
+            <text class="text-xs font-medium" color={color}>{chip.label}</text>
         </div>
     }
 }

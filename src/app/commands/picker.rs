@@ -15,6 +15,8 @@ use crate::contracts::shell::Action;
 use crate::contracts::viewport::files::FileAt;
 use crate::contracts::viewport::symbols::{DefinitionTarget, SymbolsAction};
 use crate::core::compare::CompareMode;
+use crate::core::forge::parse_pull_request_reference;
+use crate::core::review::ReviewForge;
 use crate::core::symbols::SymbolIndex;
 use crate::core::vcs::model::RevisionId;
 use crate::fonts::{FontFamilyEntry, FontRole};
@@ -55,7 +57,7 @@ impl PickerKind {
             Self::Theme => "Search themes",
             Self::Font(_) => "Search fonts",
             Self::CompareMenu => "Search compare options",
-            Self::PullRequest => "Paste a GitHub or Bitbucket pull request URL",
+            Self::PullRequest => "Paste a GitHub or Bitbucket pull request link or owner/repo#N",
             Self::File => "Search files, @ symbols here, # all symbols",
             Self::Definition => "Filter definitions",
         }
@@ -170,6 +172,8 @@ pub struct PickerState {
     pub document: Option<FileAt>,
     pub head: Option<RevisionId>,
     pub anchored: bool,
+    /// The forge a short `owner/repo#N` names in the pull request picker.
+    pub short_forge: ReviewForge,
     matcher: FuzzyMatcher,
 }
 
@@ -194,6 +198,7 @@ impl PickerState {
             document: None,
             head: None,
             anchored: false,
+            short_forge: ReviewForge::GitHub,
             matcher: FuzzyMatcher::default(),
         };
         state.refilter();
@@ -417,23 +422,40 @@ impl PickerState {
     }
 
     fn typed_choice(&self, query: &str) -> Option<PickerRow> {
-        let choice = match self.kind {
-            PickerKind::Repository => PickerChoice::Repository(expand_path(query)),
-            PickerKind::Ref(_) => PickerChoice::Ref(query.to_owned()),
-            PickerKind::PullRequest => PickerChoice::PullRequest(query.to_owned()),
+        let (label, detail, choice) = match self.kind {
+            PickerKind::Repository => (
+                query.to_owned(),
+                TYPED_PATH.to_owned(),
+                PickerChoice::Repository(expand_path(query)),
+            ),
+            PickerKind::Ref(_) => (
+                query.to_owned(),
+                "Use this revision".to_owned(),
+                PickerChoice::Ref(query.to_owned()),
+            ),
+            PickerKind::PullRequest => {
+                match parse_pull_request_reference(query, self.short_forge) {
+                    Some(pr) => (
+                        format!("{}/{}#{}", pr.owner, pr.repo, pr.number),
+                        format!("Review this {} pull request", pr.forge.name()),
+                        PickerChoice::PullRequest(pr.web_url()),
+                    ),
+                    None => (
+                        query.to_owned(),
+                        "Not a GitHub or Bitbucket pull request link".to_owned(),
+                        PickerChoice::PullRequest(query.to_owned()),
+                    ),
+                }
+            }
             _ => return None,
         };
-        if self.rows.iter().any(|r| r.label == query) {
+        if self.rows.iter().any(|r| r.label == label) {
             return None;
         }
         Some(PickerRow {
-            label: query.to_owned(),
+            label,
             meta: None,
-            detail: Some(match self.kind {
-                PickerKind::Repository => TYPED_PATH.to_owned(),
-                PickerKind::PullRequest => "Load this pull request".to_owned(),
-                _ => "Use this revision".to_owned(),
-            }),
+            detail: Some(detail),
             highlights: Vec::new(),
             choice,
             current: false,
@@ -750,6 +772,43 @@ mod tests {
         assert_eq!(
             picker.selected_choice(),
             Some(&PickerChoice::Ref("zz9".to_owned()))
+        );
+    }
+
+    #[test]
+    fn typed_pull_requests_name_their_forge() {
+        let mut picker = PickerState::new(PickerKind::PullRequest, Vec::new());
+        picker.short_forge = ReviewForge::Bitbucket;
+        let typed = |picker: &mut PickerState, query: &str| {
+            picker.query.set_text(query);
+            picker.refilter();
+            let row = &picker.rows[0];
+            (row.label.clone(), row.detail.clone().unwrap_or_default())
+        };
+
+        assert_eq!(
+            typed(&mut picker, "acme/widgets#7"),
+            (
+                "acme/widgets#7".to_owned(),
+                "Review this Bitbucket pull request".to_owned()
+            )
+        );
+        assert_eq!(
+            picker.selected_choice(),
+            Some(&PickerChoice::PullRequest(
+                "https://bitbucket.org/acme/widgets/pull-requests/7".to_owned()
+            ))
+        );
+        assert_eq!(
+            typed(&mut picker, "https://github.com/o/r/pull/7/files").1,
+            "Review this GitHub pull request"
+        );
+        assert_eq!(
+            typed(&mut picker, "o/r"),
+            (
+                "o/r".to_owned(),
+                "Not a GitHub or Bitbucket pull request link".to_owned()
+            )
         );
     }
 

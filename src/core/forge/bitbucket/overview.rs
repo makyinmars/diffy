@@ -23,10 +23,10 @@ impl BitbucketApi {
         overview.deletions = info.deletions;
         overview.changed_files = info.changed_files;
 
-        // Activity rejects some page lengths, so it is read at its default.
+        // Activity answers 400 to a page length above 50.
         let activity = transport::get_pages(
             credentials,
-            &pull_request_url(pr, "/activity"),
+            &pull_request_url(pr, "/activity?pagelen=50"),
             "Bitbucket activity fetch",
         )?;
         let commits = transport::get_pages(

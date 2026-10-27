@@ -1326,13 +1326,18 @@ fn a_pull_request_without_a_local_clone_asks_for_its_folder() {
 }
 
 #[test]
-fn the_signed_out_launcher_row_opens_github_sign_in() {
+fn the_signed_out_launcher_row_offers_every_forge_sign_in() {
     let mut ui = harness::harness();
     ui.click_node(By::role_name(
         Role::ListBoxOption,
-        "Sign in to GitHub to see your PRs",
+        "Sign in to see your PRs",
     ));
-    ui.find(By::role_name(Role::Dialog, "Sign in to GitHub"));
+    ui.find(By::role_name(
+        Role::Group,
+        "Sign in to see your pull requests",
+    ));
+    ui.click_node(By::role_name(Role::Button, "Sign in to Bitbucket"));
+    ui.find(By::role_name(Role::Dialog, "Sign in to Bitbucket"));
 }
 
 #[test]

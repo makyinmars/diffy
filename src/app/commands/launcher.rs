@@ -1,6 +1,8 @@
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use quark_components::FuzzyMatcher;
 use quark_ui::text_input::TextField;
@@ -8,8 +10,7 @@ use quark_ui::text_input::TextField;
 use super::picker::expand_path;
 use super::repo_picker::{short_parent, tilde};
 use crate::core::forge::{
-    ForgeRepo, parse_pull_request_reference, parse_pull_request_url, parse_remote,
-    parse_repo_reference,
+    ForgeRepo, parse_pull_request_reference, parse_remote, parse_repo_reference,
 };
 use crate::core::repo_discovery::{DiscoveredRepo, RepoScan};
 use crate::core::review::{ReviewForge, ReviewTarget};
@@ -163,6 +164,8 @@ pub struct Launcher {
     requested: HashSet<PathBuf>,
     capacity: usize,
     matcher: FuzzyMatcher,
+    /// The forge a short `owner/repo#N` names, shared with the palette.
+    short_forge: Rc<Cell<ReviewForge>>,
 }
 
 impl Default for Launcher {
@@ -180,6 +183,7 @@ impl Default for Launcher {
             requested: HashSet::new(),
             capacity: MAX_REPO_ROWS,
             matcher: FuzzyMatcher::default(),
+            short_forge: Rc::new(Cell::new(ReviewForge::GitHub)),
         };
         launcher.refilter();
         launcher
@@ -187,6 +191,13 @@ impl Default for Launcher {
 }
 
 impl Launcher {
+    pub fn with_short_forge(short_forge: Rc<Cell<ReviewForge>>) -> Self {
+        Self {
+            short_forge,
+            ..Self::default()
+        }
+    }
+
     pub fn reset(&mut self) {
         self.query.set_text("");
         self.counts.clear();
@@ -309,22 +320,10 @@ impl Launcher {
             .map(|entry| entry.path.as_path())
     }
 
-    /// A typed pull request. With no repository open, a short `owner/repo#N`
-    /// is GitHub unless only a Bitbucket clone of that repository is known.
+    /// A typed pull request. A short `owner/repo#N` names one on the open
+    /// repository's forge, or GitHub with none open, as in the palette.
     fn typed_pull_request(&self, query: &str) -> Option<ReviewTarget> {
-        let pr = parse_pull_request_reference(query, ReviewForge::GitHub)?;
-        if parse_pull_request_url(query).is_some() || self.find_local(&pr).is_some() {
-            return Some(pr);
-        }
-        let bitbucket = ReviewTarget {
-            forge: ReviewForge::Bitbucket,
-            ..pr.clone()
-        };
-        Some(if self.find_local(&bitbucket).is_some() {
-            bitbucket
-        } else {
-            pr
-        })
+        parse_pull_request_reference(query, self.short_forge.get())
     }
 
     pub fn refilter(&mut self) {
@@ -498,10 +497,7 @@ pub fn pull_request_row(signed_in: bool) -> (&'static str, &'static str) {
     if signed_in {
         ("Your pull requests", "Open PRs you authored")
     } else {
-        (
-            "Sign in to GitHub to see your PRs",
-            "One-time code in your browser",
-        )
+        ("Sign in to see your PRs", "GitHub or Bitbucket")
     }
 }
 
@@ -580,5 +576,46 @@ mod tests {
         launcher.query.set_text("~/somewhere");
         launcher.refilter();
         assert_eq!(launcher.rows[0].label, "Open this path");
+    }
+
+    #[test]
+    fn short_pull_request_references_follow_the_open_repository_forge() {
+        let forge = Rc::new(Cell::new(ReviewForge::GitHub));
+        let mut launcher = Launcher::with_short_forge(Rc::clone(&forge));
+        launcher.set_entries(
+            Vec::new(),
+            Some(&scan(&[(
+                "/w/widgets",
+                Some("git@bitbucket.org:acme/widgets.git"),
+            )])),
+        );
+        launcher.query.set_text("acme/widgets#7");
+        launcher.refilter();
+        assert_eq!(
+            launcher.selected_choice(),
+            Some(&LauncherChoice::PullRequest {
+                url: "https://github.com/acme/widgets/pull/7".to_owned(),
+                local: None,
+            })
+        );
+
+        forge.set(ReviewForge::Bitbucket);
+        launcher.refilter();
+        assert_eq!(
+            launcher.selected_choice(),
+            Some(&LauncherChoice::PullRequest {
+                url: "https://bitbucket.org/acme/widgets/pull-requests/7".to_owned(),
+                local: Some(PathBuf::from("/w/widgets")),
+            })
+        );
+
+        launcher
+            .query
+            .set_text("https://github.com/acme/widgets/pull/7");
+        launcher.refilter();
+        assert!(matches!(
+            launcher.selected_choice(),
+            Some(LauncherChoice::PullRequest { url, .. }) if url.starts_with("https://github.com/")
+        ));
     }
 }

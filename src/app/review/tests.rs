@@ -244,6 +244,15 @@ impl ForgeBackend for FakeGitHub {
                 s.fail_overview,
             )
         });
+        let rejected = request.token().is_some_and(|token| {
+            self.with(|s| s.rejected_tokens.iter().any(|t| t == token.expose()))
+        });
+        if rejected {
+            let forge = request.forge();
+            emit(ForgeResponse::TokenRejected { forge });
+            emit(request.fail(format!("{} returned 401 Unauthorized", forge.name())));
+            return;
+        }
         let (pulls, fail_pulls) = self.with(|s| (s.pulls.clone(), s.fail_pulls));
         if let ForgeRequest::FetchMyPullRequests {
             forge,
@@ -274,13 +283,6 @@ impl ForgeBackend for FakeGitHub {
                     });
                 }
                 emit(ForgeResponse::PullRequestLoaded { url, comparison });
-            }
-            ForgeRequest::FetchUser { token, .. }
-                if self.with(|s| s.rejected_tokens.iter().any(|t| t == token.expose())) =>
-            {
-                emit(ForgeResponse::UserFetchFailed {
-                    message: "Bitbucket user fetch returned 401 Unauthorized".to_owned(),
-                })
             }
             ForgeRequest::FetchUser { .. } => emit(ForgeResponse::UserFetched(ForgeUser {
                 login: "reviewer".to_owned(),
@@ -2944,7 +2946,7 @@ fn your_pull_requests_group_by_need_and_move_with_the_keyboard() {
     ));
     ui.find(By::role_name(
         Role::ListBoxOption,
-        "Tidy the widget, repo#42, Changes requested",
+        "Tidy the widget, repo#42 on GitHub, Changes requested",
     ));
     ui.find(By::role_name(Role::Label, "@alpha: Changes requested"));
     ui.find(By::test_id("review.pulls.preview.path"));
@@ -3557,4 +3559,324 @@ fn historical_loading_empty_pagination_and_narrow_tabs_are_accessible() {
         ui.app().driver.review.pulls().state,
         PullRequestFilter::Open
     );
+}
+
+const BITBUCKET_URL: &str = "https://bitbucket.org/acme/widgets/pull-requests/42";
+
+fn sign_in_to_bitbucket(driver: &mut Driver) {
+    driver.act(ReviewAction::OpenSignIn(ReviewForge::Bitbucket));
+    type_into(driver, REVIEW_BITBUCKET_EMAIL, "me@example.com");
+    type_into(driver, REVIEW_BITBUCKET_TOKEN, "token");
+    driver.act(ReviewAction::SignInBitbucket);
+}
+
+fn bitbucket_driver(signed_in: bool) -> Driver {
+    let mut driver = Driver::new(Fake::new());
+    driver.startup(Some(BITBUCKET_URL));
+    driver.open_repository();
+    if signed_in {
+        sign_in_to_bitbucket(&mut driver);
+    }
+    driver
+}
+
+#[test]
+fn bitbucket_pull_requests_name_bitbucket_wherever_they_ask_to_sign_in() {
+    let mut ui = harness(bitbucket_driver(false));
+
+    ui.find(By::role_name(Role::Toolbar, "Bitbucket pull request"));
+    ui.find(By::role_name(Role::Button, "#42 Tidy the widget"));
+    ui.click_node(By::test_id("review.pull_request.title"));
+
+    assert!(
+        !ui.find_all(By::role_name(Role::Button, "Sign in to Bitbucket"))
+            .is_empty()
+    );
+    assert!(
+        ui.try_find(By::role_name(Role::Button, "Sign in to GitHub"))
+            .is_none()
+    );
+}
+
+#[test]
+fn bitbucket_submit_menu_says_comments_post_one_by_one() {
+    let mut driver = bitbucket_driver(true);
+    driver.act(ReviewAction::OpenComposerAt(target(2..3)));
+    driver.type_text("Inline note");
+    driver.act(ReviewAction::SubmitComment);
+    let mut ui = harness(driver);
+
+    ui.click_node(By::role_name(Role::Button, "Submit review"));
+
+    assert!(ui.painted_text().contains("1 comment will be posted"));
+    ui.find(By::test_id("review.submit_menu.note"));
+}
+
+#[test]
+fn account_menu_and_settings_name_the_forge_of_each_account() {
+    let mut driver = bitbucket_driver(true);
+    driver.act(ReviewAction::OpenAccountMenu);
+    let ui = harness(driver);
+    assert!(ui.painted_text().contains("@reviewer on Bitbucket"));
+
+    let mut app = App::new(bitbucket_driver(true));
+    app.accounts = true;
+    let ui = UiTestHarness::new(app, (1100.0, 900.0), 2.0);
+    for forge in ["GitHub", "Bitbucket"] {
+        let card = ui
+            .find(By::role_name(Role::Group, format!("{forge} account")))
+            .bounds;
+        let title = ui
+            .painted_texts()
+            .into_iter()
+            .find(|text| text.text == forge)
+            .unwrap_or_else(|| panic!("{forge} card has no title"));
+        assert!(contains(card, title.bounds), "{forge}");
+    }
+    assert!(
+        ui.painted_text()
+            .contains("Signed in as Rae Viewer (@reviewer)")
+    );
+}
+
+#[test]
+fn your_pull_requests_mark_each_forge_and_skip_what_bitbucket_does_not_list() {
+    let mut driver = pulls_driver();
+    let bitbucket = my_pull(7, "acme/widgets", "Bitbucket change", |p| {
+        p.forge = ReviewForge::Bitbucket;
+        p.url = "https://bitbucket.org/acme/widgets/pull-requests/7".to_owned();
+        p.updated_at = "2026-02-01T00:00:00+00:00".to_owned();
+        p.stats = None;
+        p.checks = None;
+    });
+    driver
+        .fake
+        .github
+        .with(|s| s.bitbucket_pulls = Some(vec![bitbucket]));
+    sign_in_to_bitbucket(&mut driver);
+    let mut ui = harness(driver);
+    ui.click_node(By::role_name(Role::Button, "Review PR"));
+
+    ui.find(By::role_name(
+        Role::ListBoxOption,
+        "Polish the gadget, gadget#9 on GitHub, Review required",
+    ));
+    ui.click_node(By::role_name(
+        Role::ListBoxOption,
+        "Bitbucket change, widgets#7 on Bitbucket, Ready",
+    ));
+
+    ui.find(By::role_name(Role::Label, "acme/widgets#7 on Bitbucket"));
+    for field in ["checks", "threads", "merge"] {
+        let id = format!("review.pulls.preview.{field}");
+        assert!(ui.try_find(By::test_id(id.as_str())).is_none(), "{field}");
+    }
+    ui.find(By::role_name(Role::Button, "Open on Bitbucket"));
+}
+
+#[test]
+fn a_refused_github_token_asks_to_sign_in_again() {
+    let mut driver = Driver::new(Fake::new());
+    driver
+        .fake
+        .github
+        .with(|s| s.rejected_tokens.push("stored-token".to_owned()));
+    driver.startup(Some(URL));
+    driver.open_repository();
+
+    assert!(driver.review.needs_sign_in(ReviewForge::GitHub));
+    assert!(!driver.review.signed_in(ReviewForge::GitHub));
+    assert!(
+        !driver
+            .fake
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ReviewEffect::ClearToken(ReviewForge::GitHub)))
+    );
+    let mut app = App::new(driver);
+    app.accounts = true;
+    let mut ui = UiTestHarness::new(app, (1100.0, 900.0), 2.0);
+    let stopped = "Your GitHub sign-in stopped working";
+    ui.find(By::role_name(
+        Role::Button,
+        format!("{stopped}. Sign in to GitHub"),
+    ));
+    let painted = ui.painted_text();
+    assert!(painted.contains("Sign in again"), "{painted}");
+    assert!(
+        painted.contains(&format!(
+            "{stopped}. Sign in again to load pull requests and post reviews."
+        )),
+        "{painted}"
+    );
+
+    ui.app_mut().accounts = false;
+    ui.app_mut()
+        .driver
+        .act(ReviewAction::Pulls(PullsAction::Open));
+    ui.send_message(ReviewEvent::TokenSaveFailed {
+        forge: ReviewForge::GitHub,
+        message: "redraw".to_owned(),
+    });
+    ui.find(By::role_name(Role::Alert, stopped));
+    ui.click_node(By::role_name(Role::Button, "Sign in to GitHub"));
+    ui.click_node(By::role_name(Role::Button, "Continue with GitHub"));
+
+    let review = &ui.app().driver.review;
+    assert!(review.signed_in(ReviewForge::GitHub));
+    assert!(!review.needs_sign_in(ReviewForge::GitHub));
+    assert!(ui.try_find(By::role_name(Role::Alert, stopped)).is_none());
+}
+
+#[test]
+fn an_expired_bitbucket_token_offers_the_token_form_from_the_pulls_banner() {
+    let mut driver = bitbucket_driver(true);
+    driver
+        .fake
+        .github
+        .with(|s| s.rejected_tokens.push("me@example.com:token".to_owned()));
+    driver.act(ReviewAction::Pulls(PullsAction::Open));
+
+    assert!(driver.review.needs_sign_in(ReviewForge::Bitbucket));
+    assert!(driver.review.signed_in(ReviewForge::GitHub));
+    assert!(driver.errors().is_empty(), "{:?}", driver.errors());
+    assert!(driver.review.pulls().error.is_none());
+    let mut ui = harness(driver);
+    let stopped = "Your Bitbucket token stopped working";
+    ui.find(By::role_name(Role::Alert, stopped));
+    ui.find(By::role_name(
+        Role::Button,
+        format!("{stopped}. Sign in to Bitbucket"),
+    ));
+
+    ui.click_node(By::role_name(Role::Button, "Sign in to Bitbucket"));
+
+    ui.find(By::role_name(Role::Dialog, "Sign in to Bitbucket"));
+    assert_eq!(
+        ui.app().driver.review.bitbucket_email.text(),
+        "me@example.com"
+    );
+    assert_eq!(
+        ui.focus(),
+        Some(focus_id(LogicalFocus::ReviewBitbucketToken))
+    );
+    let driver = &mut ui.app_mut().driver;
+    type_into(driver, REVIEW_BITBUCKET_TOKEN, "fresh");
+    driver.act(ReviewAction::SignInBitbucket);
+    assert!(driver.review.signed_in(ReviewForge::Bitbucket));
+    assert!(!driver.review.needs_sign_in(ReviewForge::Bitbucket));
+    ui.send_message(ReviewEvent::TokenSaveFailed {
+        forge: ReviewForge::GitHub,
+        message: "redraw".to_owned(),
+    });
+    assert!(ui.try_find(By::role_name(Role::Alert, stopped)).is_none());
+}
+
+#[test]
+fn long_listing_errors_stay_inside_their_banner() {
+    let mut driver = pulls_driver();
+    driver.fake.hold = true;
+    driver.act(pulls(PullsAction::Open));
+    let scope = std::mem::take(&mut driver.fake.held)
+        .into_iter()
+        .find_map(|effect| match effect {
+            ReviewEffect::Forge { scope, .. } => Some(scope),
+            _ => None,
+        })
+        .unwrap();
+    driver.fake.hold = false;
+    let message = format!(
+        "GitHub search returned 502 Bad Gateway: {}",
+        "upstream ".repeat(40)
+    );
+    driver.deliver(ReviewEvent::Forge {
+        scope,
+        response: Box::new(ForgeResponse::MyPullRequestsLoadFailed { message }),
+    });
+    let ui = harness(driver);
+
+    let banner = ui.find(By::test_id("review.pulls.error")).bounds;
+    let retry = ui.find(By::role_name(Role::Button, "Retry")).bounds;
+    for text in ui.painted_texts() {
+        if text.text.starts_with("GitHub search") {
+            assert!(
+                contains(banner, text.bounds),
+                "{:?} outside {banner:?}",
+                text.bounds
+            );
+            assert!(
+                text.bounds.x + text.bounds.width <= retry.x,
+                "{:?} under Retry",
+                text.bounds
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stopped_sign_in_wraps_beside_the_card_actions_in_narrow_settings() {
+    let mut driver = Driver::new(Fake::new());
+    driver
+        .fake
+        .github
+        .with(|s| s.rejected_tokens.push("stored-token".to_owned()));
+    driver.startup(Some(URL));
+    driver.open_repository();
+    let mut app = App::new(driver);
+    app.accounts = true;
+    let ui = UiTestHarness::new(app, (560.0, 900.0), 2.0);
+
+    let detail = ui
+        .find(By::test_id("settings.accounts.github.detail"))
+        .bounds;
+    let sign_out = ui.find(By::role_name(Role::Button, "Sign out")).bounds;
+    let card = ui.find(By::role_name(Role::Group, "GitHub account")).bounds;
+    assert!(contains(card, detail), "{detail:?} outside {card:?}");
+    assert!(
+        detail.x + detail.width <= sign_out.x,
+        "{detail:?} under {sign_out:?}"
+    );
+}
+
+fn held_overview_refresh(driver: &mut Driver) -> ReviewEffect {
+    driver.fake.hold = true;
+    driver.act(ReviewAction::RefreshOverview);
+    driver.fake.hold = false;
+    let effect = driver.fake.held.pop().unwrap();
+    assert!(driver.fake.held.is_empty());
+    effect
+}
+
+fn land(driver: &mut Driver, effect: ReviewEffect) {
+    for event in driver.fake.run(effect) {
+        driver.deliver(event);
+    }
+}
+
+#[test]
+fn a_refusal_counts_after_its_pull_request_closed_but_not_after_a_new_sign_in() {
+    let mut driver = Driver::signed_in_with_pr();
+    let refresh = held_overview_refresh(&mut driver);
+    driver.act(ReviewAction::LoadPullRequest {
+        url: OTHER_URL.to_owned(),
+    });
+    driver
+        .fake
+        .github
+        .with(|s| s.rejected_tokens.push("stored-token".to_owned()));
+    land(&mut driver, refresh);
+    assert!(driver.review.needs_sign_in(ReviewForge::GitHub));
+
+    let mut driver = Driver::signed_in_with_pr();
+    let refresh = held_overview_refresh(&mut driver);
+    driver.act(ReviewAction::SignOut(ReviewForge::GitHub));
+    driver.act(ReviewAction::StartDeviceFlow);
+    assert!(driver.review.signed_in(ReviewForge::GitHub));
+    driver
+        .fake
+        .github
+        .with(|s| s.rejected_tokens.push("stored-token".to_owned()));
+    land(&mut driver, refresh);
+    assert!(driver.review.signed_in(ReviewForge::GitHub));
+    assert!(!driver.review.needs_sign_in(ReviewForge::GitHub));
 }
