@@ -1880,6 +1880,12 @@ impl GitService {
                 &format!("refs/heads/{}", info.head_branch),
                 &info.head_sha,
             );
+        } else if forge == ReviewForge::Bitbucket {
+            self.fetch_recorded_commit(
+                &base_source,
+                &format!("refs/heads/{}", info.base_branch),
+                &info.head_sha,
+            );
         }
         let comparison = self.cached_pull_request_comparison(target, info)?;
         tracing::info!(
