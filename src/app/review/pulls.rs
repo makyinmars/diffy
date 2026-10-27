@@ -12,7 +12,7 @@ use crate::contracts::commands::SettingsSnapshot;
 use crate::contracts::review::{ForgeRequest, PullsAction, ReviewEffect, Secret};
 use crate::contracts::shared::{JobId, SharedContext};
 use crate::contracts::shell::{Intent, LogicalFocus, Reduction, ShellEffect};
-use crate::core::forge::model::MyPullRequest;
+use crate::core::forge::model::{MyPullRequest, PullRequestFilter, PullRequestPage};
 use crate::core::ref_catalog::now_secs;
 use crate::core::review::ReviewForge;
 
@@ -24,6 +24,7 @@ pub enum PullGroup {
     Waiting,
     Ready,
     Drafts,
+    History,
 }
 
 impl PullGroup {
@@ -33,6 +34,7 @@ impl PullGroup {
             Self::Waiting => "Waiting on reviewers",
             Self::Ready => "Ready to merge",
             Self::Drafts => "Drafts",
+            Self::History => "Recent activity",
         }
     }
 
@@ -42,6 +44,7 @@ impl PullGroup {
             Self::Waiting => "waiting",
             Self::Ready => "ready",
             Self::Drafts => "drafts",
+            Self::History => "history",
         }
     }
 }
@@ -57,6 +60,11 @@ pub enum PullStatus {
     Approved,
     Ready,
     Draft,
+    Merged,
+    Closed,
+    Declined,
+    Superseded,
+    Unknown,
 }
 
 impl PullStatus {
@@ -68,6 +76,9 @@ impl PullStatus {
             }
             Self::Approved | Self::Ready => PullGroup::Ready,
             Self::Draft => PullGroup::Drafts,
+            Self::Merged | Self::Closed | Self::Declined | Self::Superseded | Self::Unknown => {
+                PullGroup::History
+            }
         }
     }
 
@@ -82,11 +93,24 @@ impl PullStatus {
             Self::Approved => "Approved",
             Self::Ready => "Ready",
             Self::Draft => "Draft",
+            Self::Merged => "Merged",
+            Self::Closed => "Closed",
+            Self::Declined => "Declined",
+            Self::Superseded => "Superseded",
+            Self::Unknown => "Unknown status",
         }
     }
 }
 
 pub fn pull_status(pull: &MyPullRequest) -> PullStatus {
+    match pull.state.as_str() {
+        "MERGED" => return PullStatus::Merged,
+        "CLOSED" => return PullStatus::Closed,
+        "DECLINED" => return PullStatus::Declined,
+        "SUPERSEDED" => return PullStatus::Superseded,
+        "OPEN" => {}
+        _ => return PullStatus::Unknown,
+    }
     let decision = pull.review_decision.as_deref();
     let checks = pull.checks.as_ref().and_then(|c| c.state.as_deref());
     let mergeable = pull.stats.as_ref().map(|s| s.mergeable.as_str());
@@ -120,11 +144,12 @@ pub struct PullSection {
     pub rows: Vec<usize>,
 }
 
-const GROUP_ORDER: [PullGroup; 4] = [
+const GROUP_ORDER: [PullGroup; 5] = [
     PullGroup::NeedsYou,
     PullGroup::Waiting,
     PullGroup::Ready,
     PullGroup::Drafts,
+    PullGroup::History,
 ];
 
 pub fn group_pulls(pulls: &[MyPullRequest], filter: &str) -> Vec<PullSection> {
@@ -169,9 +194,12 @@ pub fn row_key(url: &str) -> String {
 #[derive(Debug, Default)]
 pub struct PullsPage {
     pub open: bool,
+    pub state: PullRequestFilter,
     pub data: Option<Rc<[MyPullRequest]>>,
     pub sections: Rc<[PullSection]>,
     pub loading: bool,
+    pub loading_more: bool,
+    pub limit_reached: bool,
     pub error: Option<String>,
     pub selected: Option<String>,
     pub filter: TextField,
@@ -180,7 +208,8 @@ pub struct PullsPage {
     pub preview: ScrollHandle,
     clones: HashMap<String, PathBuf>,
     /// One listing per signed-in forge; the page fills once all answer.
-    requests: Vec<JobId>,
+    requests: Vec<(JobId, ReviewForge, PullRequestFilter)>,
+    next_cursors: HashMap<ReviewForge, String>,
     requested: usize,
     gathered: Vec<MyPullRequest>,
     forges_answered: usize,
@@ -193,6 +222,10 @@ pub struct PullsPage {
 }
 
 impl PullsPage {
+    pub fn has_more(&self) -> bool {
+        !self.next_cursors.is_empty()
+    }
+
     pub fn visible(&self) -> impl Iterator<Item = usize> + '_ {
         self.sections
             .iter()
@@ -258,7 +291,9 @@ impl PullsPage {
     /// the other forge's rows stay until the next listing replaces them.
     pub(super) fn forget(&mut self, forge: ReviewForge) {
         self.loading = false;
+        self.loading_more = false;
         self.requests.clear();
+        self.next_cursors.remove(&forge);
         self.gathered.clear();
         self.forges_answered = 0;
         self.failures.clear();
@@ -333,6 +368,29 @@ impl ReviewController {
                 Reduction::changed()
             }
             PullsAction::Review => self.review_selected(cx),
+            PullsAction::SetState(state) => {
+                if self.pulls.state == state {
+                    return Reduction::default();
+                }
+                self.pulls.state = state;
+                self.pulls.requests.clear();
+                self.pulls.next_cursors.clear();
+                self.pulls.data = None;
+                self.pulls.sections = Rc::from([]);
+                self.pulls.selected = None;
+                self.pulls.error = None;
+                self.pulls.fetched_at = None;
+                self.pulls.list.set_offset(0.0, 0.0);
+                self.pulls.preview.set_offset(0.0, 0.0);
+                self.focus_request = Some(LogicalFocus::ReviewPulls);
+                self.fetch_pulls()
+            }
+            PullsAction::LoadMore => {
+                if self.pulls.loading || !self.pulls.has_more() {
+                    return Reduction::default();
+                }
+                self.fetch_pulls_page(true)
+            }
             PullsAction::OpenOnGitHub => match self.pulls.selected_pull() {
                 Some(pull) => Reduction::default().effect(ShellEffect::OpenBrowser {
                     url: pull.url.clone(),
@@ -423,14 +481,24 @@ impl ReviewController {
     }
 
     pub(super) fn fetch_pulls(&mut self) -> Reduction {
+        self.fetch_pulls_page(false)
+    }
+
+    fn fetch_pulls_page(&mut self, more: bool) -> Reduction {
         let accounts: Vec<(ReviewForge, Secret)> = [ReviewForge::GitHub, ReviewForge::Bitbucket]
             .into_iter()
             .filter_map(|forge| Some((forge, self.token(forge)?)))
+            .filter(|(forge, _)| !more || self.pulls.next_cursors.contains_key(forge))
             .collect();
         if accounts.is_empty() {
             return Reduction::default();
         }
         self.pulls.loading = true;
+        self.pulls.loading_more = more;
+        if !more {
+            self.pulls.next_cursors.clear();
+            self.pulls.limit_reached = false;
+        }
         self.pulls.requests.clear();
         self.pulls.requested = accounts.len();
         self.pulls.gathered.clear();
@@ -439,26 +507,32 @@ impl ReviewController {
         let mut reduction = Reduction::changed();
         for (forge, token) in accounts {
             let scope = self.job(None, Pending::Pulls(forge));
-            self.pulls.requests.push(scope.request);
+            let filter = self.pulls.state;
+            let cursor = self.pulls.next_cursors.get(&forge).cloned();
+            self.pulls.requests.push((scope.request, forge, filter));
             reduction = reduction.effect(ReviewEffect::Forge {
                 scope,
-                request: Box::new(ForgeRequest::FetchMyPullRequests { forge, token }),
+                request: Box::new(ForgeRequest::FetchMyPullRequests {
+                    forge,
+                    token,
+                    filter,
+                    cursor,
+                }),
             });
         }
         reduction
     }
 
-    fn take_pulls_request(&mut self, request: JobId) -> bool {
+    fn take_pulls_request(&mut self, request: JobId) -> Option<ReviewForge> {
         let Some(index) = self
             .pulls
             .requests
             .iter()
-            .position(|known| *known == request)
+            .position(|(known, _, filter)| *known == request && *filter == self.pulls.state)
         else {
-            return false;
+            return None;
         };
-        self.pulls.requests.remove(index);
-        true
+        Some(self.pulls.requests.remove(index).1)
     }
 
     /// Publish the merged listing once every forge has answered. A forge
@@ -469,6 +543,7 @@ impl ReviewController {
             return Reduction::default();
         }
         self.pulls.loading = false;
+        let more = std::mem::take(&mut self.pulls.loading_more);
         let answered = std::mem::take(&mut self.pulls.forges_answered);
         let failures: Vec<String> = std::mem::take(&mut self.pulls.failures)
             .into_iter()
@@ -486,9 +561,16 @@ impl ReviewController {
             self.pulls.error = Some(message);
             return Reduction::changed();
         }
-        if answered > 1 {
-            pulls.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        if more && let Some(data) = self.pulls.data.as_ref() {
+            pulls.extend(data.iter().cloned());
         }
+        pulls.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.url.cmp(&b.url))
+        });
+        let mut seen = std::collections::HashSet::new();
+        pulls.retain(|pull| seen.insert(pull.url.clone()));
         self.pulls.error = None;
         self.pulls.fetched_at = Some(now_secs());
         self.pulls.data = Some(pulls.into());
@@ -509,12 +591,23 @@ impl ReviewController {
         }
     }
 
-    pub(super) fn pulls_loaded(&mut self, request: JobId, pulls: Vec<MyPullRequest>) -> Reduction {
-        if !self.take_pulls_request(request) {
+    pub(super) fn pulls_loaded(&mut self, request: JobId, page: PullRequestPage) -> Reduction {
+        let Some(forge) = self.take_pulls_request(request) else {
             return Reduction::default();
+        };
+        if let Some(cursor) = page.next_cursor {
+            self.pulls.next_cursors.insert(forge, cursor);
+        } else {
+            self.pulls.next_cursors.remove(&forge);
         }
+        self.pulls.limit_reached |= page.limit_reached;
+        self.pulls.failures.extend(
+            page.warnings
+                .into_iter()
+                .map(|warning| (forge, format!("{}: {warning}", forge.name()))),
+        );
         self.pulls.forges_answered += 1;
-        self.pulls.gathered.extend(pulls);
+        self.pulls.gathered.extend(page.pulls);
         self.finish_pulls()
     }
 
@@ -524,7 +617,7 @@ impl ReviewController {
         forge: ReviewForge,
         message: String,
     ) -> Reduction {
-        if !self.take_pulls_request(request) {
+        if self.take_pulls_request(request).is_none() {
             return Reduction::default();
         }
         let message = if self.pulls.requested == 1 {
@@ -625,6 +718,7 @@ mod tests {
     fn pull(number: i32, updated: &str) -> MyPullRequest {
         MyPullRequest {
             id: format!("PR_{number}"),
+            state: "OPEN".to_owned(),
             number,
             title: format!("Tidy the widget {number}"),
             url: format!("https://github.com/owner/repo/pull/{number}"),
@@ -705,6 +799,24 @@ mod tests {
         ];
         for (pull, expected) in cases {
             assert_eq!(pull_status(&pull), expected, "{pull:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_lifecycle_never_claims_open_draft_or_merge_readiness() {
+        for forge in [ReviewForge::GitHub, ReviewForge::Bitbucket] {
+            for state in ["", "UNKNOWN", "new-provider-state"] {
+                let mut pull = pull(1, "2026-01-01T00:00:00Z");
+                pull.forge = forge;
+                pull.state = state.to_owned();
+                pull.is_draft = true;
+                pull.review_decision = Some("CHANGES_REQUESTED".into());
+                assert_eq!(pull_status(&pull), PullStatus::Unknown);
+                assert_eq!(
+                    super::super::overview::state_badge(state, true).0,
+                    "Unknown"
+                );
+            }
         }
     }
 

@@ -88,8 +88,15 @@ pub(super) fn state_badge(state: &str, draft: bool) -> (&'static str, &'static s
     match (state, draft) {
         ("MERGED", _) => ("Merged", icons::GIT_MERGE, BadgeVariant::Accent),
         ("CLOSED", _) => ("Closed", lucide::GIT_PULL_REQUEST, BadgeVariant::Error),
-        (_, true) => ("Draft", lucide::GIT_PULL_REQUEST, BadgeVariant::Default),
-        _ => ("Open", lucide::GIT_PULL_REQUEST, BadgeVariant::Success),
+        ("DECLINED", _) => ("Declined", lucide::GIT_PULL_REQUEST, BadgeVariant::Error),
+        ("SUPERSEDED", _) => (
+            "Superseded",
+            lucide::GIT_PULL_REQUEST,
+            BadgeVariant::Default,
+        ),
+        ("OPEN", true) => ("Draft", lucide::GIT_PULL_REQUEST, BadgeVariant::Default),
+        ("OPEN", false) => ("Open", lucide::GIT_PULL_REQUEST, BadgeVariant::Success),
+        _ => ("Unknown", lucide::GIT_PULL_REQUEST, BadgeVariant::Default),
     }
 }
 
@@ -486,6 +493,8 @@ impl Page<'_> {
         ) {
             ("MERGED", _, _) => (icons::GIT_MERGE, tc.accent, "Merged"),
             ("CLOSED", _, _) => (icons::CIRCLE_X, tc.text_muted, "Closed without merging"),
+            ("DECLINED", _, _) => (icons::CIRCLE_X, tc.text_muted, "Declined without merging"),
+            ("SUPERSEDED", _, _) => (icons::CIRCLE_X, tc.text_muted, "Superseded"),
             _ if overview.is_draft => {
                 (lucide::PENCIL, tc.text_muted, "Draft, not ready for review")
             }

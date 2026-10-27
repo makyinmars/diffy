@@ -7,8 +7,9 @@ use quark_ui::document::DocumentEvent;
 use crate::contracts::shared::{AccountEpoch, JobId, SourceTarget};
 use crate::core::forge::github::DeviceFlowState;
 use crate::core::forge::model::{
-    ForgeUser, MyPullRequest, PullRequestInfo, PullRequestOverview, PullRequestReviewComment,
-    PullRequestReviewData, PullRequestReviewThreadComment, ReviewThreadResolution,
+    ForgeUser, PullRequestFilter, PullRequestInfo, PullRequestOverview, PullRequestPage,
+    PullRequestReviewComment, PullRequestReviewData, PullRequestReviewThreadComment,
+    ReviewThreadResolution,
 };
 use crate::core::forge::parse_pull_request_url;
 use crate::core::review::{
@@ -135,6 +136,8 @@ pub enum PullsAction {
     Open,
     Close,
     Refresh,
+    SetState(PullRequestFilter),
+    LoadMore,
     Move(i32),
     Select(String),
     Review,
@@ -225,6 +228,8 @@ pub enum ForgeRequest {
     FetchMyPullRequests {
         forge: ReviewForge,
         token: Secret,
+        filter: PullRequestFilter,
+        cursor: Option<String>,
     },
 }
 
@@ -433,7 +438,7 @@ pub enum ForgeResponse {
         body: String,
         message: String,
     },
-    MyPullRequestsLoaded(Vec<MyPullRequest>),
+    MyPullRequestsLoaded(PullRequestPage),
     MyPullRequestsLoadFailed {
         message: String,
     },

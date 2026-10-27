@@ -6,7 +6,9 @@ use super::comments::{self, Viewer};
 use super::transport::{self, API_ROOT, Credentials};
 use crate::core::error::{DiffyError, Result};
 use crate::core::forge::model::{ForgeUser, PullRequestInfo, PullRequestReviewData};
+use crate::core::forge::parse_remote;
 use crate::core::review::ReviewTarget;
+use crate::core::vcs::git::is_full_hex_oid;
 
 /// The signed-in Bitbucket account. `uuid` decides which comments the viewer
 /// may edit; nicknames are display names and need not be unique.
@@ -22,21 +24,35 @@ static VIEWERS: Mutex<Vec<(u64, BitbucketUser)>> = Mutex::new(Vec::new());
 #[derive(Debug, Clone, Default)]
 pub struct BitbucketApi {
     credentials: Credentials,
+    #[cfg(test)]
+    pub(super) api_root: Option<String>,
 }
 
 impl BitbucketApi {
     pub fn new(credentials: Credentials) -> Self {
-        Self { credentials }
+        Self {
+            credentials,
+            #[cfg(test)]
+            api_root: None,
+        }
     }
 
     pub(super) fn credentials(&self) -> &Credentials {
         &self.credentials
     }
 
+    pub(super) fn api_root(&self) -> &str {
+        #[cfg(test)]
+        if let Some(root) = self.api_root.as_deref() {
+            return root;
+        }
+        API_ROOT
+    }
+
     pub fn fetch_current_user(&self) -> Result<BitbucketUser> {
         let value = transport::get_json(
             &self.credentials,
-            &format!("{API_ROOT}/user"),
+            &format!("{}/user", self.api_root()),
             "Bitbucket user fetch",
         )?;
         let user = parse_user(&value)?;
@@ -89,14 +105,53 @@ impl BitbucketApi {
     pub fn fetch_pull_request(&self, pr: &ReviewTarget) -> Result<PullRequestInfo> {
         let value = self.pull_request_value(pr)?;
         let mut info = parse_pull_request(&value)?;
+        if info.state != "open" {
+            self.expand_historical_commits(pr, &mut info)?;
+        }
         self.add_diffstat(pr, &value, &mut info);
         Ok(info)
+    }
+
+    fn expand_historical_commits(
+        &self,
+        pr: &ReviewTarget,
+        info: &mut PullRequestInfo,
+    ) -> Result<()> {
+        for (oid, repository) in [
+            (&mut info.base_sha, &info.base_repo_url),
+            (&mut info.head_sha, &info.head_repo_url),
+        ] {
+            if is_full_hex_oid(oid)
+                || !(7..40).contains(&oid.len())
+                || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            let repository = parse_remote(repository)
+                .filter(|repo| repo.forge == pr.forge)
+                .map(|repo| format!("{}/{}", repo.owner, repo.repo));
+            let Some(repository) = repository else {
+                continue;
+            };
+            let url = format!("{}/repositories/{repository}/commit/{oid}", self.api_root());
+            match transport::get_json(&self.credentials, &url, "Bitbucket historical commit fetch")
+            {
+                Ok(commit) => {
+                    if let Some(full) = expanded_commit_hash(&commit, oid) {
+                        *oid = full;
+                    }
+                }
+                Err(error @ DiffyError::Auth { .. }) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn pull_request_value(&self, pr: &ReviewTarget) -> Result<Value> {
         transport::get_json(
             &self.credentials,
-            &pull_request_url(pr, ""),
+            &pull_request_url_at(self.api_root(), pr, ""),
             "Bitbucket pull request fetch",
         )
     }
@@ -113,7 +168,7 @@ impl BitbucketApi {
             .pointer("/links/diffstat/href")
             .and_then(Value::as_str)
             .map(|href| with_query(href, "pagelen=500"))
-            .unwrap_or_else(|| pull_request_url(pr, "/diffstat?pagelen=500"));
+            .unwrap_or_else(|| pull_request_url_at(self.api_root(), pr, "/diffstat?pagelen=500"));
         match transport::get_pages(&self.credentials, &diffstat, "Bitbucket diffstat fetch") {
             Ok(files) => apply_diffstat(info, &files),
             Err(error) => tracing::warn!("bitbucket: diffstat unavailable: {error}"),
@@ -122,8 +177,12 @@ impl BitbucketApi {
 }
 
 pub(super) fn pull_request_url(pr: &ReviewTarget, path: &str) -> String {
+    pull_request_url_at(API_ROOT, pr, path)
+}
+
+fn pull_request_url_at(root: &str, pr: &ReviewTarget, path: &str) -> String {
     format!(
-        "{API_ROOT}/repositories/{}/{}/pullrequests/{}{path}",
+        "{root}/repositories/{}/{}/pullrequests/{}{path}",
         pr.owner, pr.repo, pr.number
     )
 }
@@ -137,7 +196,11 @@ pub(super) fn parse_pull_request(value: &Value) -> Result<PullRequestInfo> {
     let state = str_at(value, "/state");
     let info = PullRequestInfo {
         title: str_at(value, "/title"),
-        state: if state == "OPEN" { "open" } else { "closed" }.to_owned(),
+        state: if state == "MERGED" {
+            "closed".to_owned()
+        } else {
+            state.to_ascii_lowercase()
+        },
         draft: value.get("draft").and_then(Value::as_bool).unwrap_or(false),
         merged: state == "MERGED",
         author_login: login(value.get("author")),
@@ -162,6 +225,15 @@ pub(super) fn parse_pull_request(value: &Value) -> Result<PullRequestInfo> {
         ));
     }
     Ok(info)
+}
+
+fn expanded_commit_hash(commit: &Value, abbreviated: &str) -> Option<String> {
+    let full = commit.get("hash")?.as_str()?;
+    (is_full_hex_oid(full)
+        && full
+            .get(..abbreviated.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(abbreviated)))
+    .then(|| full.to_ascii_lowercase())
 }
 
 pub(super) fn apply_diffstat(info: &mut PullRequestInfo, files: &[Value]) {
@@ -288,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_and_declined_pull_requests_are_closed() {
+    fn historical_pull_requests_keep_provider_lifecycle_states() {
         let mut value = pull_request();
         value["state"] = json!("MERGED");
         let merged = parse_pull_request(&value).unwrap();
@@ -297,8 +369,139 @@ mod tests {
         let declined = parse_pull_request(&value).unwrap();
         assert_eq!(
             (declined.state.as_str(), declined.merged),
-            ("closed", false)
+            ("declined", false)
         );
+        value["state"] = json!("SUPERSEDED");
+        let superseded = parse_pull_request(&value).unwrap();
+        assert_eq!(
+            (superseded.state.as_str(), superseded.merged),
+            ("superseded", false)
+        );
+    }
+
+    #[test]
+    fn historical_hash_expansion_accepts_only_matching_full_ids() {
+        let full = "abcdefabcdef0123456789012345678901234567";
+        assert_eq!(
+            expanded_commit_hash(&json!({"hash": full}), "ABCDEFABCDEF"),
+            Some(full.to_owned())
+        );
+        for hash in [
+            "abcdefabcdef",
+            "0000000000000123456789012345678901234567",
+            "main",
+            "",
+        ] {
+            assert_eq!(
+                expanded_commit_hash(&json!({"hash": hash}), "abcdefabcdef"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn historical_requests_expand_destination_and_fork_ids_but_open_requests_do_not() {
+        use crate::core::forge::test_http::Server;
+        for state in ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"] {
+            let server =
+                Server::new(
+                    if state == "OPEN" { 2 } else { 4 },
+                    move |request| match request.target.as_str() {
+                        "/repositories/acme/widgets/pullrequests/42" => {
+                            let mut value = pull_request();
+                            value["state"] = json!(state);
+                            value["links"] = json!({});
+                            (200, value)
+                        }
+                        "/repositories/acme/widgets/commit/abcdefabcdef" => {
+                            assert_ne!(state, "OPEN");
+                            (
+                                200,
+                                json!({"hash": "abcdefabcdef0123456789012345678901234567"}),
+                            )
+                        }
+                        "/repositories/fork-owner/widgets/commit/1a2b3c4d5e6f" => {
+                            assert_ne!(state, "OPEN");
+                            (
+                                200,
+                                json!({"hash": "1a2b3c4d5e6f0123456789012345678901234567"}),
+                            )
+                        }
+                        "/repositories/acme/widgets/pullrequests/42/diffstat?pagelen=500" => {
+                            (200, json!({"values": []}))
+                        }
+                        _ => panic!("unexpected URL {}", request.target),
+                    },
+                );
+            let mut api = BitbucketApi::new(Credentials::anonymous());
+            api.api_root = Some(server.root.clone());
+            let pr = ReviewTarget {
+                forge: crate::core::review::ReviewForge::Bitbucket,
+                owner: "acme".into(),
+                repo: "widgets".into(),
+                number: 42,
+            };
+            let info = api.fetch_pull_request(&pr).unwrap();
+            assert_eq!(info.base_sha.len(), if state == "OPEN" { 12 } else { 40 });
+            assert_eq!(info.head_sha.len(), if state == "OPEN" { 12 } else { 40 });
+            server.finish();
+        }
+    }
+
+    #[test]
+    fn historical_hash_expansion_keeps_short_ids_on_404_or_mismatch() {
+        use crate::core::forge::test_http::Server;
+        let server = Server::new(2, |request| match request.target.as_str() {
+            "/repositories/acme/widgets/commit/abcdefabcdef" => {
+                (404, json!({"error": {"message": "not found"}}))
+            }
+            "/repositories/fork-owner/widgets/commit/1a2b3c4d5e6f" => (
+                200,
+                json!({"hash": "0000000000000123456789012345678901234567"}),
+            ),
+            _ => panic!("unexpected URL {}", request.target),
+        });
+        let mut api = BitbucketApi::new(Credentials::anonymous());
+        api.api_root = Some(server.root.clone());
+        let mut info = parse_pull_request(&pull_request()).unwrap();
+        let pr = ReviewTarget {
+            forge: crate::core::review::ReviewForge::Bitbucket,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 42,
+        };
+        api.expand_historical_commits(&pr, &mut info).unwrap();
+        assert_eq!(
+            (info.base_sha.as_str(), info.head_sha.as_str()),
+            ("abcdefabcdef", "1a2b3c4d5e6f")
+        );
+        server.finish();
+    }
+
+    #[test]
+    fn historical_hash_expansion_preserves_token_rejection() {
+        use crate::core::forge::test_http::Server;
+        let server = Server::new(1, |request| {
+            assert_eq!(
+                request.target,
+                "/repositories/acme/widgets/commit/abcdefabcdef"
+            );
+            (401, json!({"error": {"message": "expired"}}))
+        });
+        let mut api = BitbucketApi::new(Credentials::parse("fixture-token").unwrap());
+        api.api_root = Some(server.root.clone());
+        let mut info = parse_pull_request(&pull_request()).unwrap();
+        let pr = ReviewTarget {
+            forge: crate::core::review::ReviewForge::Bitbucket,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 42,
+        };
+        assert!(matches!(
+            api.expand_historical_commits(&pr, &mut info),
+            Err(DiffyError::Auth { .. })
+        ));
+        server.finish();
     }
 
     #[test]

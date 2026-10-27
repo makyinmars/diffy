@@ -114,13 +114,22 @@ pub(super) fn graphql_mutation(token: &str, query: &str, variables: Value) -> Re
 }
 
 fn graphql(token: &str, query: &str, variables: Value) -> Result<Value> {
+    graphql_query_at(token, query, variables, GRAPHQL_URL)
+}
+
+pub(super) fn graphql_query_at(
+    token: &str,
+    query: &str,
+    variables: Value,
+    url: &str,
+) -> Result<Value> {
     let context = "GitHub GraphQL request";
     let credential = credential(token);
     let body = json!({ "query": query, "variables": variables }).to_string();
     let reply = execute(
         token,
         Method::POST,
-        GRAPHQL_URL,
+        url,
         Media::Versioned,
         Some(body),
         None,
@@ -202,7 +211,9 @@ fn success_body(reply: Reply, context: &str) -> Result<String> {
 }
 
 fn failure(reply: &Reply, context: &str) -> DiffyError {
-    let details = match error_message(&reply.body) {
+    let message = error_message(&reply.body)
+        .filter(|message| reply.status != StatusCode::UNAUTHORIZED || message == "Bad credentials");
+    let details = match message {
         Some(message) => format!("{context} returned {}: {message}", reply.status),
         None => format!("{context} returned {}.", reply.status),
     };

@@ -109,21 +109,13 @@ pub enum PrRefSide {
     Head,
 }
 
-/// Where Diffy keeps a fetched pull request branch. GitHub refs keep their
-/// original `refs/diffy/pr/{n}/{branch}` path. Bitbucket refs live under
-/// their own namespace and split base from head, so a fork's `main -> main`
-/// pull request gets two refs.
+/// Where Diffy keeps a fetched pull request branch.
 pub fn pr_ref_path(forge: ReviewForge, pr_number: i32, side: PrRefSide, branch: &str) -> String {
-    match forge {
-        ReviewForge::GitHub => format!("{PR_REF_PREFIX}{pr_number}/{branch}"),
-        ReviewForge::Bitbucket => {
-            let side = match side {
-                PrRefSide::Base => "base",
-                PrRefSide::Head => "head",
-            };
-            format!("{PR_REF_PREFIX}bitbucket/{pr_number}/{side}/{branch}")
-        }
-    }
+    let side = match side {
+        PrRefSide::Base => "base",
+        PrRefSide::Head => "head",
+    };
+    format!("{PR_REF_PREFIX}{}/{pr_number}/{side}/{branch}", forge.key())
 }
 
 pub fn is_pr_ref(reference: &str) -> bool {
@@ -135,6 +127,7 @@ pub fn is_pr_ref(reference: &str) -> bool {
 fn pr_ref_prefixes(forge: ReviewForge, pr_number: i32) -> Vec<String> {
     match forge {
         ReviewForge::GitHub => vec![
+            format!("{PR_REF_PREFIX}github/{pr_number}/"),
             format!("{PR_REF_PREFIX}{pr_number}/"),
             format!("refs/diffy/pull/{pr_number}/"),
         ],
@@ -868,10 +861,6 @@ fn oid_matches(resolved: &str, expected: &str) -> bool {
         && resolved
             .get(..expected.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
-}
-
-fn is_abbreviated_oid(oid: &str) -> bool {
-    !oid.is_empty() && !is_full_hex_oid(oid)
 }
 
 #[derive(Default)]
@@ -1645,13 +1634,6 @@ impl GitService {
         result
     }
 
-    fn ref_matches_oid(&self, reference: &str, expected_oid: &str) -> bool {
-        !expected_oid.is_empty()
-            && self
-                .resolve_commit_oid(reference)
-                .is_ok_and(|resolved| oid_matches(&resolved, expected_oid))
-    }
-
     /// The forge the repository's remotes point at, `origin` first, read
     /// without spawning git. The config is re-read because remotes change
     /// while the repository stays open; the open repository caches it.
@@ -1847,101 +1829,20 @@ impl GitService {
         target: &ReviewTarget,
         info: PullRequestInfo,
     ) -> Result<(PullRequestInfo, String, String)> {
-        match target.forge {
-            ReviewForge::GitHub => self.resolve_github_comparison(target, info),
-            ReviewForge::Bitbucket => self.resolve_bitbucket_comparison(target, info),
-        }
-    }
-
-    fn resolve_github_comparison(
-        &self,
-        target: &ReviewTarget,
-        info: PullRequestInfo,
-    ) -> Result<(PullRequestInfo, String, String)> {
-        let total_started = Instant::now();
-        let fetch_source = fetch_source_for_repo(
-            self.repo_path_ref()?,
-            ReviewForge::GitHub,
-            &target.owner,
-            &target.repo,
-            &info.base_repo_url,
-        );
-        let base_source = if info.base_sha.is_empty() {
-            format!("refs/heads/{}", info.base_branch)
-        } else {
-            info.base_sha.clone()
-        };
-        let head_source = format!("refs/pull/{}/head", target.number);
-        let base_target = pr_ref_path(
-            ReviewForge::GitHub,
-            target.number,
-            PrRefSide::Base,
-            &info.base_branch,
-        );
-        let head_target = pr_ref_path(
-            ReviewForge::GitHub,
-            target.number,
-            PrRefSide::Head,
-            &info.head_branch,
-        );
-        let mut refspecs = Vec::with_capacity(2);
-        if !self.ref_matches_oid(&base_target, &info.base_sha) {
-            refspecs.push(format!("+{base_source}:{base_target}"));
-        }
-        if !self.ref_matches_oid(&head_target, &info.head_sha) {
-            refspecs.push(format!("+{head_source}:{head_target}"));
-        }
-        if refspecs.is_empty() {
-            tracing::info!(
-                owner = %target.owner,
-                repo = %target.repo,
-                number = target.number,
-                "github-pr: cached refs are current"
-            );
-        } else {
-            self.fetch_refspecs(&fetch_source, &refspecs)?;
-        }
-        tracing::info!(
-            owner = %target.owner,
-            repo = %target.repo,
-            number = target.number,
-            elapsed_ms = total_started.elapsed().as_millis(),
-            "github-pr: git resolver complete"
-        );
-        prune_stale_pr_refs(
-            self.repo_path_ref()?,
-            &pr_ref_prefixes(ReviewForge::GitHub, target.number),
-            &base_target,
-            &head_target,
-        );
-        Ok((info, base_target, head_target))
-    }
-
-    /// Bitbucket Cloud has no pull request refs, so fetch the destination
-    /// branch from the destination repository and the source branch from the
-    /// source repository, which may be a fork. The refs are then pinned to
-    /// the commits the pull request names when git has them: a merged pull
-    /// request's destination branch already contains its source, a source
-    /// branch may have moved past it, and a deleted source branch or fork
-    /// leaves only those commits.
-    fn resolve_bitbucket_comparison(
-        &self,
-        target: &ReviewTarget,
-        mut info: PullRequestInfo,
-    ) -> Result<(PullRequestInfo, String, String)> {
         let total_started = Instant::now();
         let repo_path = self.repo_path_ref()?;
-        let forge = ReviewForge::Bitbucket;
-        // No source repository means the fork was deleted.
-        let head_source = (!info.head_repo_url.is_empty()).then(|| {
-            let (owner, repo) = parse_remote(&info.head_repo_url)
-                .filter(|repo| repo.forge == forge)
-                .map_or_else(
-                    || (target.owner.clone(), target.repo.clone()),
-                    |repo| (repo.owner, repo.repo),
-                );
-            fetch_source_for_repo(repo_path, forge, &owner, &repo, &info.head_repo_url)
-        });
+        let forge = target.forge;
+        for (side, oid) in [("base", &info.base_sha), ("head", &info.head_sha)] {
+            if !(7..=40).contains(&oid.len()) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(git_error(
+                    "pull request fetch",
+                    format!(
+                        "pull request #{} has no valid recorded {side} commit",
+                        target.number
+                    ),
+                ));
+            }
+        }
         let base_source = fetch_source_for_repo(
             repo_path,
             forge,
@@ -1949,70 +1850,94 @@ impl GitService {
             &target.repo,
             &info.base_repo_url,
         );
-        let base_target = pr_ref_path(forge, target.number, PrRefSide::Base, &info.base_branch);
-        let head_target = pr_ref_path(forge, target.number, PrRefSide::Head, &info.head_branch);
-        let base_refspec = format!("+refs/heads/{}:{base_target}", info.base_branch);
-        let head_refspec = format!("+refs/heads/{}:{head_target}", info.head_branch);
-        let need_base = !self.ref_matches_oid(&base_target, &info.base_sha);
-        let need_head = !self.ref_matches_oid(&head_target, &info.head_sha);
-        if !need_base && !need_head {
-            tracing::info!(
-                owner = %target.owner,
-                repo = %target.repo,
-                number = target.number,
-                "bitbucket-pr: cached refs are current"
+        let head_source = parse_remote(&info.head_repo_url)
+            .filter(|repo| repo.forge == forge)
+            .map(|repo| {
+                fetch_source_for_repo(
+                    repo_path,
+                    forge,
+                    &repo.owner,
+                    &repo.repo,
+                    &info.head_repo_url,
+                )
+            });
+        self.fetch_recorded_commit(
+            &base_source,
+            &format!("refs/heads/{}", info.base_branch),
+            &info.base_sha,
+        );
+        match forge {
+            ReviewForge::GitHub => self.fetch_recorded_commit(
+                &base_source,
+                &format!("refs/pull/{}/head", target.number),
+                &info.head_sha,
+            ),
+            ReviewForge::Bitbucket => {}
+        }
+        if let Some(source) = &head_source {
+            self.fetch_recorded_commit(
+                source,
+                &format!("refs/heads/{}", info.head_branch),
+                &info.head_sha,
             );
         }
-        let mut head_fetched = !need_head;
-        if need_base && need_head && head_source.as_deref() == Some(base_source.as_str()) {
-            head_fetched = self
-                .fetch_refspecs(&base_source, &[base_refspec.clone(), head_refspec.clone()])
-                .is_ok();
-            if !head_fetched {
-                self.fetch_refspecs(&base_source, &[base_refspec])?;
-            }
-        } else {
-            if need_base {
-                self.fetch_refspecs(&base_source, &[base_refspec])?;
-            }
-            if need_head && let Some(source) = &head_source {
-                head_fetched = match self.fetch_refspecs(source, &[head_refspec]) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::warn!("bitbucket-pr: source branch fetch failed: {error}");
-                        false
-                    }
-                };
-            }
-        }
-        // Pin even after a successful fetch: a merged or declined pull
-        // request's source branch may have moved on since.
-        self.pin_ref(&base_target, &info.base_sha);
-        let head_pinned = self.pin_ref(&head_target, &info.head_sha);
-        if !head_fetched && !head_pinned {
-            return Err(git_error(
-                "pull request fetch",
-                match head_source {
-                    None => format!(
-                        "the source repository of pull request #{} was deleted, and its commits are not in this clone",
-                        target.number
-                    ),
-                    Some(_) => format!(
-                        "the source branch {} could not be fetched, and commit {} is not in this clone",
-                        info.head_branch, info.head_sha
-                    ),
-                },
-            ));
-        }
-        info.base_sha = self.full_oid(&base_target, &info.base_sha)?;
-        info.head_sha = self.full_oid(&head_target, &info.head_sha)?;
+        let comparison = self.cached_pull_request_comparison(target, info)?;
         tracing::info!(
+            forge = forge.key(),
             owner = %target.owner,
             repo = %target.repo,
             number = target.number,
             elapsed_ms = total_started.elapsed().as_millis(),
-            "bitbucket-pr: git resolver complete"
+            "pull-request: git resolver complete"
         );
+        Ok(comparison)
+    }
+
+    pub fn cached_pull_request_comparison(
+        &self,
+        target: &ReviewTarget,
+        mut info: PullRequestInfo,
+    ) -> Result<(PullRequestInfo, String, String)> {
+        let repo_path = self.repo_path_ref()?;
+        let forge = target.forge;
+        info.base_sha = self.recorded_commit_oid(&info.base_sha).map_err(|error| {
+            git_error(
+                "pull request fetch",
+                format!(
+                    "pull request #{} recorded base commit is unavailable: {error}",
+                    target.number
+                ),
+            )
+        })?;
+        info.head_sha = self.recorded_commit_oid(&info.head_sha).map_err(|error| {
+            let source = if info.head_repo_url.is_empty() {
+                " (the source repository was deleted)"
+            } else {
+                ""
+            };
+            git_error(
+                "pull request fetch",
+                format!(
+                    "pull request #{} recorded head commit is unavailable{source}: {error}",
+                    target.number
+                ),
+            )
+        })?;
+        let base_target = pr_ref_path(forge, target.number, PrRefSide::Base, &info.base_branch);
+        let head_target = pr_ref_path(forge, target.number, PrRefSide::Head, &info.head_branch);
+        for (reference, oid) in [
+            (&base_target, &info.base_sha),
+            (&head_target, &info.head_sha),
+        ] {
+            run_system_git(
+                repo_path,
+                &[
+                    OsString::from("update-ref"),
+                    OsString::from(reference),
+                    OsString::from(oid),
+                ],
+            )?;
+        }
         prune_stale_pr_refs(
             repo_path,
             &pr_ref_prefixes(forge, target.number),
@@ -2022,50 +1947,56 @@ impl GitService {
         Ok((info, base_target, head_target))
     }
 
-    /// Point `reference` at the commit an abbreviated hash names, when that
-    /// commit is in the repository. Returns whether the ref now names it.
-    fn pin_ref(&self, reference: &str, oid: &str) -> bool {
-        let oid = oid.trim();
-        if oid.len() < 7 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return false;
+    fn fetch_recorded_commit(&self, source: &str, branch: &str, oid: &str) {
+        if self.recorded_commit_oid(oid).is_ok() {
+            return;
         }
-        let Ok(repo_path) = self.repo_path_ref() else {
-            return false;
-        };
-        let Ok(commit) = resolve_commit_oid_at(repo_path, oid) else {
-            return false;
-        };
-        if resolve_commit_oid_at(repo_path, reference).is_ok_and(|current| current == commit) {
-            return true;
+        if is_full_hex_oid(oid) {
+            let _ = self.fetch_refspecs(source, &[oid.to_owned()]);
+            if self.recorded_commit_oid(oid).is_ok() {
+                return;
+            }
         }
-        run_system_git(
-            repo_path,
-            &[
-                OsString::from("update-ref"),
-                OsString::from(reference),
-                OsString::from(&commit),
-            ],
-        )
-        .is_ok()
+        let _ = self.fetch_refspecs(source, &[branch.to_owned()]);
     }
 
-    /// The full oid behind `reference` when `api_oid` is abbreviated. A
-    /// branch that moved since the forge reported it is reviewed as fetched.
-    fn full_oid(&self, reference: &str, api_oid: &str) -> Result<String> {
-        if !is_abbreviated_oid(api_oid) {
-            return Ok(api_oid.to_owned());
+    fn recorded_commit_oid(&self, oid: &str) -> Result<String> {
+        if !(7..=40).contains(&oid.len()) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(git_error(
+                "resolve commit",
+                "missing or invalid recorded commit",
+            ));
         }
-        // Ask git itself: the fetch just wrote this ref and its pack.
-        let resolved = resolve_commit_oid_at(self.repo_path_ref()?, reference)?;
-        if !oid_matches(&resolved, api_oid) {
-            tracing::warn!(
-                reference,
-                reported = api_oid,
-                fetched = %resolved,
-                "bitbucket-pr: branch moved since the pull request was read"
-            );
+        let repo_path = self.repo_path_ref()?;
+        let output = run_system_git_capture(
+            repo_path,
+            &[
+                OsString::from("rev-parse"),
+                OsString::from(format!("--disambiguate={}", oid.to_ascii_lowercase())),
+            ],
+        )?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut candidates = text.lines();
+        let resolved = candidates
+            .next()
+            .filter(|candidate| is_full_hex_oid(candidate) && oid_matches(candidate, oid))
+            .ok_or_else(|| {
+                git_error(
+                    "resolve commit",
+                    format!("commit {oid} is not in this clone"),
+                )
+            })?;
+        if candidates.next().is_some() {
+            return Err(git_error(
+                "resolve commit",
+                format!("commit hash {oid} is ambiguous"),
+            ));
         }
-        Ok(resolved)
+        gix::open(repo_path)
+            .map_err(gix_error)?
+            .find_commit(gix_object_id(resolved)?)
+            .map_err(gix_error)?;
+        Ok(resolved.to_owned())
     }
 
     fn diff_between_refs(&self, left: &str, right: &str) -> Result<String> {
@@ -2824,10 +2755,10 @@ mod tests {
     #[test]
     fn pr_ref_path_embeds_branch_with_slash() {
         let github = |number, branch| pr_ref_path(GITHUB, number, PrRefSide::Base, branch);
-        assert_eq!(github(12, "main"), "refs/diffy/pr/12/main");
+        assert_eq!(github(12, "main"), "refs/diffy/pr/github/12/base/main");
         assert_eq!(
             github(77, "feat/new-thing"),
-            "refs/diffy/pr/77/feat/new-thing"
+            "refs/diffy/pr/github/77/base/feat/new-thing"
         );
         assert!(github(1, "x").starts_with(PR_REF_PREFIX));
         assert!(is_pr_ref(&github(12, "main")));
@@ -3437,6 +3368,303 @@ mod tests {
 
         assert_eq!(git.resolve_commit_oid(&right).unwrap(), head_oid);
         assert_eq!(resolved.head_sha, head_oid);
+    }
+
+    fn historical_pull_request_fixture(forge: ReviewForge, merged: bool, deleted: bool) {
+        let upstream = TempDir::new().unwrap();
+        Repository::init_bare(upstream.path()).unwrap();
+        let fork = TempDir::new().unwrap();
+        Repository::init_bare(fork.path()).unwrap();
+        let seed_dir = TempDir::new().unwrap();
+        let seed = Repository::init(seed_dir.path()).unwrap();
+        let base_oid = commit_file(&seed, "a.txt", "header\nold\nfooter\n", "base");
+        let head_oid = commit_file(&seed, "a.txt", "header\nreviewed\nfooter\n", "PR head");
+        let source_tip = commit_file(
+            &seed,
+            "a.txt",
+            "header\nsource tip\nfooter\n",
+            "later source",
+        );
+        let destination_parent = if merged { &head_oid } else { &base_oid };
+        let parent = seed.revparse_single(destination_parent).unwrap();
+        seed.reset(&parent, git2::ResetType::Hard, None).unwrap();
+        let destination_tip = commit_file(
+            &seed,
+            "a.txt",
+            "header\ndestination tip\nfooter\n",
+            "later destination",
+        );
+        for (name, directory, tip) in [
+            ("upstream", &upstream, &destination_tip),
+            ("fork", &fork, &source_tip),
+        ] {
+            let mut remote = seed
+                .remote(name, directory.path().to_str().unwrap())
+                .unwrap();
+            remote
+                .push(&[format!("+{tip}:refs/heads/main")], None)
+                .unwrap();
+            if deleted {
+                remote.push(&[":refs/heads/main"], None).unwrap();
+            }
+        }
+        if forge == GITHUB {
+            seed.find_remote("upstream")
+                .unwrap()
+                .push(&[format!("+{source_tip}:refs/pull/24/head")], None)
+                .unwrap();
+        }
+        let local_dir = TempDir::new().unwrap();
+        let local = Repository::init(local_dir.path()).unwrap();
+        commit_file(&local, "README.md", "local\n", "local");
+        let host = match forge {
+            GITHUB => "github.com",
+            BITBUCKET => "bitbucket.org",
+        };
+        for (repo, directory) in [("acme/widgets", &upstream), ("forker/widgets", &fork)] {
+            local
+                .config()
+                .unwrap()
+                .set_str(
+                    &format!("url.{}.insteadOf", directory.path().display()),
+                    &format!("https://{host}/{repo}.git"),
+                )
+                .unwrap();
+        }
+        let target = ReviewTarget {
+            forge,
+            owner: "acme".to_owned(),
+            repo: "widgets".to_owned(),
+            number: 24,
+        };
+        let info = PullRequestInfo {
+            number: target.number,
+            state: if merged { "closed" } else { "declined" }.to_owned(),
+            merged,
+            base_branch: "main".to_owned(),
+            head_branch: "main".to_owned(),
+            base_sha: if deleted {
+                base_oid.clone()
+            } else {
+                base_oid[..12].to_owned()
+            },
+            head_sha: if deleted {
+                head_oid.clone()
+            } else {
+                head_oid[..12].to_owned()
+            },
+            base_repo_url: format!("https://{host}/acme/widgets.git"),
+            head_repo_url: format!("https://{host}/forker/widgets.git"),
+            ..PullRequestInfo::default()
+        };
+        let mut git = GitService::new();
+        git.open(local_dir.path().to_str().unwrap()).unwrap();
+        let (resolved, left, right) = git
+            .resolve_pull_request_comparison(&target, info.clone())
+            .unwrap();
+        assert_ne!(left, right);
+        assert_eq!(
+            (&resolved.base_sha, &resolved.head_sha),
+            (&base_oid, &head_oid)
+        );
+        assert_eq!(git.resolve_commit_oid(&left).unwrap(), base_oid);
+        assert_eq!(git.resolve_commit_oid(&right).unwrap(), head_oid);
+        assert_ne!(resolved.base_sha, destination_tip);
+        assert_ne!(resolved.head_sha, source_tip);
+        assert_eq!(
+            git.read_file_source_at(&left, "a.txt")
+                .unwrap()
+                .text()
+                .unwrap()
+                .line(1),
+            Some("old")
+        );
+        assert_eq!(
+            git.read_file_source_at(&right, "a.txt")
+                .unwrap()
+                .text()
+                .unwrap()
+                .line(1),
+            Some("reviewed")
+        );
+        assert_eq!(
+            git.diff_shortstat_find_renames(&left, &right).unwrap(),
+            (1, 1)
+        );
+        let patch = git.diff_two_refs(&left, &right).unwrap();
+        assert!(
+            patch.contains("@@ -1,3 +1,3 @@\n header\n-old\n+reviewed\n footer\n"),
+            "{patch}"
+        );
+        assert!(!patch.contains("tip"), "{patch}");
+        for missing_base in [true, false] {
+            for missing in ["f".repeat(40), "f".repeat(12), String::new()] {
+                let mut unavailable = info.clone();
+                if missing_base {
+                    unavailable.base_sha = missing;
+                } else {
+                    unavailable.head_sha = missing;
+                }
+                let error = git
+                    .resolve_pull_request_comparison(&target, unavailable)
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        crate::core::error::DiffyError::Vcs {
+                            recoverable: true,
+                            ..
+                        }
+                    ),
+                    "{error}"
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains(if missing_base { "base" } else { "head" }),
+                    "{error}"
+                );
+                assert_eq!(git.resolve_commit_oid(&left).unwrap(), base_oid);
+                assert_eq!(git.resolve_commit_oid(&right).unwrap(), head_oid);
+            }
+        }
+        git.fetch_refspecs(
+            upstream.path().to_str().unwrap(),
+            std::slice::from_ref(&destination_tip),
+        )
+        .unwrap();
+        git.fetch_refspecs(
+            fork.path().to_str().unwrap(),
+            std::slice::from_ref(&source_tip),
+        )
+        .unwrap();
+        drop(upstream);
+        drop(fork);
+        local
+            .reference(
+                &left,
+                destination_tip.parse().unwrap(),
+                true,
+                "moved cached base",
+            )
+            .unwrap();
+        local
+            .reference(
+                &right,
+                source_tip.parse().unwrap(),
+                true,
+                "moved cached head",
+            )
+            .unwrap();
+        let (offline, offline_left, offline_right) = git
+            .cached_pull_request_comparison(&target, info.clone())
+            .unwrap();
+        assert_eq!((offline_left, offline_right), (left.clone(), right.clone()));
+        assert_eq!(
+            (offline.base_sha, offline.head_sha),
+            (base_oid.clone(), head_oid.clone())
+        );
+        local.find_reference(&left).unwrap().delete().unwrap();
+        local.find_reference(&right).unwrap().delete().unwrap();
+        let (cached, cached_left, cached_right) =
+            git.resolve_pull_request_comparison(&target, info).unwrap();
+        assert_eq!((cached_left, cached_right), (left, right));
+        assert_eq!((cached.base_sha, cached.head_sha), (base_oid, head_oid));
+    }
+
+    #[test]
+    fn merged_github_pull_requests_keep_original_commits_after_branches_advance_or_disappear() {
+        for deleted in [false, true] {
+            historical_pull_request_fixture(GITHUB, true, deleted);
+        }
+    }
+
+    #[test]
+    fn closed_github_pull_requests_keep_original_commits_after_branches_advance_or_disappear() {
+        for deleted in [false, true] {
+            historical_pull_request_fixture(GITHUB, false, deleted);
+        }
+    }
+
+    #[test]
+    fn merged_bitbucket_pull_requests_keep_original_commits_after_branches_advance_or_disappear() {
+        for deleted in [false, true] {
+            historical_pull_request_fixture(BITBUCKET, true, deleted);
+        }
+    }
+
+    #[test]
+    fn declined_bitbucket_pull_requests_keep_original_commits_after_branches_advance_or_disappear()
+    {
+        for deleted in [false, true] {
+            historical_pull_request_fixture(BITBUCKET, false, deleted);
+        }
+    }
+
+    #[test]
+    fn historical_pull_requests_reject_ambiguous_hashes_even_when_a_cached_ref_matches() {
+        let local_dir = TempDir::new().unwrap();
+        let local = Repository::init(local_dir.path()).unwrap();
+        let tree = local.treebuilder(None).unwrap().write().unwrap();
+        let mut commits = Vec::new();
+        for nonce in [4672, 15486] {
+            let bytes = format!(
+                "tree {tree}\nauthor Diffy <diffy@example.com> 1 +0000\ncommitter Diffy <diffy@example.com> 1 +0000\n\ncollision {nonce}\n"
+            );
+            let oid = local
+                .odb()
+                .unwrap()
+                .write(git2::ObjectType::Commit, bytes.as_bytes())
+                .unwrap();
+            commits.push(oid.to_string());
+        }
+        assert_ne!(commits[0], commits[1]);
+        assert_eq!(&commits[0][..7], "4bb3020");
+        assert_eq!(&commits[1][..7], "4bb3020");
+        let mut git = GitService::new();
+        git.open(local_dir.path().to_str().unwrap()).unwrap();
+        for forge in [GITHUB, BITBUCKET] {
+            let target = ReviewTarget {
+                forge,
+                owner: "acme".to_owned(),
+                repo: "widgets".to_owned(),
+                number: 42,
+            };
+            let reference = pr_ref_path(forge, 42, PrRefSide::Base, "main");
+            local
+                .reference(&reference, commits[0].parse().unwrap(), true, "cached")
+                .unwrap();
+            let url = format!(
+                "https://{}/acme/widgets.git",
+                if forge == GITHUB {
+                    "github.com"
+                } else {
+                    "bitbucket.org"
+                }
+            );
+            local
+                .config()
+                .unwrap()
+                .set_str(
+                    &format!("url.{}.insteadOf", local_dir.path().display()),
+                    &url,
+                )
+                .unwrap();
+            let info = PullRequestInfo {
+                number: 42,
+                base_branch: "main".to_owned(),
+                head_branch: "feature".to_owned(),
+                base_sha: "4bb3020".to_owned(),
+                head_sha: commits[1].clone(),
+                base_repo_url: url,
+                ..PullRequestInfo::default()
+            };
+            let error = git
+                .resolve_pull_request_comparison(&target, info)
+                .unwrap_err();
+            assert!(error.to_string().contains("ambiguous"), "{error}");
+            assert_eq!(git.resolve_commit_oid(&reference).unwrap(), commits[0]);
+        }
     }
 
     fn make_remote_and_clone() -> (TempDir, TempDir) {

@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use crate::contracts::review::{
     AvatarImage, ForgeRequest, ForgeResponse, PullRequestComparison, Secret,
 };
-use crate::core::compare::{LayoutMode, RendererKind};
 use crate::core::error::{DiffyError, Result};
 use crate::core::forge::bitbucket::{self, BitbucketApi, Credentials};
 use crate::core::forge::github::{
@@ -20,8 +19,8 @@ use crate::core::http;
 use crate::core::repo_discovery;
 use crate::core::review::{ReviewForge, ReviewSession, ReviewSessionKey, ReviewTarget};
 use crate::core::vcs::discovery;
-use crate::core::vcs::git::{PrRefSide, forge_remotes, pr_ref_path};
-use crate::core::vcs::model::{VcsCompareRequest, VcsCompareSpec, VcsKind};
+use crate::core::vcs::git::{GitService, forge_remotes};
+use crate::core::vcs::model::VcsKind;
 use crate::platform::persistence::SettingsStore;
 use crate::platform::review_store::ReviewStore;
 use crate::platform::secrets;
@@ -303,35 +302,21 @@ impl LiveForge {
             return Ok(None);
         }
 
-        let mut repo = discovery::open_repository(repo_path)?;
+        let repo = discovery::open_repository(repo_path)?;
         if !repo.capabilities().forge_pull_requests {
             return Ok(None);
         }
-        if repo.location().kind != VcsKind::GIT {
-            let Ok(git_repo) = discovery::open_git_repository(repo_path) else {
-                return Ok(None);
-            };
-            repo = git_repo;
-        }
-
+        let Ok(git) = GitService::new_with_open(repo_path) else {
+            return Ok(None);
+        };
         for session in sessions.into_iter().rev() {
             let info = session.pull_request;
             if info.base_branch.is_empty() || info.head_branch.is_empty() {
                 continue;
             }
-            let ref_path =
-                |side, branch: &str| pr_ref_path(target.forge, info.number, side, branch);
-            let left_ref = ref_path(PrRefSide::Base, &info.base_branch);
-            let right_ref = ref_path(PrRefSide::Head, &info.head_branch);
-            let request = VcsCompareRequest {
-                spec: VcsCompareSpec::MergeBaseRange {
-                    base: left_ref.clone(),
-                    head: right_ref.clone(),
-                },
-                layout: LayoutMode::default(),
-                renderer: RendererKind::default(),
-            };
-            if repo.resolve_compare_request(&request).is_ok() {
+            if let Ok((info, left_ref, right_ref)) =
+                git.cached_pull_request_comparison(target, info)
+            {
                 tracing::info!(
                     forge = target.forge.key(),
                     owner = %target.owner,
@@ -569,8 +554,15 @@ impl LiveForge {
                     message: failure_message(ReviewForge::GitHub, &error, emit),
                 },
             },
-            ForgeRequest::FetchMyPullRequests { token, .. } => {
-                match GitHubApi::with_token(token.into_inner()).fetch_my_pull_requests() {
+            ForgeRequest::FetchMyPullRequests {
+                token,
+                filter,
+                cursor,
+                ..
+            } => {
+                match GitHubApi::with_token(token.into_inner())
+                    .fetch_my_pull_requests(filter, cursor.as_deref())
+                {
                     Ok(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
                     Err(error) => ForgeResponse::MyPullRequestsLoadFailed {
                         message: failure_message(ReviewForge::GitHub, &error, emit),
@@ -741,8 +733,8 @@ impl LiveForge {
                     },
                 }
             }
-            ForgeRequest::FetchMyPullRequests { token, .. } => {
-                match bitbucket_api(Some(token)).fetch_my_pull_requests() {
+            ForgeRequest::FetchMyPullRequests { token, filter, cursor, .. } => {
+                match bitbucket_api(Some(token)).fetch_my_pull_requests(filter, cursor.as_deref()) {
                     Ok(pulls) => ForgeResponse::MyPullRequestsLoaded(pulls),
                     Err(error) => ForgeResponse::MyPullRequestsLoadFailed {
                         message: failure_message(ReviewForge::Bitbucket, &error, emit),
@@ -786,6 +778,87 @@ fn apply_circular_mask(rgba: &mut [u8], width: u32, height: u32) {
                     *alpha = (f32::from(*alpha) * coverage).round().clamp(0.0, 255.0) as u8;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::core::vcs::git::{PrRefSide, pr_ref_path};
+
+    #[test]
+    fn cached_history_rebuilds_distinct_refs_from_recorded_commits_without_network() {
+        for forge in [ReviewForge::GitHub, ReviewForge::Bitbucket] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let repo = git2::Repository::init(dir.path()).unwrap();
+            let signature = git2::Signature::now("Diffy", "diffy@example.com").unwrap();
+            let tree = repo.treebuilder(None).unwrap().write().unwrap();
+            let tree = repo.find_tree(tree).unwrap();
+            let base = repo
+                .commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+                .unwrap();
+            let parent = repo.find_commit(base).unwrap();
+            let head = repo
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "head",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            let target = ReviewTarget {
+                forge,
+                owner: "acme".into(),
+                repo: "widgets".into(),
+                number: 7,
+            };
+            let info = PullRequestInfo {
+                number: 7,
+                state: "closed".into(),
+                merged: true,
+                base_branch: "main".into(),
+                head_branch: "main".into(),
+                base_sha: base.to_string(),
+                head_sha: head.to_string(),
+                ..PullRequestInfo::default()
+            };
+            let cache = tempfile::TempDir::new().unwrap();
+            let store = ReviewStore::open(cache.path().join("cache")).unwrap();
+            let session = ReviewSession::new(target.clone(), info.clone());
+            store.save_session(&session).unwrap();
+            repo.reference("refs/diffy/pr/7/main", head, true, "legacy collision")
+                .unwrap();
+            let live = LiveForge::new(store.clone());
+            for stale_refs in [false, true] {
+                let left = pr_ref_path(forge, 7, PrRefSide::Base, "main");
+                let right = pr_ref_path(forge, 7, PrRefSide::Head, "main");
+                if stale_refs {
+                    repo.reference(&left, head, true, "wrong base").unwrap();
+                    repo.reference(&right, base, true, "wrong head").unwrap();
+                }
+                let comparison = live
+                    .cached_pull_request_comparison(&target, dir.path())
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(comparison.left_ref, comparison.right_ref);
+                assert_eq!(comparison.info, info);
+                assert_eq!(repo.find_reference(&left).unwrap().target(), Some(base));
+                assert_eq!(repo.find_reference(&right).unwrap().target(), Some(head));
+            }
+            store.remove_session(&session.key()).unwrap();
+            let mut missing = info;
+            missing.head_sha = "f".repeat(40);
+            store
+                .save_session(&ReviewSession::new(target.clone(), missing))
+                .unwrap();
+            assert!(
+                live.cached_pull_request_comparison(&target, dir.path())
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 }

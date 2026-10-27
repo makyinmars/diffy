@@ -56,12 +56,14 @@ impl BitbucketApi {
 }
 
 /// The overview fields the pull request object carries. States use the
-/// model's vocabulary: OPEN, MERGED, CLOSED (declined or superseded).
+/// provider's vocabulary: OPEN, MERGED, DECLINED or SUPERSEDED.
 pub(super) fn parse_overview(value: &Value) -> PullRequestOverview {
     let state = match str_at(value, "/state").as_str() {
         "OPEN" => "OPEN",
         "MERGED" => "MERGED",
-        _ => "CLOSED",
+        "DECLINED" => "DECLINED",
+        "SUPERSEDED" => "SUPERSEDED",
+        _ => "UNKNOWN",
     };
     let author = actor(value.get("author"));
     let reviewers = reviewers(value);
@@ -441,7 +443,7 @@ mod tests {
         let overview = parse_overview(&json!({ "state": "DECLINED", "description": "Old body" }));
         assert_eq!(
             (overview.state.as_str(), overview.body.as_str()),
-            ("CLOSED", "Old body")
+            ("DECLINED", "Old body")
         );
         let merged = parse_overview(&json!({ "state": "MERGED" }));
         assert_eq!(merged.state, "MERGED");
