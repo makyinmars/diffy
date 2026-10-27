@@ -211,7 +211,9 @@ fn success_body(reply: Reply, context: &str) -> Result<String> {
 }
 
 fn failure(reply: &Reply, context: &str) -> DiffyError {
-    let details = match error_message(&reply.body) {
+    let message = error_message(&reply.body)
+        .filter(|message| reply.status != StatusCode::UNAUTHORIZED || message == "Bad credentials");
+    let details = match message {
         Some(message) => format!("{context} returned {}: {message}", reply.status),
         None => format!("{context} returned {}.", reply.status),
     };
